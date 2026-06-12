@@ -623,14 +623,14 @@ roblox_name = resolved["name"]
 db_users = db_get_all()
 linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
 
-    if not linked:
-        return await interaction.followup.send(
-            f"❌ {target.mention} is not linked to a Roblox account. Use `/add` first.",
-            ephemeral=True
-        )
+if not linked:
+    return await interaction.followup.send(
+        f"❌ {target.mention} is not linked to a Roblox account. Use `/add` first.",
+        ephemeral=True
+    )
 
-    roblox_id = int(linked[0])
-    roblox_name = linked[2]
+roblox_id = int(linked[0])
+roblox_name = linked[2]
 
     try:
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
