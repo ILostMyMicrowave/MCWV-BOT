@@ -62,8 +62,16 @@ ps99_first_check = True       # suppresses announcement on first poll (mid-war s
 import psycopg2
 import os
 
-conn = psycopg2.connect(os.environ["DATABASE_URL"])
-cur = conn.cursor()
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+conn = None
+cur = None
+
+if DATABASE_URL:
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+else:
+    print("DATABASE_URL not set - bot running without DB")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
