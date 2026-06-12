@@ -253,9 +253,9 @@ async def ping(interaction: discord.Interaction):
 @require_role()
 async def add(interaction: discord.Interaction, member: discord.Member, roblox_username: str):
     await interaction.response.defer()
-
+print("/add command started")
     url = "https://users.roblox.com/v1/usernames/users"
-
+    
     try:
         async with session.post(url, json={
             "usernames": [roblox_username],
@@ -270,7 +270,7 @@ async def add(interaction: discord.Interaction, member: discord.Member, roblox_u
 
         rid = str(results[0]["id"])
         name = results[0]["name"]
-
+print("/add command finished")
         # SAFE DB CALL (prevents bot crash)
         try:
             db_add(rid, member.id, name)
