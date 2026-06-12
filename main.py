@@ -880,6 +880,9 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
+pts = 0
+rank_display = "N/A"
+        
         if battle and pts > 0:
             embed.add_field(
                 name="⚔️ Current War",
