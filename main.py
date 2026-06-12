@@ -1274,29 +1274,33 @@ async def check_loop():
 async def reminder_loop():
 
     if not bot_enabled or not offline_ping_enabled:
-        return
+    return
 
-    if not offline_since:
-        return
+users = db_get_all()
+if not users:
+    return
 
-    users = db_get_all()
+try:
+    channel = await bot.fetch_channel(reminder_channel_id)
+except Exception:
+    return
 
-    try:
-        channel = await bot.fetch_channel(reminder_channel_id)
+for rid, since in list(offline_since.items()):
+    info = next((x for x in users if x[0] == rid), None)
+    if not info:
+        continue
 
-        for rid, since in list(offline_since.items()):
-            info = next((x for x in users if x[0] == rid), None)
-            if not info:
-                continue
+    # skip if they are in game
+    if status_cache.get(rid) == 2:
+        continue
 
-            duration = format_duration(since)
-            await channel.send(
-                f"⚫ <@{info[1]}> **({info[2]})** has been offline for **{duration}** (since {discord.utils.format_dt(since, 'R')})",
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
+    duration = format_duration(since)
 
-    except Exception as e:
-        print("Reminder loop error:", e)
+    await channel.send(
+        f"⚫ <@{info[1]}> **({info[2]})** still offline — "
+        f"**{duration}** (since {discord.utils.format_dt(since, 'R')})",
+        allowed_mentions=discord.AllowedMentions(users=True)
+    )
 
 # ---------------- PS99 WAR POLL (every 5 min — auto-detects clan wars) ----------------
 @tasks.loop(minutes=5)
