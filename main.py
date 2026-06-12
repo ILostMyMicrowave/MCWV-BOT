@@ -1407,7 +1407,10 @@ async def war_poll_loop():
     except Exception as e:
         print("War poll error:", e)
 
-# ---------------- CLAN LEAVE DETECTION (every 10 min) ----------------
+# ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
+
+pending_clan_removals = {}
+
 @tasks.loop(minutes=10)
 async def clan_leave_loop():
     users = db_get_all()
@@ -1423,7 +1426,12 @@ async def clan_leave_loop():
         print("Clan leave loop error:", e)
         return
 
-    clan_member_ids = {int(m["UserID"]) for m in data.get("Members", []) if "UserID" in m}
+    clan_member_ids = {
+        int(m["UserID"])
+        for m in data.get("Members", [])
+        if "UserID" in m
+    }
+
     if not clan_member_ids:
         return
 
@@ -1431,44 +1439,36 @@ async def clan_leave_loop():
     if not guild:
         return
 
-    log_ch  = guild.get_channel(LOG_CHANNEL_ID)
-    clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
+    staff_channel = guild.get_channel(1501639281750442114)
 
     for roblox_id, discord_id, roblox_name in users:
+
         if int(roblox_id) in clan_member_ids:
             continue
 
-        # this user is tracked but no longer in the clan — auto-remove
-        print(f"[clan_leave_loop] {roblox_name} ({roblox_id}) left the clan — auto-removing")
+        if roblox_id in pending_clan_removals:
+            continue
 
-        # remove role
-        try:
-            member = guild.get_member(discord_id) or await guild.fetch_member(discord_id)
-            if clan_role and member and clan_role in member.roles:
-                await member.remove_roles(clan_role, reason="Left PS99 clan (auto-detected)")
-        except Exception as e:
-            print(f"[clan_leave_loop] Could not remove role for {roblox_name}: {e}")
+        pending_clan_removals[roblox_id] = {
+            "discord_id": discord_id,
+            "roblox_name": roblox_name
+        }
 
-        # unlink from DB and clear tracking
-        db_remove(discord_id)
-        offline_since.pop(roblox_id, None)
-        status_cache.pop(roblox_id, None)
+        embed = discord.Embed(
+            title="🚨 Clan Leave Detected",
+            description=f"**{roblox_name}** is no longer in the clan.",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
 
-        # log
-        if log_ch:
-            embed = discord.Embed(
-                title="🚪  Member Left Clan (Auto-Detected)",
-                color=discord.Color.orange(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.add_field(name="Roblox",    value=roblox_name,                                         inline=True)
-            embed.add_field(name="Discord",   value=f"<@{discord_id}>",                                   inline=True)
-            embed.add_field(name="Action",    value="Role removed • Roblox account unlinked",             inline=False)
-            embed.set_footer(text=f"Roblox ID: {roblox_id} • Detected via PS99 clan API")
-            try:
-                await log_ch.send(embed=embed)
-            except Exception:
-                pass
+        embed.add_field(name="Discord User", value=f"<@{discord_id}>", inline=True)
+        embed.add_field(name="Roblox", value=roblox_name, inline=True)
+        embed.add_field(name="Action Required", value="Approve or ignore this removal.", inline=False)
+
+        await staff_channel.send(
+            embed=embed,
+            view=ClanReviewView(roblox_id)
+        )
 
 # ---------------- CLEANUP ----------------
 @bot.event
