@@ -758,123 +758,124 @@ if retry_after:
             ephemeral=True
         )
             
-@bot.tree.command(name="profile", description="View a member's full profile — Discord, Roblox, and clan war stats", guild=guild_obj)
-async def profile(interaction: discord.Interaction, member: discord.Member = None):
+@bot.tree.command(
+    name="profile",
+    description="View a Roblox-linked user profile dashboard",
+    guild=guild_obj
+)
+async def profile(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
-    target   = member or interaction.user
-    db_users = db_get_all()
-    linked   = next((u for u in db_users if u[1] == target.id), None)
+    try:
+        # ---------------- RESOLVE ROBLOX ----------------
+        resolved = await resolve_roblox_username(roblox_username)
+        if not resolved:
+            return await interaction.followup.send(
+                f"❌ Roblox user `{roblox_username}` not found.",
+                ephemeral=True
+            )
 
-    if not linked:
-        return await interaction.followup.send(
-            f"❌ {target.mention} is not linked to a Roblox account.",
+        roblox_id = int(resolved["id"])
+        roblox_name = resolved["name"]
+
+        # ---------------- DB LOOKUP ----------------
+        db_users = db_get_all()
+        linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
+
+        discord_id = linked[1] if linked else None
+        discord_display = f"<@{discord_id}>" if discord_id else "Not linked"
+
+        # ---------------- FETCH WAR DATA ----------------
+        async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
+            if war_r.status != 200 or clan_r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach PS99 API.",
+                    ephemeral=True
+                )
+
+            war_data = await war_r.json()
+            clan_data = await clan_r.json()
+
+        war_config = war_data.get("data", {}).get("configData", {})
+        battles = clan_data.get("data", {}).get("Battles", {})
+
+        # ---------------- FIND ACTIVE WAR ----------------
+        now = datetime.now(timezone.utc).timestamp()
+
+        active_battle_id = None
+        for b_id, b_data in battles.items():
+            start = b_data.get("StartTime", 0)
+            end = b_data.get("FinishTime", 0)
+
+            if start <= now <= end:
+                active_battle_id = b_id
+                break
+
+        battle = battles.get(active_battle_id) if active_battle_id else None
+
+        # ---------------- EMBED SETUP ----------------
+        embed = discord.Embed(
+            title=f"📇 Player Profile — {roblox_name}",
+            color=discord.Color.blurple()
+        )
+
+        embed.add_field(name="🎮 Roblox", value=roblox_name, inline=True)
+        embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
+        embed.add_field(name="💬 Discord", value=discord_display, inline=True)
+
+        # ---------------- WAR SECTION ----------------
+        if battle:
+            contributions = sorted(
+                battle.get("PointContributions", []),
+                key=lambda x: x.get("Points", 0),
+                reverse=True
+            )
+
+            user_entry = next(
+                (e for e in contributions if int(e.get("UserID", 0)) == roblox_id),
+                None
+            )
+
+            if user_entry:
+                pts = user_entry.get("Points", 0)
+                rank = next(
+                    (i + 1 for i, e in enumerate(contributions)
+                     if int(e.get("UserID", 0)) == roblox_id),
+                    None
+                )
+
+                medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+                rank_display = medals.get(rank, f"#{rank}")
+
+                embed.add_field(
+                    name="⚔️ Current War",
+                    value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="⚔️ Current War",
+                    value="No contributions yet",
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="⚔️ Current War",
+                value="No active war",
+                inline=False
+            )
+
+        # ---------------- FOOTER ----------------
+        embed.set_footer(text=f"Roblox ID: {roblox_id}")
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print("[profile] error:", repr(e))
+        await interaction.followup.send(
+            "❌ Profile command failed.",
             ephemeral=True
         )
-
-    roblox_id   = int(linked[0])
-    roblox_name = linked[2]
-
-    # --- fetch Roblox profile info + war data in parallel ---
-    try:
-        async with session.get(f"{ROBLOX_USERS_API}/{roblox_id}") as rr, \
-                   session.get(PS99_API) as war_r, \
-                   session.get(CLAN_API) as clan_r:
-            roblox_ok = rr.status == 200
-            roblox_profile = await rr.json() if roblox_ok else {}
-            if war_r.status != 200 or clan_r.status != 200:
-                return await interaction.followup.send("❌ Could not reach the PS99 API.", ephemeral=True)
-            war_data  = await war_r.json()
-            clan_data = await clan_r.json()
-    except Exception:
-        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
-
-    # --- Roblox profile details ---
-    display_name  = roblox_profile.get("displayName", roblox_name)
-    roblox_url    = f"https://www.roblox.com/users/{roblox_id}/profile"
-    created_raw   = roblox_profile.get("created", "")
-    joined_str    = ""
-    if created_raw:
-        try:
-            created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-            joined_str = discord.utils.format_dt(created_dt, "D")
-        except Exception:
-            pass
-
-    # --- current online status ---
-    status_icons = {0: "⚫ Offline", 1: "🟢 Online", 2: "🎮 In Game", 3: "🔧 Studio"}
-    rid_str      = str(roblox_id)
-    current_status = status_icons.get(status_cache.get(rid_str, 0), "❓ Unknown")
-    if status_cache.get(rid_str, 0) == 0 and rid_str in offline_since:
-        current_status += f" — {format_duration(offline_since[rid_str])}"
-
-    # --- war stats ---
-    war_config       = war_data.get("data", {}).get("configData", {})
-    active_battle_id = war_config.get("Title") or war_data.get("data", {}).get("configName")
-    battles          = clan_data.get("data", {}).get("Battles", {})
-
-    battle_id = None
-    if active_battle_id and active_battle_id in battles:
-        battle_id = active_battle_id
-    elif battles:
-        battle_id = list(battles.keys())[-1]
-
-    now_ts    = datetime.now(timezone.utc).timestamp()
-    finish_ts = war_config.get("FinishTime")
-    is_active = bool(finish_ts and war_config.get("StartTime", 0) <= now_ts <= finish_ts)
-    color     = discord.Color.red() if is_active else discord.Color.dark_gold()
-
-    friendly = ""
-    war_section = ""
-    if battle_id:
-        friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', battle_id)).strip()
-        battle      = battles[battle_id]
-        contributions = sorted(
-            battle.get("PointContributions", []),
-            key=lambda x: x.get("Points", 0),
-            reverse=True
-        )
-        total_points = battle.get("Points", 0)
-        user_entry   = next((e for e in contributions if e["UserID"] == roblox_id), None)
-        rank         = next((i + 1 for i, e in enumerate(contributions) if e["UserID"] == roblox_id), None)
-
-    # --- build embed ---
-    embed = discord.Embed(
-        title=f"👤  {target.display_name}",
-        color=color
-    )
-    embed.set_thumbnail(url=target.display_avatar.url)
-
-    # Discord identity
-    embed.add_field(name="🏷️  Discord",  value=f"{target.mention}",                      inline=True)
-    embed.add_field(name="🎮  Roblox",   value=f"[{display_name}]({roblox_url})",         inline=True)
-    embed.add_field(name="📡  Status",   value=current_status,                            inline=True)
-    if joined_str:
-        embed.add_field(name="📅  Roblox Joined", value=joined_str,                       inline=True)
-
-    # War stats section
-    if battle_id and user_entry:
-        pts      = user_entry["Points"]
-        pct      = (pts / total_points * 100) if total_points else 0
-        top_pts  = contributions[0]["Points"] if contributions else 1
-        bar_len  = int((pts / top_pts) * 20)
-        bar      = "█" * bar_len + "░" * (20 - bar_len)
-        medals   = {1: "🥇", 2: "🥈", 3: "🥉"}
-        rank_str = medals.get(rank, f"#{rank}") if rank else "—"
-        war_label = ("⚔️ " if is_active else "🏁 ") + friendly
-
-        embed.add_field(name="\u200b", value=f"─────────────── **{war_label}** ───────────────", inline=False)
-        embed.add_field(name="🏅  Rank",    value=rank_str,               inline=True)
-        embed.add_field(name="⚔️  Points",  value=format_points(pts),     inline=True)
-        embed.add_field(name="📈  Share",   value=f"{pct:.1f}%",          inline=True)
-        embed.add_field(name="Progress vs #1", value=f"`{bar}`",          inline=False)
-    elif battle_id:
-        war_label = ("⚔️ " if is_active else "🏁 ") + friendly
-        embed.add_field(name="\u200b", value=f"─────────────── **{war_label}** ───────────────", inline=False)
-        embed.add_field(name="⚔️  War Stats", value="😴 No contributions yet", inline=False)
-
-    embed.set_footer(text=f"Roblox ID: {roblox_id} • roblox.com/users/{roblox_id}/profile")
-    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="clanstats", description="Show MCWV clan overview — level, members, diamonds, and battle history", guild=guild_obj)
 async def clanstats(interaction: discord.Interaction):
