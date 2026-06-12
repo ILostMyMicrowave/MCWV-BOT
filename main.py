@@ -262,20 +262,26 @@ async def add(interaction: discord.Interaction, member: discord.Member, roblox_u
             "excludeBannedUsers": False
         }) as r:
             data = await r.json()
-            results = data.get("data", [])
 
-            if not results:
-                return await interaction.followup.send("❌ Roblox user not found.", ephemeral=True)
+        results = data.get("data", [])
 
-            rid = str(results[0]["id"])
-            name = results[0]["name"]
+        if not results:
+            return await interaction.followup.send("❌ Roblox user not found.", ephemeral=True)
 
+        rid = str(results[0]["id"])
+        name = results[0]["name"]
+
+        # SAFE DB CALL (prevents bot crash)
+        try:
             db_add(rid, member.id, name)
+        except Exception as db_error:
+            print("DB ERROR:", db_error)
+            return await interaction.followup.send("❌ Database error occurred.", ephemeral=True)
 
-            await interaction.followup.send(f"✅ Linked {member.mention} → **{name}**")
+        await interaction.followup.send(f"✅ Linked {member.mention} → **{name}**")
 
     except Exception as e:
-        print(e)
+        print("Roblox API error:", e)
         await interaction.followup.send("❌ Roblox API error.", ephemeral=True)
 
 @bot.tree.command(name="remove", description="Remove user", guild=guild_obj)
