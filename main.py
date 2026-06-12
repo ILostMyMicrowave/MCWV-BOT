@@ -606,11 +606,16 @@ async def leaderboard(interaction: discord.Interaction):
     embed.set_footer(text=f"Showing top {len(top)} of {len(contributions)} • ps99.biggamesapi.io")
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="mystats", description="Check a Roblox user's clan war contribution stats", guild=guild_obj)
+@bot.tree.command(
+    name="mystats",
+    description="Check a Roblox user's clan war contribution stats",
+    guild=guild_obj
+)
 async def mystats(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
     try:
+        # ---------------- RESOLVE USER ----------------
         resolved = await resolve_roblox_username(roblox_username)
         if not resolved:
             return await interaction.followup.send(
@@ -621,10 +626,12 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         roblox_id = int(resolved["id"])
         roblox_name = resolved["name"]
 
+        # ---------------- DB LINK ----------------
         db_users = db_get_all()
         linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
         discord_display = f"<@{linked[1]}>" if linked else "Not linked"
 
+        # ---------------- API CALL ----------------
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
             if war_r.status != 200 or clan_r.status != 200:
                 return await interaction.followup.send(
@@ -638,63 +645,81 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         war_config = war_data.get("data", {}).get("configData", {})
         battles = clan_data.get("data", {}).get("Battles", {})
 
-        now = datetime.now(timezone.utc).timestamp()
-        battle_id = None
+        if not battles:
+            return await interaction.followup.send("❌ No battles found.", ephemeral=True)
 
+        # ---------------- FIND CURRENT WAR ----------------
+        now = datetime.now(timezone.utc).timestamp()
+
+        active_battle_id = None
+
+        # 1) try find active battle by time
         for b_id, b_data in battles.items():
             start = b_data.get("StartTime", 0)
             end = b_data.get("FinishTime", 0)
 
+            # safety: sometimes API uses ms
+            if start > 10_000_000_000:
+                start /= 1000
+            if end > 10_000_000_000:
+                end /= 1000
+
             if start <= now <= end:
-                battle_id = b_id
+                active_battle_id = b_id
                 break
 
-        if not battle_id:
-            return await interaction.followup.send(
-                "❌ No active war found right now.",
-                ephemeral=True
-            )
+        # 2) fallback to API "active title"
+        if not active_battle_id:
+            title = war_config.get("Title") or war_data.get("data", {}).get("configName")
+            if title in battles:
+                active_battle_id = title
 
-        battle = battles[battle_id]
+        # 3) fallback to latest battle
+        if not active_battle_id:
+            active_battle_id = list(battles.keys())[-1]
+
+        battle = battles.get(active_battle_id)
+        if not battle:
+            return await interaction.followup.send("❌ Could not determine current battle.", ephemeral=True)
+
+        # ---------------- CONTRIBUTIONS ----------------
         contributions = sorted(
             battle.get("PointContributions", []),
             key=lambda x: x.get("Points", 0),
             reverse=True
         )
+
         total_points = battle.get("Points", 0)
 
         user_entry = next(
             (e for e in contributions if int(e.get("UserID", 0)) == roblox_id),
             None
         )
+
         rank = next(
-            (i + 1 for i, e in enumerate(contributions) if int(e.get("UserID", 0)) == roblox_id),
+            (i + 1 for i, e in enumerate(contributions)
+             if int(e.get("UserID", 0)) == roblox_id),
             None
         )
 
-        friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', battle_id)).strip()
-        start_ts = battle.get("StartTime", 0)
-        finish_ts = battle.get("FinishTime", 0)
-        is_active = start_ts <= now <= finish_ts
-        color = discord.Color.red() if is_active else discord.Color.dark_gold()
+        friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', active_battle_id)).strip()
 
+        # ---------------- EMBED ----------------
         embed = discord.Embed(
-            title=f"📊  {roblox_name}  —  {friendly}",
-            color=color
+            title=f"📊 {roblox_name} — {friendly}",
+            color=discord.Color.red()
         )
 
         embed.add_field(name="Discord", value=discord_display, inline=True)
 
         if not user_entry:
-            embed.description = "😴  **No contributions recorded yet for this war.**"
-            embed.set_footer(text="Get in the game and start contributing!")
+            embed.description = "😴 No contributions recorded yet for this war."
             return await interaction.followup.send(embed=embed)
 
-        pts = user_entry["Points"]
+        pts = user_entry.get("Points", 0)
         pct = (pts / total_points * 100) if total_points else 0
-        top_pts = contributions[0]["Points"] if contributions else 1
-        if top_pts <= 0:
-            top_pts = 1
+
+        top_pts = max(contributions[0].get("Points", 1), 1)
 
         bar_len = int((pts / top_pts) * 20)
         bar = "█" * bar_len + "░" * (20 - bar_len)
@@ -702,27 +727,22 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         rank_display = medals.get(rank, f"#{rank}")
 
-        embed.add_field(name="🏅  Rank", value=f"**{rank_display}** of {len(contributions)}", inline=True)
-        embed.add_field(name="⚔️  Points", value=f"**{format_points(pts)}**", inline=True)
-        embed.add_field(name="📈  Share", value=f"**{pct:.1f}%** of clan total", inline=True)
+        embed.add_field(name="🏅 Rank", value=rank_display, inline=True)
+        embed.add_field(name="⚔️ Points", value=format_points(pts), inline=True)
+        embed.add_field(name="📈 Share", value=f"{pct:.1f}%", inline=True)
         embed.add_field(name="Progress vs #1", value=f"`{bar}`", inline=False)
-        embed.add_field(name="🔢  Clan Total", value=f"**{format_points(total_points)}**", inline=True)
+        embed.add_field(name="🔢 Clan Total", value=format_points(total_points), inline=True)
 
-        status_str = "⚔️ Active" if is_active else "🏁 Ended"
-        embed.add_field(name="War Status", value=status_str, inline=True)
+        embed.add_field(name="Discord", value=discord_display, inline=True)
 
-        embed.set_footer(text=f"Roblox: {roblox_name} • ps99.biggamesapi.io")
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        print("[mystats] error:", repr(e))
-        try:
-            await interaction.followup.send(
-                "❌ `/mystats` failed while building the stats.",
-                ephemeral=True
-            )
-        except Exception:
-            pass
+        print("[mystats error]", repr(e))
+        await interaction.followup.send(
+            "❌ Something went wrong while building stats.",
+            ephemeral=True
+        )
             
 @bot.tree.command(name="profile", description="View a member's full profile — Discord, Roblox, and clan war stats", guild=guild_obj)
 async def profile(interaction: discord.Interaction, member: discord.Member = None):
