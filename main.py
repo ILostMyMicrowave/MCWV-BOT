@@ -1251,10 +1251,11 @@ async def check_loop():
                 if old is None or old == current:
                     continue
 
+# ONLY IN GAME is ignored
+                
                 try:
-    # ONLY IN GAME is ignored
     if current == 2:
-        return
+        continue
 
     now = datetime.now(timezone.utc)
 
