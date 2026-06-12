@@ -873,24 +873,18 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
-pts = 0
-rank_display = "N/A"
-        
-        if battle:
-            embed.add_field(
-                name="⚔️ Current War",
-                value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="⚔️ Current War",
-                value="No contributions / no active war",
-                inline=False
-            )
-
-        embed.set_footer(text=f"Roblox ID: {roblox_id}")
-
+if battle:
+    embed.add_field(
+        name="⚔️ Current War",
+        value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
+        inline=False
+    )
+else:
+    embed.add_field(
+        name="⚔️ Current War",
+        value="No contributions / no active war",
+        inline=False
+    )
         # ---------------- PROFILE IMAGE ----------------
         buffer = generate_profile_card(
             roblox_name,
