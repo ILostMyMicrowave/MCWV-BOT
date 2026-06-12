@@ -1251,20 +1251,26 @@ async def check_loop():
                 if old is None or old == current:
                     continue
 
-                if current == 0:
-                    went_offline = datetime.now(timezone.utc)
-                    offline_since[rid] = went_offline
+                # ONLY IN GAME is ignored
+if current == 2:
+    continue
 
-                    if offline_ping_enabled:
-                        info = next((x for x in users if x[0] == rid), None)
-                        if info:
-                            channel = await bot.fetch_channel(CHANNEL_ID)
-                            await channel.send(
-                                f"⚫ <@{info[1]}> **({info[2]})** just went offline — {discord.utils.format_dt(went_offline, 'R')}",
-                                allowed_mentions=discord.AllowedMentions(users=True)
-                            )
-                else:
-                    offline_since.pop(rid, None)
+# everything else = track + optional “just changed state” ping
+now = datetime.now(timezone.utc)
+
+# first time seen in non-game state → set timestamp
+if rid not in offline_since:
+    offline_since[rid] = now
+
+# only send "state change" ping when they were previously IN GAME
+if offline_ping_enabled and old == 2:
+    info = next((x for x in users if x[0] == rid), None)
+    if info:
+        channel = await bot.fetch_channel(CHANNEL_ID)
+        await channel.send(
+            f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
 
     except Exception as e:
         print("Loop error:", e)
