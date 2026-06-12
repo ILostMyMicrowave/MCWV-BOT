@@ -791,7 +791,8 @@ if retry_after:
             ephemeral=True
         )
             
-@bot.tree.command( name="profile",
+@bot.tree.command(
+    name="profile",
     description="View a Roblox-linked user profile dashboard",
     guild=guild_obj
 )
@@ -799,7 +800,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
     try:
-        # ---------------- RESOLVE ROBLOX ----------------
+        # ---------------- RESOLVE ROBLOX USER ----------------
         resolved = await resolve_roblox_username(roblox_username)
         if not resolved:
             return await interaction.followup.send(
@@ -818,44 +819,33 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         discord_display = f"<@{discord_id}>" if discord_id else "Not linked"
 
         # ---------------- FETCH WAR DATA ----------------
+        pts = 0
+        rank_display = "N/A"
+        battle = None
+
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
-            if war_r.status != 200 or clan_r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach PS99 API.",
-                    ephemeral=True
-                )
+            if war_r.status == 200 and clan_r.status == 200:
+                war_data = await war_r.json()
+                clan_data = await clan_r.json()
 
-            war_data = await war_r.json()
-            clan_data = await clan_r.json()
+                war_config = war_data.get("data", {}).get("configData", {})
+                battles = clan_data.get("data", {}).get("Battles", {})
 
-        war_config = war_data.get("data", {}).get("configData", {})
-        battles = clan_data.get("data", {}).get("Battles", {})
+                now = datetime.now(timezone.utc).timestamp()
 
-        # ---------------- FIND ACTIVE WAR ----------------
-        now = datetime.now(timezone.utc).timestamp()
+                # find active battle
+                active_battle_id = None
+                for b_id, b_data in battles.items():
+                    start = b_data.get("StartTime", 0)
+                    end = b_data.get("FinishTime", 0)
 
-        active_battle_id = None
-        for b_id, b_data in battles.items():
-            start = b_data.get("StartTime", 0)
-            end = b_data.get("FinishTime", 0)
+                    if start <= now <= end:
+                        active_battle_id = b_id
+                        break
 
-            if start <= now <= end:
-                active_battle_id = b_id
-                break
+                battle = battles.get(active_battle_id) if active_battle_id else None
 
-        battle = battles.get(active_battle_id) if active_battle_id else None
-
-        # ---------------- EMBED SETUP ----------------
-        embed = discord.Embed(
-            title=f"📇 Player Profile — {roblox_name}",
-            color=discord.Color.blurple()
-        )
-
-        embed.add_field(name="🎮 Roblox", value=roblox_name, inline=True)
-        embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
-        embed.add_field(name="💬 Discord", value=discord_display, inline=True)
-
-        # ---------------- WAR SECTION ----------------
+        # ---------------- CALCULATE USER STATS ----------------
         if battle:
             contributions = sorted(
                 battle.get("PointContributions", []),
@@ -870,6 +860,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
             if user_entry:
                 pts = user_entry.get("Points", 0)
+
                 rank = next(
                     (i + 1 for i, e in enumerate(contributions)
                      if int(e.get("UserID", 0)) == roblox_id),
@@ -879,40 +870,44 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 medals = {1: "🥇", 2: "🥈", 3: "🥉"}
                 rank_display = medals.get(rank, f"#{rank}")
 
-                embed.add_field(
-                    name="⚔️ Current War",
-                    value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
-                    inline=False
-                )
-            else:
-                embed.add_field(
-                    name="⚔️ Current War",
-                    value="No contributions yet",
-                    inline=False
-                )
+        # ---------------- EMBED ----------------
+        embed = discord.Embed(
+            title=f"📇 Player Profile — {roblox_name}",
+            color=discord.Color.blurple()
+        )
+
+        embed.add_field(name="🎮 Roblox", value=roblox_name, inline=True)
+        embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
+        embed.add_field(name="💬 Discord", value=discord_display, inline=True)
+
+        if battle and pts > 0:
+            embed.add_field(
+                name="⚔️ Current War",
+                value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
+                inline=False
+            )
         else:
             embed.add_field(
                 name="⚔️ Current War",
-                value="No active war",
+                value="No contributions / no active war",
                 inline=False
             )
 
-        # ---------------- FOOTER ----------------
         embed.set_footer(text=f"Roblox ID: {roblox_id}")
 
+        # ---------------- PROFILE IMAGE ----------------
         buffer = generate_profile_card(
-    roblox_name,
-    roblox_id,
-    discord_display,
-    pts if 'pts' in locals() else 0,
-    rank_display if 'rank_display' in locals() else "N/A"
-)
+            roblox_name,
+            roblox_id,
+            discord_display,
+            pts,
+            rank_display
+        )
 
-file = discord.File(buffer, filename="profile.png")
+        file = discord.File(buffer, filename="profile.png")
+        embed.set_image(url="attachment://profile.png")
 
-embed.set_image(url="attachment://profile.png")
-
-await interaction.followup.send(embed=embed, file=file)
+        await interaction.followup.send(embed=embed, file=file)
 
     except Exception as e:
         print("[profile] error:", repr(e))
