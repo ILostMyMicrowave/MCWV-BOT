@@ -67,47 +67,95 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 conn = None
 cur = None
 
-if DATABASE_URL:
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-else:
-    print("DATABASE_URL not set - bot running without DB")
+def db_enabled():
+    return conn is not None and cur is not None
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    roblox_id TEXT PRIMARY KEY,
-    discord_id INTEGER,
-    username TEXT
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-)
-""")
-db.commit()
+if DATABASE_URL:
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        print("Database connected")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            roblox_id TEXT PRIMARY KEY,
+            discord_id BIGINT,
+            username TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        conn.commit()
+
+    except Exception as e:
+        print("DB connection failed:", e)
+        conn = None
+        cur = None
+else:
+    print("DATABASE_URL not set - running without DB")
+
 
 def db_add(rid, did, name):
-    cur.execute("REPLACE INTO users VALUES (?, ?, ?)", (rid, did, name))
-    db.commit()
+    if not db_enabled():
+        return
+
+    cur.execute("""
+        INSERT INTO users (roblox_id, discord_id, username)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (roblox_id)
+        DO UPDATE SET discord_id = EXCLUDED.discord_id,
+                      username = EXCLUDED.username
+    """, (rid, did, name))
+
+    conn.commit()
+
 
 def db_remove(did):
-    cur.execute("DELETE FROM users WHERE discord_id=?", (did,))
-    db.commit()
+    if not db_enabled():
+        return
+
+    cur.execute("""
+        DELETE FROM users WHERE discord_id = %s
+    """, (did,))
+
+    conn.commit()
+
 
 def db_get_all():
+    if not db_enabled():
+        return []
+
     cur.execute("SELECT roblox_id, discord_id, username FROM users")
     return cur.fetchall()
 
+
 def db_get_setting(key, default=None):
-    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+    if not db_enabled():
+        return default
+
+    cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
     row = cur.fetchone()
     return row[0] if row else default
 
+
 def db_set_setting(key, value):
-    cur.execute("REPLACE INTO settings VALUES (?, ?)", (key, str(value)))
-    db.commit()
+    if not db_enabled():
+        return
+
+    cur.execute("""
+        INSERT INTO settings (key, value)
+        VALUES (%s, %s)
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value
+    """, (key, str(value)))
+
+    conn.commit()
 
 # ---------------- STATUS ----------------
 status_cache = {}
