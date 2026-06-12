@@ -187,6 +187,21 @@ def format_duration(since: datetime) -> str:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
 
+async def resolve_roblox_username(username: str):
+    url = "https://users.roblox.com/v1/usernames/users"
+    async with session.post(
+        url,
+        json={"usernames": [username], "excludeBannedUsers": False}
+    ) as r:
+        data = await r.json()
+        results = data.get("data", [])
+        if not results:
+            return None
+        return {
+            "id": str(results[0]["id"]),
+            "name": results[0]["name"]
+        }
+
 # ---------------- ROLE CHECK ----------------
 def require_role():
     async def predicate(interaction: discord.Interaction) -> bool:
