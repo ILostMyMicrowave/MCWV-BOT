@@ -59,8 +59,11 @@ ps99_war_active = False       # tracks last known PS99 war state
 ps99_first_check = True       # suppresses announcement on first poll (mid-war startup)
 
 # ---------------- DATABASE ----------------
-db = sqlite3.connect("data.db", check_same_thread=False)
-cur = db.cursor()
+import psycopg2
+import os
+
+conn = psycopg2.connect(os.environ["DATABASE_URL"])
+cur = conn.cursor()
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
