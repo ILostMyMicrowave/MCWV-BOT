@@ -775,6 +775,15 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
 
         embed.add_field(name="Discord", value=discord_display, inline=True)
 
+await interaction.followup.send(embed=embed)
+
+retry_after = check_cooldown(interaction)
+if retry_after:
+    return await interaction.followup.send(
+        f"⏳ Slow down! Try again in {round(retry_after, 1)}s",
+        ephemeral=True
+    )
+
 @bot.tree.command(
     name="profile",
     description="View a Roblox-linked user profile dashboard",
