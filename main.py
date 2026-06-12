@@ -607,7 +607,7 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="mystats", description="Check your (or another member's) clan war contribution stats", guild=guild_obj)
-async def mystats(interaction: discord.Interaction, member: discord.Member = None):
+async def mystats(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
     target = member or interaction.user
