@@ -1274,33 +1274,39 @@ async def check_loop():
 async def reminder_loop():
 
     if not bot_enabled or not offline_ping_enabled:
-    return
+        return
 
-users = db_get_all()
-if not users:
-    return
+    try:
+        channel = await bot.fetch_channel(reminder_channel_id)
+    except:
+        return
 
-try:
-    channel = await bot.fetch_channel(reminder_channel_id)
-except Exception:
-    return
+    users = db_get_all()
+    now = datetime.now(timezone.utc)
 
-for rid, since in list(offline_since.items()):
-    info = next((x for x in users if x[0] == rid), None)
-    if not info:
-        continue
+    for roblox_id, discord_id, username in users:
 
-    # skip if they are in game
-    if status_cache.get(rid) == 2:
-        continue
+        rid = str(roblox_id)
+        status = status_cache.get(rid)
 
-    duration = format_duration(since)
+        # ONLY skip if IN GAME
+        if status == 2:
+            continue
 
-    await channel.send(
-        f"⚫ <@{info[1]}> **({info[2]})** still offline — "
-        f"**{duration}** (since {discord.utils.format_dt(since, 'R')})",
-        allowed_mentions=discord.AllowedMentions(users=True)
-    )
+        # if we don't know status yet, assume pingable
+        if status is None:
+            status = 0
+
+        # get or set offline start time
+        if rid not in offline_since:
+            offline_since[rid] = now
+
+        duration = format_duration(offline_since[rid])
+
+        await channel.send(
+            f"⚫ <@{discord_id}> **({username})** is not in game — {duration}",
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
 
 # ---------------- PS99 WAR POLL (every 5 min — auto-detects clan wars) ----------------
 @tasks.loop(minutes=5)
