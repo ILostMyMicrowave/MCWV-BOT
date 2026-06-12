@@ -610,9 +610,18 @@ async def leaderboard(interaction: discord.Interaction):
 async def mystats(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
-    target = member or interaction.user
-    db_users = db_get_all()
-    linked = next((u for u in db_users if u[1] == target.id), None)
+resolved = await resolve_roblox_username(roblox_username)
+if not resolved:
+    return await interaction.followup.send(
+        f"❌ Roblox user `{roblox_username}` not found.",
+        ephemeral=True
+    )
+
+roblox_id = int(resolved["id"])
+roblox_name = resolved["name"]
+
+db_users = db_get_all()
+linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
 
     if not linked:
         return await interaction.followup.send(
