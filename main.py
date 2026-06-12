@@ -1282,6 +1282,9 @@ async def reminder_loop():
     if not bot_enabled or not offline_ping_enabled:
         return
 
+    if not offline_since:
+        return
+
     try:
         channel = await bot.fetch_channel(reminder_channel_id)
     except:
@@ -1290,29 +1293,26 @@ async def reminder_loop():
     users = db_get_all()
     now = datetime.now(timezone.utc)
 
-    for roblox_id, discord_id, username in users:
+    lines = []
 
-        rid = str(roblox_id)
-        status = status_cache.get(rid)
+    for rid, since in offline_since.items():
 
-        # ONLY skip if IN GAME
-        if status == 2:
+        # skip ONLY in-game users
+        if status_cache.get(rid) == 2:
             continue
 
-        # if we don't know status yet, assume pingable
-        if status is None:
-            status = 0
+        info = next((x for x in users if x[0] == rid), None)
+        if not info:
+            continue
 
-        # get or set offline start time
-        if rid not in offline_since:
-            offline_since[rid] = now
+        duration = format_duration(since)
+        lines.append(f"⚫ <@{info[1]}> **({info[2]})** is not in game - {duration}")
 
-        duration = format_duration(offline_since[rid])
+    if not lines:
+        return
 
-        await channel.send(
-            f"⚫ <@{discord_id}> **({username})** is not in game — {duration}",
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
+    # ONE message only
+    await channel.send("\n\n".join(lines))
 
 # ---------------- PS99 WAR POLL (every 5 min — auto-detects clan wars) ----------------
 @tasks.loop(minutes=5)
