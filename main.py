@@ -25,6 +25,39 @@ def run_web():
 
 Thread(target=run_web).start()
 
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
+
+def generate_profile_card(roblox_name, roblox_id, discord_tag, points, rank):
+    # base image
+    img = Image.new("RGB", (900, 300), (18, 18, 28))
+    draw = ImageDraw.Draw(img)
+
+    # fonts (safe fallback)
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 42)
+        text_font = ImageFont.truetype("arial.ttf", 24)
+    except:
+        title_font = ImageFont.load_default()
+        text_font = ImageFont.load_default()
+
+    # title
+    draw.text((30, 25), roblox_name, fill=(255, 255, 255), font=title_font)
+
+    # info
+    draw.text((30, 110), f"Roblox ID: {roblox_id}", fill=(180, 180, 180), font=text_font)
+    draw.text((30, 150), f"Discord: {discord_tag}", fill=(180, 180, 180), font=text_font)
+
+    draw.text((30, 200), f"Points: {points}", fill=(255, 200, 0), font=text_font)
+    draw.text((30, 235), f"Rank: {rank}", fill=(0, 200, 255), font=text_font)
+
+    # convert to file
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    return buffer
+
 # ---------------- CONFIG ----------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
@@ -758,8 +791,7 @@ if retry_after:
             ephemeral=True
         )
             
-@bot.tree.command(
-    name="profile",
+@bot.tree.command( name="profile",
     description="View a Roblox-linked user profile dashboard",
     guild=guild_obj
 )
@@ -868,7 +900,19 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         # ---------------- FOOTER ----------------
         embed.set_footer(text=f"Roblox ID: {roblox_id}")
 
-        await interaction.followup.send(embed=embed)
+        buffer = generate_profile_card(
+    roblox_name,
+    roblox_id,
+    discord_display,
+    pts if 'pts' in locals() else 0,
+    rank_display if 'rank_display' in locals() else "N/A"
+)
+
+file = discord.File(buffer, filename="profile.png")
+
+embed.set_image(url="attachment://profile.png")
+
+await interaction.followup.send(embed=embed, file=file)
 
     except Exception as e:
         print("[profile] error:", repr(e))
