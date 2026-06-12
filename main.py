@@ -1470,6 +1470,48 @@ async def clan_leave_loop():
             view=ClanReviewView(roblox_id)
         )
 
+class ClanReviewView(discord.ui.View):
+    def __init__(self, roblox_id):
+        super().__init__(timeout=None)
+        self.roblox_id = roblox_id
+
+    @discord.ui.button(label="Approve Removal", style=discord.ButtonStyle.danger)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        if self.roblox_id not in pending_clan_removals:
+            return await interaction.response.send_message("Already handled.", ephemeral=True)
+
+        data = pending_clan_removals.pop(self.roblox_id)
+
+        guild = interaction.guild
+
+        member = guild.get_member(int(data["discord_id"])) or await guild.fetch_member(int(data["discord_id"]))
+        role = guild.get_role(CLAN_MEMBER_ROLE_ID)
+
+        if member and role and role in member.roles:
+            await member.remove_roles(role, reason="Staff approved clan removal")
+
+        db_remove(data["discord_id"])
+
+        await interaction.response.edit_message(
+            content="✅ Member removed and processed.",
+            embed=interaction.message.embeds[0],
+            view=None
+        )
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.secondary)
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        if self.roblox_id in pending_clan_removals:
+            pending_clan_removals.pop(self.roblox_id)
+
+        await interaction.response.edit_message(
+            content="🟡 Ignored by staff.",
+            embed=interaction.message.embeds[0],
+            view=None
+        )
+
+
 # ---------------- CLEANUP ----------------
 @bot.event
 async def on_disconnect():
