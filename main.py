@@ -606,36 +606,31 @@ async def leaderboard(interaction: discord.Interaction):
     embed.set_footer(text=f"Showing top {len(top)} of {len(contributions)} • ps99.biggamesapi.io")
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="mystats", description="Check your (or another member's) clan war contribution stats", guild=guild_obj)
+@bot.tree.command(name="mystats", description="Check a Roblox user's clan war contribution stats", guild=guild_obj)
 async def mystats(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
-resolved = await resolve_roblox_username(roblox_username)
-if not resolved:
-    return await interaction.followup.send(
-        f"❌ Roblox user `{roblox_username}` not found.",
-        ephemeral=True
-    )
+    resolved = await resolve_roblox_username(roblox_username)
+    if not resolved:
+        return await interaction.followup.send(
+            f"❌ Roblox user `{roblox_username}` not found.",
+            ephemeral=True
+        )
 
-roblox_id = int(resolved["id"])
-roblox_name = resolved["name"]
+    roblox_id = int(resolved["id"])
+    roblox_name = resolved["name"]
 
-db_users = db_get_all()
-linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
-
-if not linked:
-    return await interaction.followup.send(
-        f"❌ {target.mention} is not linked to a Roblox account. Use `/add` first.",
-        ephemeral=True
-    )
-
-roblox_id = int(linked[0])
-roblox_name = linked[2]
+    db_users = db_get_all()
+    linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
+    discord_display = f"<@{linked[1]}>" if linked else "Not linked"
 
     try:
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
             if war_r.status != 200 or clan_r.status != 200:
-                return await interaction.followup.send("❌ Could not reach the PS99 API.", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 API.",
+                    ephemeral=True
+                )
             war_data = await war_r.json()
             clan_data = await clan_r.json()
     except Exception:
@@ -676,6 +671,8 @@ roblox_name = linked[2]
         color=color
     )
 
+    embed.add_field(name="Discord", value=discord_display, inline=True)
+
     if not user_entry:
         embed.description = "😴  **No contributions recorded yet for this war.**"
         embed.set_footer(text="Get in the game and start contributing!")
@@ -695,8 +692,10 @@ roblox_name = linked[2]
     embed.add_field(name="📈  Share", value=f"**{pct:.1f}%** of clan total", inline=True)
     embed.add_field(name="Progress vs #1", value=f"`{bar}`", inline=False)
     embed.add_field(name="🔢  Clan Total", value=f"**{format_points(total_points)}**", inline=True)
+
     status_str = "⚔️ Active" if is_active else "🏁 Ended"
     embed.add_field(name="War Status", value=status_str, inline=True)
+
     embed.set_footer(text=f"Roblox: {roblox_name} • ps99.biggamesapi.io")
     await interaction.followup.send(embed=embed)
 
