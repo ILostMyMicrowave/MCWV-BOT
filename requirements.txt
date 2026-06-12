@@ -5,3 +5,4 @@ aiohttp
 discord.py
 Flask
 requests
+aiohttp==3.9.5
