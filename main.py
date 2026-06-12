@@ -1381,7 +1381,15 @@ async def on_disconnect():
         await session.close()
 
 # ---------------- RUN ----------------
+from threading import Thread
+import asyncio
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
 async def main():
     await bot.start(TOKEN)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    Thread(target=run_flask).start()
+    asyncio.run(main())
