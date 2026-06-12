@@ -883,7 +883,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 pts = 0
 rank_display = "N/A"
         
-        if battle and pts > 0:
+        if battle:
             embed.add_field(
                 name="⚔️ Current War",
                 value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
