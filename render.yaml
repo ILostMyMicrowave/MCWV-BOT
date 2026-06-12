@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: mcwv-bot
-    env: python
-    region: frankfurt
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    runtime: python-3.11.8
