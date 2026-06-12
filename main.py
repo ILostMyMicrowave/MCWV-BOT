@@ -1297,7 +1297,7 @@ async def reminder_loop():
 
     for rid, since in offline_since.items():
 
-        # skip ONLY in-game users
+        # ONLY skip IN GAME
         if status_cache.get(rid) == 2:
             continue
 
@@ -1311,7 +1311,6 @@ async def reminder_loop():
     if not lines:
         return
 
-    # ONE message only
     await channel.send("\n\n".join(lines))
 
 # ---------------- PS99 WAR POLL (every 5 min — auto-detects clan wars) ----------------
