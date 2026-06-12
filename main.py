@@ -49,6 +49,13 @@ guild_obj = discord.Object(id=GUILD_ID)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+cooldowns = commands.CooldownMapping.from_cooldown(
+    1, 10, commands.BucketType.user
+)
+def check_cooldown(interaction: discord.Interaction):
+    bucket = cooldowns.get_bucket(interaction)
+    retry_after = bucket.update_rate_limit()
+    return retry_after
 
 session = None
 bot_enabled = True
@@ -736,6 +743,13 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="Discord", value=discord_display, inline=True)
 
         await interaction.followup.send(embed=embed)
+        retry_after = check_cooldown(interaction)
+
+if retry_after:
+    return await interaction.followup.send(
+        f"⏳ Slow down! Try again in {round(retry_after, 1)}s",
+        ephemeral=True
+    )
 
     except Exception as e:
         print("[mystats error]", repr(e))
