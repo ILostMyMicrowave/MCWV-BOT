@@ -1,8 +1,4 @@
 discord.py==2.4.0
-requests==2.32.3
-Flask==3.0.3
-aiohttp
-discord.py
-Flask
-requests
 aiohttp==3.9.5
+flask==3.0.3
+requests==2.32.3
