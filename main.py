@@ -1234,42 +1234,53 @@ async def check_loop():
         url = "https://presence.roblox.com/v1/presence/users"
 
         async with session.post(url, json={"userIds": user_ids}) as r:
-
             if r.status != 200:
                 return
 
             data = await r.json()
 
-            for u in data.get("userPresences", []):
+    except Exception as e:
+        print("Loop error (API fetch):", e)
+        return
 
-    rid = str(u["userId"])
-    current = u["userPresenceType"]
-    old = status_cache.get(rid)
+    try:
+        for u in data.get("userPresences", []):
 
-    status_cache[rid] = current
+            rid = str(u["userId"])
+            current = u["userPresenceType"]
+            old = status_cache.get(rid)
 
-    if old == current:
-        continue
+            status_cache[rid] = current
 
-    now = datetime.now(timezone.utc)
+            # no change → skip
+            if old == current:
+                continue
 
-    info = next((x for x in users if x[0] == rid), None)
-    if not info:
-        continue
+            now = datetime.now(timezone.utc)
 
-    if current == 2:
-        offline_since.pop(rid, None)
-        continue
+            info = next((x for x in users if x[0] == rid), None)
+            if not info:
+                continue
 
-    if rid not in offline_since:
-        offline_since[rid] = now
+            # IN GAME → ignore everything
+            if current == 2:
+                offline_since.pop(rid, None)
+                continue
 
-    if old == 2 and offline_ping_enabled:
-        channel = await bot.fetch_channel(CHANNEL_ID)
-        await channel.send(
-            f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
+            # first time seen outside game
+            if rid not in offline_since:
+                offline_since[rid] = now
+
+            # ONLY ping when leaving IN GAME
+            if old == 2 and offline_ping_enabled:
+                channel = await bot.fetch_channel(CHANNEL_ID)
+                await channel.send(
+                    f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+                    allowed_mentions=discord.AllowedMentions(users=True)
+                )
+
+    except Exception as e:
+        print("Loop error (processing):", e)
 
 # ---------------- REMINDER LOOP (every 30 min — re-pings offline users) ----------------
 @tasks.loop(minutes=30)
