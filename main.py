@@ -634,9 +634,17 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
             war_data = await war_r.json()
             clan_data = await clan_r.json()
 
-        war_config = war_data.get("data", {}).get("configData", {})
-        active_battle_id = war_config.get("Title") or war_data.get("data", {}).get("configName")
-        battles = clan_data.get("data", {}).get("Battles", {})
+        now = datetime.now(timezone.utc).timestamp()
+
+battle_id = None
+
+for b_id, b_data in battles.items():
+    start = b_data.get("StartTime", 0)
+    end = b_data.get("FinishTime", 0)
+
+    if start <= now <= end:
+        battle_id = b_id
+        break
 
         battle_id = None
         if active_battle_id and active_battle_id in battles:
