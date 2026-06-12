@@ -631,29 +631,29 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
                     "❌ Could not reach the PS99 API.",
                     ephemeral=True
                 )
+
             war_data = await war_r.json()
             clan_data = await clan_r.json()
 
+        war_config = war_data.get("data", {}).get("configData", {})
+        battles = clan_data.get("data", {}).get("Battles", {})
+
         now = datetime.now(timezone.utc).timestamp()
-
-battle_id = None
-
-for b_id, b_data in battles.items():
-    start = b_data.get("StartTime", 0)
-    end = b_data.get("FinishTime", 0)
-
-    if start <= now <= end:
-        battle_id = b_id
-        break
-
         battle_id = None
-        if active_battle_id and active_battle_id in battles:
-            battle_id = active_battle_id
-        elif battles:
-            battle_id = list(battles.keys())[-1]
+
+        for b_id, b_data in battles.items():
+            start = b_data.get("StartTime", 0)
+            end = b_data.get("FinishTime", 0)
+
+            if start <= now <= end:
+                battle_id = b_id
+                break
 
         if not battle_id:
-            return await interaction.followup.send("❌ No battle data found.", ephemeral=True)
+            return await interaction.followup.send(
+                "❌ No active war found right now.",
+                ephemeral=True
+            )
 
         battle = battles[battle_id]
         contributions = sorted(
@@ -663,13 +663,19 @@ for b_id, b_data in battles.items():
         )
         total_points = battle.get("Points", 0)
 
-        user_entry = next((e for e in contributions if int(e.get("UserID", 0)) == roblox_id), None)
-        rank = next((i + 1 for i, e in enumerate(contributions) if int(e.get("UserID", 0)) == roblox_id), None)
+        user_entry = next(
+            (e for e in contributions if int(e.get("UserID", 0)) == roblox_id),
+            None
+        )
+        rank = next(
+            (i + 1 for i, e in enumerate(contributions) if int(e.get("UserID", 0)) == roblox_id),
+            None
+        )
 
         friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', battle_id)).strip()
-        now = datetime.now(timezone.utc).timestamp()
-        finish_ts = war_config.get("FinishTime")
-        is_active = finish_ts and war_config.get("StartTime", 0) <= now <= finish_ts
+        start_ts = battle.get("StartTime", 0)
+        finish_ts = battle.get("FinishTime", 0)
+        is_active = start_ts <= now <= finish_ts
         color = discord.Color.red() if is_active else discord.Color.dark_gold()
 
         embed = discord.Embed(
@@ -711,7 +717,10 @@ for b_id, b_data in battles.items():
     except Exception as e:
         print("[mystats] error:", repr(e))
         try:
-            await interaction.followup.send("❌ `/mystats` failed while building the stats.", ephemeral=True)
+            await interaction.followup.send(
+                "❌ `/mystats` failed while building the stats.",
+                ephemeral=True
+            )
         except Exception:
             pass
             
