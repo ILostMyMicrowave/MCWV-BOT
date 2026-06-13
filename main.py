@@ -960,9 +960,9 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         discord_id = linked[1] if linked else None
         discord_display = f"<@{discord_id}>" if discord_id else "Not linked"
 
-        # ---------------- FETCH WAR DATA ----------------
+        # ---------------- WAR DATA ----------------
         pts = 0
-        rank_display = "N/A"
+        rank = None
         battle = None
 
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
@@ -971,10 +971,8 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 clan_data = await clan_r.json()
 
                 battles = clan_data.get("data", {}).get("Battles", {})
-
                 now = datetime.now(timezone.utc).timestamp()
 
-                # find active battle
                 active_battle_id = None
                 for b_id, b_data in battles.items():
                     start = b_data.get("StartTime", 0)
@@ -986,7 +984,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
                 battle = battles.get(active_battle_id) if active_battle_id else None
 
-        # ---------------- CALCULATE USER STATS ----------------
+        # ---------------- STATS ----------------
         if battle:
             contributions = sorted(
                 battle.get("PointContributions", []),
@@ -1008,10 +1006,19 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                     None
                 )
 
-                medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-                rank_display = medals.get(rank, f"#{rank}")
+        # ---------------- GENERATE IMAGE ----------------
+        image_buffer = await generate_profile_card(
+            roblox_name=roblox_name,
+            roblox_id=roblox_id,
+            discord_tag=discord_display,
+            points=pts,
+            rank=rank if rank else "N/A",
+            animated=False   # set True later for GIF
+        )
 
-                # ---------------- EMBED ----------------
+        file = discord.File(fp=image_buffer, filename="profile.png")
+
+        # ---------------- EMBED ----------------
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             color=discord.Color.blurple()
@@ -1024,17 +1031,20 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         if battle:
             embed.add_field(
                 name="⚔️ Current War",
-                value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
+                value=f"Points: **{pts:,}**",
                 inline=False
             )
         else:
             embed.add_field(
                 name="⚔️ Current War",
-                value="No contributions / no active war",
+                value="No active war",
                 inline=False
             )
 
-        await interaction.followup.send(embed=embed)
+        # IMPORTANT: attach image here
+        embed.set_image(url="attachment://profile.png")
+
+        await interaction.followup.send(embed=embed, file=file)
 
     except Exception as e:
         print("[profile] error:", repr(e))
@@ -1042,181 +1052,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             "❌ Profile command failed.",
             ephemeral=True
         )
-
-        # ---------------- PROFILE IMAGE ----------------
-async def fetch_roblox_avatar(user_id):
-    try:
-        url = (
-            "https://thumbnails.roblox.com/v1/users/avatar-headshot"
-            f"?userIds={user_id}&size=420x420&format=Png&isCircular=false"
-        )
-
-        async with session.get(url) as r:
-            data = await r.json()
-
-        image_url = data["data"][0]["imageUrl"]
-
-        async with session.get(image_url) as r:
-            avatar_bytes = await r.read()
-
-        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
-        return avatar
-
-    except Exception as e:
-        print("Avatar fetch error:", e)
-        return None
-        
-async def generate_profile_card(
-    roblox_name,
-    roblox_id,
-    discord_tag,
-    points,
-    rank,
-    animated=False
-):
-    WIDTH, HEIGHT = 1400, 600
-    frames = []
-
-    font = ImageFont.load_default()
-
-    particles = [
-        (math.randint(60, WIDTH - 60), math.randint(60, HEIGHT - 60), math.randint(2, 5))
-        for _ in range(25)
-    ]
-
-    avatar = await fetch_roblox_avatar(roblox_id)
-    if avatar:
-        avatar = avatar.resize((220, 220))
-
-        mask = Image.new("L", (220, 220), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, 220, 220), fill=255)
-        avatar.putalpha(mask)
-
-    for frame in range(6 if animated else 1):
-
-        img = Image.new("RGBA", (WIDTH, HEIGHT))
-        draw = ImageDraw.Draw(img)
-
-        # ---------- BACKGROUND GRADIENT ----------
-        for y in range(HEIGHT):
-            r = int(10 + (45 - 10) * (y / HEIGHT))
-            g = int(15 + (30 - 15) * (y / HEIGHT))
-            b = int(40 + (120 - 40) * (y / HEIGHT))
-            draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
-
-        # ---------- PARTICLES ----------
-        for i, (x, y, size) in enumerate(particles):
-            offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
-
-            draw.ellipse(
-                [
-                    x + offset,
-                    y + offset,
-                    x + size + offset,
-                    y + size + offset
-                ],
-                fill=(120, 160, 255, 120)
-            )
-
-        # ---------- MAIN PANEL ----------
-        draw.rounded_rectangle(
-            [40, 40, WIDTH - 40, HEIGHT - 40],
-            radius=35,
-            fill=(20, 22, 30)
-        )
-
-        # ---------- AVATAR ----------
-        if avatar:
-            img.paste(avatar, (80, 90), avatar)
-
-        # ---------- NAME ----------
-        x, y = 350, 90
-
-        for i in range(6):  # glow effect
-            draw.text(
-                (x, y),
-                roblox_name,
-                font=font,
-                fill=(120, 160, 255, 18)
-            )
-
-        draw.text((x, y), roblox_name, fill="white", font=font)
-
-        # ---------- INFO ----------
-        draw.text((355, 175), f"Discord: {discord_tag}", fill=(200, 200, 200), font=font)
-        draw.text((355, 220), f"Roblox ID: {roblox_id}", fill=(200, 200, 200), font=font)
-
-        # ---------- PROGRESS BAR ----------
-        progress = min(points / 50_000_000, 1)
-
-        bar_x, bar_y, bar_w, bar_h = 350, 340, 800, 45
-
-        draw.rounded_rectangle(
-            [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
-            radius=18,
-            fill=(40, 40, 55)
-        )
-
-        draw.rounded_rectangle(
-            [bar_x, bar_y, bar_x + int(bar_w * progress), bar_y + bar_h],
-            radius=18,
-            fill=(88, 101, 242)
-        )
-
-        draw.text((1170, 340), f"{points:,}", fill="white", font=font)
-
-        # ---------- RANK BADGE ----------
-        pulse = int(6 * math.sin(frame * 0.8)) if animated else 0
-
-        draw.rounded_rectangle(
-            [1120 - pulse, 80 - pulse, 1310 + pulse, 160 + pulse],
-            radius=25,
-            fill=(255, 215, 0)
-        )
-
-        draw.text((1185, 95), str(rank), fill=(20, 20, 20), font=font)
-
-        # ---------- STAT CARDS ----------
-        cards = [
-            ("POINTS", f"{points:,}"),
-            ("RANK", str(rank)),
-            ("CLAN", "MCWV")
-        ]
-
-        start_x = 80
-
-        for i, (title, value) in enumerate(cards):
-            x = start_x + i * 320
-
-            draw.rounded_rectangle(
-                [x, 440, x + 260, 530],
-                radius=20,
-                fill=(35, 38, 52)
-            )
-
-            draw.text((x + 20, 455), title, fill=(160, 160, 160), font=font)
-            draw.text((x + 20, 485), value, fill="white", font=font)
-
-        frames.append(img)
-
-    # ---------- OUTPUT ----------
-    buffer = BytesIO()
-
-    if animated:
-        frames[0].save(
-            buffer,
-            format="GIF",
-            save_all=True,
-            append_images=frames[1:],
-            duration=90,
-            loop=0,
-            disposal=2
-        )
-    else:
-        frames[0].save(buffer, format="PNG")
-
-    buffer.seek(0)
-    return buffer
 
 @bot.tree.command(name="clanstats", description="Show MCWV clan overview — level, members, diamonds, and battle history", guild=guild_obj)
 async def clanstats(interaction: discord.Interaction):
