@@ -9,6 +9,8 @@ from io import BytesIO
 import math
 import random
 
+session = None
+
 from datetime import datetime, timezone
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -1020,7 +1022,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 ephemeral=True
             )
 
-        roblox_id = str(resolved["id"])   # force string consistency
+        roblox_id = str(resolved["id"])
         roblox_name = resolved["name"]
 
         # ---------------- DB LOOKUP ----------------
@@ -1040,6 +1042,11 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         battle = None
 
         try:
+            # ensure session exists
+            global session
+            if session is None or session.closed:
+                session = aiohttp.ClientSession()
+
             async with session.get(CLAN_API) as clan_r:
                 if clan_r.status == 200:
                     clan_data = await clan_r.json()
@@ -1885,6 +1892,17 @@ async def approve(self, interaction: discord.Interaction, button: discord.ui.But
 # ---------------- CLEANUP ----------------
 @bot.event
 async def on_ready():
+    global session
+
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    try:
+        synced = await bot.tree.sync(guild=guild_obj)
+        print(f"Synced {len(synced)} commands")
+    except Exception as e:
+        print("Sync error:", e)
+
     print(f"Logged in as {bot.user}")
 
     try:
