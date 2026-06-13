@@ -880,7 +880,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 medals = {1: "🥇", 2: "🥈", 3: "🥉"}
                 rank_display = medals.get(rank, f"#{rank}")
 
-        # ---------------- EMBED ----------------
+                # ---------------- EMBED ----------------
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             color=discord.Color.blurple()
@@ -890,7 +890,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
-                if battle:
+        if battle:
             embed.add_field(
                 name="⚔️ Current War",
                 value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
