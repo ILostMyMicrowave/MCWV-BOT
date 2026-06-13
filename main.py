@@ -108,7 +108,22 @@ async def generate_profile_card(
     WIDTH, HEIGHT = 1400, 600
     frames = []
 
-    font = ImageFont.load_default()
+    from PIL import ImageFont
+
+def load_fonts():
+    try:
+        return {
+            "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52),
+            "big":   ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34),
+            "small": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24),
+        }
+    except:
+        # fallback (still works, just worse)
+        return {
+            "title": ImageFont.load_default(),
+            "big": ImageFont.load_default(),
+            "small": ImageFont.load_default(),
+        }
 
     particles = generate_particles(25, WIDTH, HEIGHT)
 
