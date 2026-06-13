@@ -42,6 +42,7 @@ def generate_particles(count, width, height):
         for _ in range(count)
     ]
 
+
 def glass_panel(base, xy, radius=40, fill=(30, 35, 55, 180)):
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
@@ -50,6 +51,7 @@ def glass_panel(base, xy, radius=40, fill=(30, 35, 55, 180)):
 
     layer = layer.filter(ImageFilter.GaussianBlur(10))
     base.alpha_composite(layer)
+
 
 def glow_bar(base, x, y, width, height, progress):
     glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -72,6 +74,135 @@ def glow_bar(base, x, y, width, height, progress):
         radius=25,
         fill=(90, 140, 255)
     )
+
+async def fetch_roblox_avatar(user_id):
+    try:
+        url = (
+            "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+            f"?userIds={user_id}&size=420x420&format=Png&isCircular=false"
+        )
+
+        async with session.get(url) as r:
+            data = await r.json()
+
+        image_url = data["data"][0]["imageUrl"]
+
+        async with session.get(image_url) as r:
+            avatar_bytes = await r.read()
+
+        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
+        return avatar
+
+    except Exception as e:
+        print("Avatar fetch error:", e)
+        return None
+
+async def generate_profile_card(
+    roblox_name,
+    roblox_id,
+    discord_tag,
+    points,
+    rank,
+    animated=False
+):
+    WIDTH, HEIGHT = 1400, 600
+    frames = []
+
+    font = ImageFont.load_default()
+
+    particles = generate_particles(25, WIDTH, HEIGHT)
+
+    avatar = await fetch_roblox_avatar(roblox_id)
+
+    if avatar:
+        avatar = avatar.resize((220, 220))
+
+        mask = Image.new("L", (220, 220), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 220, 220), fill=255)
+
+        avatar.putalpha(mask)
+
+    for frame in range(6 if animated else 1):
+
+        img = Image.new("RGBA", (WIDTH, HEIGHT))
+        draw = ImageDraw.Draw(img)
+
+        # background
+        for y in range(HEIGHT):
+            r = int(10 + (45 - 10) * (y / HEIGHT))
+            g = int(15 + (30 - 15) * (y / HEIGHT))
+            b = int(40 + (120 - 40) * (y / HEIGHT))
+            draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
+
+        # particles
+        for i, (x, y, size) in enumerate(particles):
+            offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
+
+            draw.ellipse(
+                [
+                    x + offset,
+                    y + offset,
+                    x + size + offset,
+                    y + size + offset
+                ],
+                fill=(120, 160, 255, 120)
+            )
+
+        # panel
+        draw.rounded_rectangle(
+            [40, 40, WIDTH - 40, HEIGHT - 40],
+            radius=35,
+            fill=(20, 22, 30)
+        )
+
+        # avatar
+        if avatar:
+            img.paste(avatar, (80, 90), avatar)
+
+        # name
+        x, y = 350, 90
+        draw.text((x, y), roblox_name, fill="white", font=font)
+
+        # info
+        draw.text((355, 175), f"Discord: {discord_tag}", fill=(200, 200, 200), font=font)
+        draw.text((355, 220), f"Roblox ID: {roblox_id}", fill=(200, 200, 200), font=font)
+
+        # bar
+        progress = min(points / 50_000_000, 1)
+
+        draw.rounded_rectangle(
+            [350, 340, 1150, 385],
+            radius=18,
+            fill=(40, 40, 55)
+        )
+
+        draw.rounded_rectangle(
+            [350, 340, 350 + int(800 * progress), 385],
+            radius=18,
+            fill=(88, 101, 242)
+        )
+
+        draw.text((1170, 340), f"{points:,}", fill="white", font=font)
+
+        frames.append(img)
+
+    buffer = BytesIO()
+
+    if animated:
+        frames[0].save(
+            buffer,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=90,
+            loop=0,
+            disposal=2
+        )
+    else:
+        frames[0].save(buffer, format="PNG")
+
+    buffer.seek(0)
+    return buffer
 
 # ---------------- CONFIG ----------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
