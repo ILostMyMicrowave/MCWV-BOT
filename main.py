@@ -10,6 +10,7 @@ import math
 import random
 
 session = None
+status_cooldown = {}
 
 from datetime import datetime, timezone
 from discord import app_commands
@@ -1715,27 +1716,56 @@ async def settings(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="status", description="Check Roblox status", guild=guild_obj)
-@require_role()
 async def status(interaction: discord.Interaction, member: discord.Member):
 
+    # ---------------- COOLDOWN CHECK ----------------
+    now = datetime.now(timezone.utc).timestamp()
+    user_id = interaction.user.id
+
+    last_used = status_cooldown.get(user_id, 0)
+
+    if now - last_used < 5:
+        remaining = round(5 - (now - last_used), 1)
+        return await interaction.response.send_message(
+            f"⏳ Slow down — wait {remaining}s before using this again.",
+            ephemeral=True
+        )
+
+    status_cooldown[user_id] = now
+
+    # ---------------- DB LOOKUP ----------------
     users = db_get_all()
 
-    target = next((u for u in users if u[1] == member.id), None)
+    target = next((u for u in users if int(u[1]) == member.id), None)
 
     if not target:
         return await interaction.response.send_message("Not linked", ephemeral=True)
 
-    rid = target[0]
-    current = status_cache.get(rid, 0)
-    status_icons = {0: "⚫", 1: "🟢", 2: "🎮", 3: "🔧"}
+    roblox_id = int(target[0])
+    roblox_name = target[2]
+
+    # ---------------- STATUS ----------------
+    current = status_cache.get(roblox_id, 0)
+
+    status_icons = {
+        0: "⚫",
+        1: "🟢",
+        2: "🎮",
+        3: "🔧"
+    }
+
     icon = status_icons.get(current, "❓")
+
+    # ---------------- OFFLINE INFO ----------------
     extra = ""
-    if current == 0 and rid in offline_since:
-        since_dt = offline_since[rid]
+
+    if current == 0 and roblox_id in offline_since:
+        since_dt = offline_since[roblox_id]
         extra = f"\nOffline since {discord.utils.format_dt(since_dt, 'R')} ({format_duration(since_dt)})"
 
+    # ---------------- RESPONSE ----------------
     await interaction.response.send_message(
-        f"{icon} **{target[2]}** — {status_text(current)}{extra}",
+        f"{icon} **{roblox_name}** — {status_text(current)}{extra}",
         ephemeral=True
     )
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
