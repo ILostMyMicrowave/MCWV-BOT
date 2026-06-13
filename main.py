@@ -498,6 +498,15 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
+@bot.tree.command(name="statstest", guild=guild_obj)
+async def statstest(interaction: discord.Interaction):
+    try:
+        users = db_get_all()
+        sample = users[0]
+        await interaction.response.send_message(f"Sample row: {sample}", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"ERROR: {e}", ephemeral=True)
+
 @bot.tree.command(name="dbtest", guild=guild_obj)
 async def dbtest(interaction: discord.Interaction):
     try:
