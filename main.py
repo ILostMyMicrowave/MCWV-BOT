@@ -686,7 +686,10 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         battles = clan_data.get("data", {}).get("Battles", {})
 
         if not battles:
-            return await interaction.followup.send("❌ No battles found.", ephemeral=True)
+            return await interaction.followup.send(
+                "❌ No battles found.",
+                ephemeral=True
+            )
 
         # ---------------- FIND CURRENT WAR ----------------
         now = datetime.now(timezone.utc).timestamp()
@@ -699,6 +702,90 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
             if start > 10_000_000_000:
                 start /= 1000
             if end > 10_000_000_000:
+                end /= 1000
+
+            if start <= now <= end:
+                active_battle_id = b_id
+                break
+
+        if not active_battle_id:
+            title = war_config.get("Title") or war_data.get("data", {}).get("configName")
+            if title in battles:
+                active_battle_id = title
+
+        if not active_battle_id:
+            active_battle_id = list(battles.keys())[-1]
+
+        battle = battles.get(active_battle_id)
+        if not battle:
+            return await interaction.followup.send(
+                "❌ Could not determine current battle.",
+                ephemeral=True
+            )
+
+        # ---------------- CONTRIBUTIONS ----------------
+        contributions = sorted(
+            battle.get("PointContributions", []),
+            key=lambda x: x.get("Points", 0),
+            reverse=True
+        )
+
+        total_points = battle.get("Points", 0)
+
+        user_entry = next(
+            (e for e in contributions if int(e.get("UserID", 0)) == roblox_id),
+            None
+        )
+
+        rank = next(
+            (i + 1 for i, e in enumerate(contributions)
+             if int(e.get("UserID", 0)) == roblox_id),
+            None
+        )
+
+        friendly = re.sub(
+            r'(\d+)', r' \1',
+            re.sub(r'([A-Z])', r' \1', active_battle_id)
+        ).strip()
+
+        # ---------------- EMBED ----------------
+        embed = discord.Embed(
+            title=f"📊 {roblox_name} — {friendly}",
+            color=discord.Color.red()
+        )
+
+        embed.add_field(name="Discord", value=discord_display, inline=True)
+
+        if not user_entry:
+            embed.description = "😴 No contributions recorded yet for this war."
+            await interaction.followup.send(embed=embed)
+            return
+
+        pts = user_entry.get("Points", 0)
+        pct = (pts / total_points * 100) if total_points else 0
+
+        top_pts = max(contributions[0].get("Points", 1), 1)
+
+        bar_len = int((pts / top_pts) * 20)
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        rank_display = medals.get(rank, f"#{rank}")
+
+        embed.add_field(name="🏅 Rank", value=rank_display, inline=True)
+        embed.add_field(name="⚔️ Points", value=format_points(pts), inline=True)
+        embed.add_field(name="📈 Share", value=f"{pct:.1f}%", inline=True)
+        embed.add_field(name="Progress vs #1", value=f"`{bar}`", inline=False)
+        embed.add_field(name="🔢 Clan Total", value=format_points(total_points), inline=True)
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print("[mystats error]", repr(e))
+        await interaction.followup.send(
+            "❌ Something went wrong while fetching stats.",
+            ephemeral=True
+        )
 
 @bot.tree.command(
     name="profile",
