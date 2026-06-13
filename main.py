@@ -808,96 +808,141 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        # Fetch active war name and clan data in parallel
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
             if war_r.status != 200 or clan_r.status != 200:
-                return await interaction.followup.send("❌ Could not reach the PS99 API.", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 API.",
+                    ephemeral=True
+                )
+
             war_data = await war_r.json()
             clan_data = await clan_r.json()
-    except Exception:
-        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
 
-    # Determine which battle to show
+    except Exception:
+        return await interaction.followup.send(
+            "❌ API request failed.",
+            ephemeral=True
+        )
+
+    # ---------------- WAR CONFIG ----------------
     war_config = war_data.get("data", {}).get("configData", {})
-    active_battle_id = war_config.get("Title") or war_data.get("data", {}).get("configName")
+
+    # ---------------- DETERMINE CURRENT WAR ----------------
     battles = clan_data.get("data", {}).get("Battles", {})
 
-    battle_id = None
-    if active_battle_id and active_battle_id in battles:
-        battle_id = active_battle_id
-    elif battles:
-        battle_id = list(battles.keys())[-1]
+    if not battles:
+        return await interaction.followup.send(
+            "❌ No battle data found for MCWV.",
+            ephemeral=True
+        )
 
-    if not battle_id:
-        return await interaction.followup.send("❌ No battle data found for MCWV.", ephemeral=True)
+    # safer selection (handles missing FinishTime)
+    battle_id = max(
+        battles.items(),
+        key=lambda x: x[1].get("FinishTime") or 0
+    )[0]
 
-    battle = battles[battle_id]
+    battle = battles.get(battle_id)
+
+    if not battle:
+        return await interaction.followup.send(
+            "❌ No battle data found for MCWV.",
+            ephemeral=True
+        )
+
+    # ---------------- CONTRIBUTIONS ----------------
     contributions = sorted(
         battle.get("PointContributions", []),
         key=lambda x: x.get("Points", 0),
         reverse=True
     )
+
     total_points = battle.get("Points", 0)
 
     if not contributions:
-        return await interaction.followup.send("❌ No contribution data yet for this war.", ephemeral=True)
+        return await interaction.followup.send(
+            "❌ No contribution data yet for this war.",
+            ephemeral=True
+        )
 
-    # Resolve Roblox usernames for top 15
+    # ---------------- ROBLOX NAMES ----------------
     top = contributions[:15]
-    user_ids = [e["UserID"] for e in top]
+    user_ids = [e.get("UserID") for e in top if e.get("UserID") is not None]
+
     try:
-        async with session.post(ROBLOX_USERS_API, json={"userIds": user_ids, "excludeBannedUsers": False}) as r:
+        async with session.post(
+            ROBLOX_USERS_API,
+            json={"userIds": user_ids, "excludeBannedUsers": False}
+        ) as r:
             roblox_data = await r.json()
             id_to_name = {u["id"]: u["name"] for u in roblox_data.get("data", [])}
     except Exception:
         id_to_name = {}
 
-    # Build Discord mention lookup from our DB (roblox_id -> discord_id)
+    # ---------------- DISCORD LOOKUP ----------------
     db_users = db_get_all()
     roblox_to_discord = {int(u[0]): u[1] for u in db_users}
 
-    # Rank medals
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     top_points = top[0]["Points"] if top else 1
 
     lines = []
+
     for i, entry in enumerate(top, 1):
-        uid = entry["UserID"]
+        uid = entry.get("UserID")
         pts = entry.get("Points", 0)
+
         name = id_to_name.get(uid, f"Unknown ({uid})")
         medal = medals.get(i, f"`#{i:>2}`")
+
         bar_len = int((pts / top_points) * 10)
         bar = "█" * bar_len + "░" * (10 - bar_len)
+
         discord_mention = f" <@{roblox_to_discord[uid]}>" if uid in roblox_to_discord else ""
+
         lines.append(f"{medal} **{name}**{discord_mention}\n`{bar}` **{format_points(pts)}**")
 
-    # Friendly battle name
+    # ---------------- DISPLAY ----------------
     friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', battle_id)).strip()
 
     now = datetime.now(timezone.utc).timestamp()
     finish_ts = war_config.get("FinishTime")
-    is_active = finish_ts and war_config.get("StartTime", 0) <= now <= finish_ts
+    start_ts = war_config.get("StartTime", 0)
+
+    is_active = False
+    if finish_ts:
+        is_active = start_ts <= now <= finish_ts
 
     embed = discord.Embed(
         title=f"🏆  {CLAN_NAME} — {friendly}",
         description="\n".join(lines),
         color=discord.Color.red() if is_active else discord.Color.dark_gold()
     )
+
     embed.add_field(
         name="🔢  Total Clan Points",
         value=f"**{format_points(total_points)}**",
         inline=True
     )
+
     embed.add_field(
         name="👥  Contributors",
         value=f"**{len(contributions)}**",
         inline=True
     )
-    status_str = "⚔️ Active" if is_active else "🏁 Ended"
-    embed.add_field(name="Status", value=status_str, inline=True)
-    embed.set_footer(text=f"Showing top {len(top)} of {len(contributions)} • ps99.biggamesapi.io")
-    await interaction.followup.send(embed=embed)
 
+    embed.add_field(
+        name="Status",
+        value="⚔️ Active" if is_active else "🏁 Ended",
+        inline=True
+    )
+
+    embed.set_footer(
+        text=f"Showing top {len(top)} of {len(contributions)} • ps99.biggamesapi.io"
+    )
+
+    await interaction.followup.send(embed=embed)
+    
 @bot.tree.command(
     name="mystats",
     description="Check a Roblox user's clan war contribution stats",
