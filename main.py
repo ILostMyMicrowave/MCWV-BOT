@@ -4,7 +4,10 @@ import asyncio
 import sqlite3
 import discord
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from io import BytesIO
+import math
+import random
 
 from datetime import datetime, timezone
 from discord import app_commands
@@ -29,35 +32,46 @@ Thread(target=run_web).start()
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 
-def generate_profile_card(roblox_name, roblox_id, discord_tag, points, rank):
-    # base image
-    img = Image.new("RGB", (900, 300), (18, 18, 28))
-    draw = ImageDraw.Draw(img)
+def generate_particles(count, width, height):
+    return [
+        (
+            random.randint(60, width - 60),
+            random.randint(60, height - 60),
+            random.randint(2, 5)
+        )
+        for _ in range(count)
+    ]
 
-    # fonts (safe fallback)
-    try:
-        title_font = ImageFont.truetype("arial.ttf", 42)
-        text_font = ImageFont.truetype("arial.ttf", 24)
-    except:
-        title_font = ImageFont.load_default()
-        text_font = ImageFont.load_default()
+def glass_panel(base, xy, radius=40, fill=(30, 35, 55, 180)):
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
 
-    # title
-    draw.text((30, 25), roblox_name, fill=(255, 255, 255), font=title_font)
+    d.rounded_rectangle(xy, radius=radius, fill=fill)
 
-    # info
-    draw.text((30, 110), f"Roblox ID: {roblox_id}", fill=(180, 180, 180), font=text_font)
-    draw.text((30, 150), f"Discord: {discord_tag}", fill=(180, 180, 180), font=text_font)
+    layer = layer.filter(ImageFilter.GaussianBlur(10))
+    base.alpha_composite(layer)
 
-    draw.text((30, 200), f"Points: {points}", fill=(255, 200, 0), font=text_font)
-    draw.text((30, 235), f"Rank: {rank}", fill=(0, 200, 255), font=text_font)
+def glow_bar(base, x, y, width, height, progress):
+    glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(glow)
 
-    # convert to file
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
+    filled = int(width * progress)
 
-    return buffer
+    d.rounded_rectangle(
+        [x, y, x + filled, y + height],
+        radius=25,
+        fill=(80, 120, 255, 180)
+    )
+
+    glow = glow.filter(ImageFilter.GaussianBlur(20))
+    base.alpha_composite(glow)
+
+    d2 = ImageDraw.Draw(base)
+    d2.rounded_rectangle(
+        [x, y, x + filled, y + height],
+        radius=25,
+        fill=(90, 140, 255)
+    )
 
 # ---------------- CONFIG ----------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
