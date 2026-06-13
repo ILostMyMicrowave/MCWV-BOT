@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import discord
 import aiohttp
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from datetime import datetime, timezone
 from discord import app_commands
@@ -889,18 +890,199 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             )
 
         # ---------------- PROFILE IMAGE ----------------
-        buffer = generate_profile_card(
-            roblox_name,
-            roblox_id,
-            discord_display,
-            pts,
-            rank_display
+async def fetch_roblox_avatar(user_id):
+    try:
+        url = (
+            "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+            f"?userIds={user_id}&size=420x420&format=Png&isCircular=false"
         )
 
-        file = discord.File(buffer, filename="profile.png")
-        embed.set_image(url="attachment://profile.png")
+        async with session.get(url) as r:
+            data = await r.json()
 
-        await interaction.followup.send(embed=embed, file=file)
+        image_url = data["data"][0]["imageUrl"]
+
+        async with session.get(image_url) as r:
+            avatar_bytes = await r.read()
+
+        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
+        return avatar
+
+    except Exception as e:
+        print("Avatar fetch error:", e)
+        return None
+        
+        async def generate_profile_card(
+    roblox_name,
+    roblox_id,
+    discord_tag,
+    points,
+    rank
+):
+    WIDTH = 1400
+    HEIGHT = 600
+
+    img = Image.new("RGB", (WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(img)
+
+    # ---------- BACKGROUND ----------
+    for y in range(HEIGHT):
+        r = int(15 + (60 - 15) * (y / HEIGHT))
+        g = int(20 + (35 - 20) * (y / HEIGHT))
+        b = int(40 + (130 - 40) * (y / HEIGHT))
+        draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
+
+    # ---------- FONTS ----------
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 62)
+        sub_font = ImageFont.truetype("arial.ttf", 28)
+        stat_title = ImageFont.truetype("arial.ttf", 22)
+        stat_value = ImageFont.truetype("arial.ttf", 40)
+        rank_font = ImageFont.truetype("arial.ttf", 48)
+    except:
+        title_font = ImageFont.load_default()
+        sub_font = ImageFont.load_default()
+        stat_title = ImageFont.load_default()
+        stat_value = ImageFont.load_default()
+        rank_font = ImageFont.load_default()
+
+    # ---------- MAIN PANEL ----------
+    draw.rounded_rectangle(
+        [40, 40, WIDTH - 40, HEIGHT - 40],
+        radius=35,
+        fill=(24, 27, 38)
+    )
+
+    # ---------- AVATAR ----------
+    avatar = await fetch_roblox_avatar(roblox_id)
+
+    if avatar:
+        avatar = avatar.resize((220, 220))
+
+        mask = Image.new("L", (220, 220), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 220, 220), fill=255)
+
+        avatar.putalpha(mask)
+
+        img.paste(
+            avatar,
+            (80, 90),
+            avatar
+        )
+
+    # ---------- USER INFO ----------
+    draw.text(
+        (350, 90),
+        roblox_name,
+        fill="white",
+        font=title_font
+    )
+
+    draw.text(
+        (355, 175),
+        f"Discord: {discord_tag}",
+        fill=(180, 180, 180),
+        font=sub_font
+    )
+
+    draw.text(
+        (355, 220),
+        f"Roblox ID: {roblox_id}",
+        fill=(180, 180, 180),
+        font=sub_font
+    )
+
+    # ---------- RANK BADGE ----------
+    badge_color = (255, 215, 0)
+
+    draw.rounded_rectangle(
+        [1120, 80, 1310, 160],
+        radius=20,
+        fill=badge_color
+    )
+
+    draw.text(
+        (1175, 95),
+        str(rank),
+        fill=(20, 20, 20),
+        font=rank_font
+    )
+
+    # ---------- POINTS BAR ----------
+    draw.text(
+        (350, 290),
+        "WAR CONTRIBUTION",
+        fill=(160, 160, 160),
+        font=sub_font
+    )
+
+    draw.rounded_rectangle(
+        [350, 340, 1150, 390],
+        radius=20,
+        fill=(50, 50, 60)
+    )
+
+    pct = min(points / 50000000, 1)
+
+    draw.rounded_rectangle(
+        [350, 340, 350 + int(800 * pct), 390],
+        radius=20,
+        fill=(88, 101, 242)
+    )
+
+    draw.text(
+        (1170, 340),
+        f"{points:,}",
+        fill="white",
+        font=sub_font
+    )
+
+    # ---------- STAT CARDS ----------
+    cards = [
+        ("POINTS", f"{points:,}"),
+        ("RANK", str(rank)),
+        ("CLAN", "MCWV")
+    ]
+
+    start_x = 80
+
+    for i, (title, value) in enumerate(cards):
+
+        x = start_x + i * 320
+
+        draw.rounded_rectangle(
+            [x, 440, x + 260, 530],
+            radius=20,
+            fill=(40, 44, 60)
+        )
+
+        draw.text(
+            (x + 20, 455),
+            title,
+            fill=(140, 140, 140),
+            font=stat_title
+        )
+
+        draw.text(
+            (x + 20, 485),
+            value,
+            fill="white",
+            font=stat_value
+        )
+
+    # ---------- FOOTER ----------
+    draw.text(
+        (1070, 545),
+        "MCWV CLAN PROFILE",
+        fill=(130, 130, 130),
+        font=sub_font
+    )
+
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    return buffer
 
     except Exception as e:
         print("[profile] error:", repr(e))
