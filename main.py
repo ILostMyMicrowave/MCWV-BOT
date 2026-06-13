@@ -1520,6 +1520,7 @@ async def status(interaction: discord.Interaction, member: discord.Member):
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
 @tasks.loop(minutes=2)
 async def check_loop():
+    print("CHECK LOOP RUNNING")
 
     users = db_get_all()
     if not users or not bot_enabled:
