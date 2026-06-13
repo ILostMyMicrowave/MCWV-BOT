@@ -1938,15 +1938,14 @@ async def on_ready():
 
     print(f"Logged in as {bot.user}")
 
-    try:
-        synced = await bot.tree.sync(guild=guild_obj)
-        print(f"Synced {len(synced)} commands")
-    except Exception as e:
-        print("Sync error:", e)
-
     # start war loop safely (only once)
-    if not any(t.get_name() == "war_poll_loop" for t in bot.tasks):
+    if not war_poll_loop.is_running():
         war_poll_loop.start()
+
+    # start check loop safely (ONLY FIX YOU NEEDED)
+    if not check_loop.is_running():
+        check_loop.start()
+        print("check_loop started")
 
 
 @bot.event
@@ -1954,6 +1953,7 @@ async def on_disconnect():
     global session
     if session:
         await session.close()
+        
 # ---------------- RUN ----------------
 from threading import Thread
 import asyncio
