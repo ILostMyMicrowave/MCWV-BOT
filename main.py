@@ -1577,7 +1577,7 @@ async def check_loop():
                 offline_since[rid] = now
 
             # ONLY ping when leaving IN GAME
-            if old == 2 and db_get_setting("offline_tracking") == "true":
+            if old is not None and old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
                 channel = await bot.fetch_channel(CHANNEL_ID)
                 await channel.send(
                     f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
