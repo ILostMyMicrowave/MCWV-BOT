@@ -890,7 +890,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
-        if battle:
+                if battle:
             embed.add_field(
                 name="⚔️ Current War",
                 value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
@@ -903,12 +903,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 inline=False
             )
 
-except Exception as e:
-    print("[profile] error:", repr(e))
-    await interaction.followup.send(
-        "❌ Profile command failed.",
-        ephemeral=True
-    )
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print("[profile] error:", repr(e))
+        await interaction.followup.send(
+            "❌ Profile command failed.",
+            ephemeral=True
+        )
 
         # ---------------- PROFILE IMAGE ----------------
 async def fetch_roblox_avatar(user_id):
