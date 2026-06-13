@@ -1865,21 +1865,27 @@ async def approve(self, interaction: discord.Interaction, button: discord.ui.But
         except:
             pass
 
-
 # ---------------- CLEANUP ----------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
-    # force immediate war sync on startup
-    bot.loop.create_task(war_poll_loop())
+    try:
+        synced = await bot.tree.sync(guild=guild_obj)
+        print(f"Synced {len(synced)} commands")
+    except Exception as e:
+        print("Sync error:", e)
+
+    # start war loop safely (only once)
+    if not any(t.get_name() == "war_poll_loop" for t in bot.tasks):
+        war_poll_loop.start()
+
 
 @bot.event
 async def on_disconnect():
     global session
     if session:
         await session.close()
-
 # ---------------- RUN ----------------
 from threading import Thread
 import asyncio
