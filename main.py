@@ -1650,6 +1650,8 @@ async def check_loop():
     if not users or not bot_enabled:
         return
 
+    print("Loop running, users:", len(users))  # DEBUG LINE
+
     try:
         global session
 
