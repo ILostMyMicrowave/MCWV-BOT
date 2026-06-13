@@ -1542,41 +1542,49 @@ async def check_loop():
     try:
         for u in data.get("userPresences", []):
 
-            rid = str(u["userId"])
-            current = u["userPresenceType"]
-            old = status_cache.get(rid)
+    rid = str(u["userId"])
+    current = u["userPresenceType"]
 
-            status_cache[rid] = current
+    # previous cached state
+    old = status_cache.get(rid)
 
-            # no change → skip
-            if old == current:
-                continue
+    # update memory cache (still needed for transitions + /list logic)
+    status_cache[rid] = current
 
-            now = datetime.now(timezone.utc)
+    # save to Neon (persistent state)
+    await db.execute("""
+    INSERT INTO user_status (roblox_id, status, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (roblox_id)
+    DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+    """, rid, current)
 
-            info = next((x for x in users if x[0] == rid), None)
-            if not info:
-                continue
+    # no change → skip processing
+    if old == current:
+        continue
 
-            # IN GAME → ignore everything
-            if current == 2:
-                offline_since.pop(rid, None)
-                continue
+    now = datetime.now(timezone.utc)
 
-            # first time seen outside game
-            if rid not in offline_since:
-                offline_since[rid] = now
+    info = next((x for x in users if x[0] == rid), None)
+    if not info:
+        continue
 
-            # ONLY ping when leaving IN GAME
-            if old == 2 and db_get("offline_tracking") == "true":
-                channel = await bot.fetch_channel(CHANNEL_ID)
-                await channel.send(
-                    f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-                    allowed_mentions=discord.AllowedMentions(users=True)
-                )
+    # IN GAME → reset offline tracking
+    if current == 2:
+        offline_since.pop(rid, None)
+        continue
 
-    except Exception as e:
-        print("Loop error (processing):", e)
+    # first time seen outside game
+    if rid not in offline_since:
+        offline_since[rid] = now
+
+    # ONLY ping when leaving IN GAME
+    if old == 2 and db_get("offline_tracking") == "true":
+        channel = await bot.fetch_channel(CHANNEL_ID)
+        await channel.send(
+            f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
 
 # ---------------- REMINDER LOOP (every 30 min — re-pings offline users) ----------------
 @tasks.loop(minutes=30)
