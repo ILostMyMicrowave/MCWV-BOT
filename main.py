@@ -1011,7 +1011,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             roblox_id=roblox_id,
             discord_tag=discord_display,
             points=pts,
-            rank=rank or "N/A",
+            rank=rank if rank is not None else 0,
             animated=False
         )
 
