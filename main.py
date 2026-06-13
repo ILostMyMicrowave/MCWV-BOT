@@ -32,6 +32,21 @@ Thread(target=run_web).start()
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 
+def load_fonts():
+    try:
+        return {
+            "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52),
+            "big":   ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34),
+            "small": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24),
+        }
+    except:
+        # fallback (still works, just worse)
+        return {
+            "title": ImageFont.load_default(),
+            "big": ImageFont.load_default(),
+            "small": ImageFont.load_default(),
+        }
+
 def generate_particles(count, width, height):
     return [
         (
@@ -75,6 +90,38 @@ def glow_bar(base, x, y, width, height, progress):
         fill=(90, 140, 255)
     )
 
+def draw_shimmer_bar(img, x, y, width, height, progress, frame):
+    base = ImageDraw.Draw(img)
+
+    filled = int(width * progress)
+
+    base.rounded_rectangle([x, y, x + width, y + height], radius=18, fill=(40, 40, 55))
+
+    if filled <= 0:
+        return
+
+    base.rounded_rectangle([x, y, x + filled, y + height], radius=18, fill=(90, 140, 255))
+
+    shimmer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(shimmer)
+
+    offset = (frame * 12) % (filled + 200)
+    band = 120
+
+    for i in range(-40, 40, 10):
+        sdraw.polygon(
+            [
+                (x + offset + i - 200, y),
+                (x + offset + i, y),
+                (x + offset + i + band, y + height),
+                (x + offset + i + band - 200, y + height),
+            ],
+            fill=(160, 200, 255, 60)
+        )
+
+    shimmer = shimmer.filter(ImageFilter.GaussianBlur(6))
+    img.alpha_composite(shimmer)
+
 async def fetch_roblox_avatar(user_id):
     try:
         url = (
@@ -108,22 +155,10 @@ async def generate_profile_card(
     WIDTH, HEIGHT = 1400, 600
     frames = []
 
-    from PIL import ImageFont
-
-def load_fonts():
-    try:
-        return {
-            "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52),
-            "big":   ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34),
-            "small": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24),
-        }
-    except:
-        # fallback (still works, just worse)
-        return {
-            "title": ImageFont.load_default(),
-            "big": ImageFont.load_default(),
-            "small": ImageFont.load_default(),
-        }
+    fonts = load_fonts()
+    title_font = fonts["title"]
+    big_font = fonts["big"]
+    small_font = fonts["small"]
 
     particles = generate_particles(25, WIDTH, HEIGHT)
 
@@ -131,10 +166,8 @@ def load_fonts():
 
     if avatar:
         avatar = avatar.resize((220, 220))
-
         mask = Image.new("L", (220, 220), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, 220, 220), fill=255)
-
         avatar.putalpha(mask)
 
     for frame in range(6 if animated else 1):
@@ -152,67 +185,44 @@ def load_fonts():
         # particles
         for i, (x, y, size) in enumerate(particles):
             offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
-
-            draw.ellipse(
-                [
-                    x + offset,
-                    y + offset,
-                    x + size + offset,
-                    y + size + offset
-                ],
-                fill=(120, 160, 255, 120)
-            )
+            draw.ellipse([x+offset, y+offset, x+size+offset, y+size+offset], fill=(120,160,255,120))
 
         # panel
-        draw.rounded_rectangle(
-            [40, 40, WIDTH - 40, HEIGHT - 40],
-            radius=35,
-            fill=(20, 22, 30)
-        )
+        draw.rounded_rectangle([40, 40, WIDTH-40, HEIGHT-40], radius=35, fill=(20,22,30))
 
         # avatar
         if avatar:
             img.paste(avatar, (80, 90), avatar)
 
         # name
-        x, y = 350, 90
-        draw.text((x, y), roblox_name, fill="white", font=font)
+        x, y = 350, 80
+        draw.text((x, y), roblox_name, fill="white", font=title_font)
+
+        for i in range(3):
+            draw.text((x, y), roblox_name, fill=(90,140,255,40), font=title_font)
 
         # info
-        draw.text((355, 175), f"Discord: {discord_tag}", fill=(200, 200, 200), font=font)
-        draw.text((355, 220), f"Roblox ID: {roblox_id}", fill=(200, 200, 200), font=font)
+        draw.text((355, 175), f"Discord: {discord_tag}", fill=(200,200,200), font=small_font)
+        draw.text((355, 215), f"Roblox ID: {roblox_id}", fill=(160,160,160), font=small_font)
+        draw.text((355, 255), f"Rank: {rank}", fill=(180,180,180), font=small_font)
 
-        # bar
+        # shimmer bar
         progress = min(points / 50_000_000, 1)
 
-        draw.rounded_rectangle(
-            [350, 340, 1150, 385],
-            radius=18,
-            fill=(40, 40, 55)
-        )
+        draw_shimmer_bar(img, 350, 340, 800, 45, progress, frame)
 
-        draw.rounded_rectangle(
-            [350, 340, 350 + int(800 * progress), 385],
-            radius=18,
-            fill=(88, 101, 242)
-        )
+        draw.text((350, 300), "WAR PROGRESS", fill=(180,180,180), font=small_font)
+        draw.text((1170, 340), f"{int(progress*100)}%", fill="white", font=small_font)
 
-        draw.text((1170, 340), f"{points:,}", fill="white", font=font)
+        draw.text((355, 410), f"{points:,} TOTAL POINTS", fill="white", font=big_font)
 
         frames.append(img)
 
     buffer = BytesIO()
 
     if animated:
-        frames[0].save(
-            buffer,
-            format="GIF",
-            save_all=True,
-            append_images=frames[1:],
-            duration=90,
-            loop=0,
-            disposal=2
-        )
+        frames[0].save(buffer, format="GIF", save_all=True,
+                       append_images=frames[1:], duration=90, loop=0)
     else:
         frames[0].save(buffer, format="PNG")
 
