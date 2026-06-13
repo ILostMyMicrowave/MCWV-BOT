@@ -942,7 +942,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
     try:
-        # ---------------- RESOLVE ROBLOX USER ----------------
+        # ---------------- RESOLVE USER ----------------
         resolved = await resolve_roblox_username(roblox_username)
         if not resolved:
             return await interaction.followup.send(
@@ -967,10 +967,9 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
             if war_r.status == 200 and clan_r.status == 200:
-                war_data = await war_r.json()
                 clan_data = await clan_r.json()
-
                 battles = clan_data.get("data", {}).get("Battles", {})
+
                 now = datetime.now(timezone.utc).timestamp()
 
                 active_battle_id = None
@@ -1006,14 +1005,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                     None
                 )
 
-        # ---------------- GENERATE IMAGE ----------------
+        # ---------------- IMAGE ----------------
         image_buffer = await generate_profile_card(
             roblox_name=roblox_name,
             roblox_id=roblox_id,
             discord_tag=discord_display,
             points=pts,
-            rank=rank if rank else "N/A",
-            animated=False   # set True later for GIF
+            rank=rank or "N/A",
+            animated=False
         )
 
         file = discord.File(fp=image_buffer, filename="profile.png")
@@ -1041,7 +1040,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 inline=False
             )
 
-        # IMPORTANT: attach image here
+        # THIS is what makes the image appear
         embed.set_image(url="attachment://profile.png")
 
         await interaction.followup.send(embed=embed, file=file)
