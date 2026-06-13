@@ -31,6 +31,15 @@ def run_web():
 
 Thread(target=run_web).start()
 
+def get_latest_battle(battles):
+    if not battles:
+        return None
+
+    return max(
+        battles.items(),
+        key=lambda x: x[1].get("FinishTime", 0)
+    )[0]
+
 async def run_initial_presence_check(channel):
     try:
         users = db_get_all()
@@ -934,32 +943,10 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
                 ephemeral=True
             )
 
-        # ---------------- FIND CURRENT WAR ----------------
-        now = datetime.now(timezone.utc).timestamp()
-        active_battle_id = None
+        # ---------------- FIND CURRENT WAR (FIXED) ----------------
+        battle_id = get_latest_battle(battles)
+        battle = battles.get(battle_id)
 
-        for b_id, b_data in battles.items():
-            start = b_data.get("StartTime", 0)
-            end = b_data.get("FinishTime", 0)
-
-            if start > 10_000_000_000:
-                start /= 1000
-            if end > 10_000_000_000:
-                end /= 1000
-
-            if start <= now <= end:
-                active_battle_id = b_id
-                break
-
-        if not active_battle_id:
-            title = war_config.get("Title") or war_data.get("data", {}).get("configName")
-            if title in battles:
-                active_battle_id = title
-
-        if not active_battle_id:
-            active_battle_id = list(battles.keys())[-1]
-
-        battle = battles.get(active_battle_id)
         if not battle:
             return await interaction.followup.send(
                 "❌ Could not determine current battle.",
