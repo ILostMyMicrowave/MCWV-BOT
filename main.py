@@ -1435,71 +1435,120 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
         summary += "\n\n⚠️ **Some steps failed:**\n" + "\n".join(errors)
     await interaction.followup.send(f"**Accept complete!**\n{summary}", ephemeral=True)
 
-@bot.tree.command(name="kick", description="Remove a member from the clan and unlink their Roblox account", guild=guild_obj)
+@bot.tree.command(
+    name="kick",
+    description="Remove a member (Discord or Roblox username) with confirmation",
+    guild=guild_obj
+)
 @require_role()
-async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+async def kick(interaction: discord.Interaction, target: str, reason: str = "No reason provided"):
     await interaction.response.defer(ephemeral=True)
 
     guild = interaction.guild
-
-    # --- get their linked Roblox info before removing ---
     db_users = db_get_all()
-    linked = next((u for u in db_users if u[1] == member.id), None)
-    roblox_name = linked[2] if linked else "Not linked"
-    roblox_id   = linked[0] if linked else None
 
-    actions = []
-    errors  = []
+    member = None
+    roblox_name = None
+    roblox_id = None
 
-    # --- remove clan member role ---
-    clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
-    if clan_role and clan_role in member.roles:
-        try:
-            await member.remove_roles(clan_role, reason=f"Kicked by {interaction.user}: {reason}")
-            actions.append(f"✅ Removed role **{clan_role.name}**")
-        except Exception as e:
-            errors.append(f"❌ Could not remove role: {e}")
-    elif clan_role:
-        actions.append("ℹ️ Member did not have the clan role")
+    match = re.match(r"<@!?(\d+)>", target)
 
-    # --- unlink from bot DB ---
-    if linked:
-        db_remove(member.id)
-        actions.append(f"✅ Unlinked Roblox account **{roblox_name}**")
+    if match:
+        discord_id = int(match.group(1))
+        member = guild.get_member(discord_id) or await guild.fetch_member(discord_id)
+
+    elif target.isdigit():
+        discord_id = int(target)
+        member = guild.get_member(discord_id) or await guild.fetch_member(discord_id)
+
     else:
-        actions.append("ℹ️ No Roblox account was linked")
+        roblox_name = target.lower()
+        linked = next((u for u in db_users if u[2].lower() == roblox_name), None)
 
-    # --- clear from offline tracking ---
-    if roblox_id:
-        offline_since.pop(roblox_id, None)
-        status_cache.pop(roblox_id, None)
-        actions.append("✅ Removed from offline tracking")
+        if not linked:
+            return await interaction.followup.send("❌ Roblox user not found.", ephemeral=True)
 
-    # --- log ---
-    log_ch = guild.get_channel(LOG_CHANNEL_ID)
-    if log_ch:
-        log_embed = discord.Embed(
-            title="🚫  Member Kicked",
-            color=discord.Color.red(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        log_embed.add_field(name="Staff",      value=interaction.user.mention, inline=True)
-        log_embed.add_field(name="Member",     value=member.mention,           inline=True)
-        log_embed.add_field(name="Roblox",     value=roblox_name,              inline=True)
-        log_embed.add_field(name="Reason",     value=reason,                   inline=False)
-        log_embed.add_field(name="Actions",    value="\n".join(actions) or "—",inline=False)
-        if errors:
-            log_embed.add_field(name="⚠️ Errors", value="\n".join(errors), inline=False)
-        log_embed.set_footer(text=f"Member ID: {member.id}" + (f" • Roblox ID: {roblox_id}" if roblox_id else ""))
-        try:
-            await log_ch.send(embed=log_embed)
-        except Exception:
-            pass
+        roblox_id = linked[0]
+        discord_id = linked[1]
 
-    summary = "\n".join(actions)
-    if errors:
-        summary += "\n\n⚠️ **Errors:**\n" + "\n".join(errors)
-    await interaction.followup.send(f"**{member.display_name}** has been kicked.\n{summary}", ephemeral=True)
+        member = guild.get_member(int(discord_id)) or await guild.fetch_member(int(discord_id))
+        roblox_name = linked[2]
+
+    if not member:
+        return await interaction.followup.send("❌ Member not found.", ephemeral=True)
+
+    # resolve linked if Discord path
+    linked = next((u for u in db_users if u[1] == member.id), None)
+
+    if linked:
+        roblox_name = linked[2]
+        roblox_id = linked[0]
+
+    # ---------------- CONFIRMATION VIEW ----------------
+    class KickConfirmView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
+
+        @discord.ui.button(label="CONFIRM KICK", style=discord.ButtonStyle.danger)
+        async def confirm(self, interaction_btn: discord.Interaction, button: discord.ui.Button):
+
+            await interaction_btn.response.defer(ephemeral=True)
+
+            actions = []
+            errors = []
+
+            try:
+                clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
+
+                if clan_role and clan_role in member.roles:
+                    await member.remove_roles(
+                        clan_role,
+                        reason=f"Kicked by {interaction.user}: {reason}"
+                    )
+                    actions.append(f"✅ Removed role {clan_role.name}")
+
+                if linked:
+                    db_remove(member.id)
+                    actions.append(f"✅ Unlinked Roblox account {roblox_name}")
+
+                if roblox_id:
+                    offline_since.pop(str(roblox_id), None)
+                    status_cache.pop(str(roblox_id), None)
+                    actions.append("✅ Removed from tracking")
+
+                await interaction_btn.edit_original_response(
+                    content=f"✅ Successfully kicked **{member.display_name}**\n" + "\n".join(actions),
+                    view=None
+                )
+
+            except Exception as e:
+                await interaction_btn.edit_original_response(
+                    content=f"❌ Kick failed: {e}",
+                    view=None
+                )
+
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction_btn: discord.Interaction, button: discord.ui.Button):
+            await interaction_btn.response.edit_message(
+                content="❎ Kick cancelled.",
+                view=None
+            )
+
+        async def on_timeout(self):
+            for item in self.children:
+                item.disabled = True
+
+    # ---------------- SEND CONFIRMATION ----------------
+    embed = discord.Embed(
+        title="⚠️ Confirm Kick",
+        description=f"Are you sure you want to kick **{member.display_name}**?",
+        color=discord.Color.orange()
+    )
+
+    embed.add_field(name="Roblox", value=roblox_name or "Unknown", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+
+    await interaction.followup.send(embed=embed, view=KickConfirmView(), ephemeral=True)
 
 @bot.tree.command(name="settings", description="Show current bot settings", guild=guild_obj)
 @require_role()
