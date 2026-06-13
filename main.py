@@ -903,6 +903,13 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 inline=False
             )
 
+    except Exception as e:
+    print("[profile] error:", repr(e))
+    await interaction.followup.send(
+        "❌ Profile command failed.",
+        ephemeral=True
+    )
+
         # ---------------- PROFILE IMAGE ----------------
 async def fetch_roblox_avatar(user_id):
     try:
