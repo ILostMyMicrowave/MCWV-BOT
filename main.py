@@ -1020,12 +1020,16 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 ephemeral=True
             )
 
-        roblox_id = int(resolved["id"])
+        roblox_id = str(resolved["id"])   # force string consistency
         roblox_name = resolved["name"]
 
         # ---------------- DB LOOKUP ----------------
         db_users = db_get_all()
-        linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
+
+        linked = next(
+            (u for u in db_users if str(u[0]) == roblox_id),
+            None
+        )
 
         discord_id = linked[1] if linked else None
         discord_display = f"<@{discord_id}>" if discord_id else "Not linked"
@@ -1035,23 +1039,27 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         rank = None
         battle = None
 
-        async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
-            if war_r.status == 200 and clan_r.status == 200:
-                clan_data = await clan_r.json()
-                battles = clan_data.get("data", {}).get("Battles", {})
+        try:
+            async with session.get(CLAN_API) as clan_r:
+                if clan_r.status == 200:
+                    clan_data = await clan_r.json()
+                    battles = clan_data.get("data", {}).get("Battles", {})
 
-                now = datetime.now(timezone.utc).timestamp()
+                    now = datetime.now(timezone.utc).timestamp()
 
-                active_battle_id = None
-                for b_id, b_data in battles.items():
-                    start = b_data.get("StartTime", 0)
-                    end = b_data.get("FinishTime", 0)
+                    active_battle = None
+                    for b_id, b_data in battles.items():
+                        start = b_data.get("StartTime", 0)
+                        end = b_data.get("FinishTime", 0)
 
-                    if start <= now <= end:
-                        active_battle_id = b_id
-                        break
+                        if start <= now <= end:
+                            active_battle = b_data
+                            break
 
-                battle = battles.get(active_battle_id) if active_battle_id else None
+                    battle = active_battle
+
+        except Exception as e:
+            print("[profile] war API error:", e)
 
         # ---------------- STATS ----------------
         if battle:
@@ -1062,7 +1070,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             )
 
             user_entry = next(
-                (e for e in contributions if int(e.get("UserID", 0)) == roblox_id),
+                (e for e in contributions if str(e.get("UserID")) == roblox_id),
                 None
             )
 
@@ -1071,14 +1079,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
                 rank = next(
                     (i + 1 for i, e in enumerate(contributions)
-                     if int(e.get("UserID", 0)) == roblox_id),
+                     if str(e.get("UserID")) == roblox_id),
                     None
                 )
 
         # ---------------- IMAGE ----------------
         image_buffer = await generate_profile_card(
             roblox_name=roblox_name,
-            roblox_id=roblox_id,
+            roblox_id=int(roblox_id),
             discord_tag=discord_display,
             points=pts,
             rank=rank if rank is not None else 0,
@@ -1094,7 +1102,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         )
 
         embed.add_field(name="🎮 Roblox", value=roblox_name, inline=True)
-        embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
+        embed.add_field(name="🆔 User ID", value=roblox_id, inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
         if battle:
@@ -1110,7 +1118,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 inline=False
             )
 
-        # THIS is what makes the image appear
         embed.set_image(url="attachment://profile.png")
 
         await interaction.followup.send(embed=embed, file=file)
@@ -1118,7 +1125,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
     except Exception as e:
         print("[profile] error:", repr(e))
         await interaction.followup.send(
-            "❌ Profile command failed.",
+            f"❌ Profile failed: `{e}`",
             ephemeral=True
         )
 
