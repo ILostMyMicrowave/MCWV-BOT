@@ -690,99 +690,15 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
 
         # ---------------- FIND CURRENT WAR ----------------
         now = datetime.now(timezone.utc).timestamp()
-
         active_battle_id = None
 
-        # 1) try find active battle by time
         for b_id, b_data in battles.items():
             start = b_data.get("StartTime", 0)
             end = b_data.get("FinishTime", 0)
 
-            # safety: sometimes API uses ms
             if start > 10_000_000_000:
                 start /= 1000
             if end > 10_000_000_000:
-                end /= 1000
-
-            if start <= now <= end:
-                active_battle_id = b_id
-                break
-
-        # 2) fallback to API "active title"
-        if not active_battle_id:
-            title = war_config.get("Title") or war_data.get("data", {}).get("configName")
-            if title in battles:
-                active_battle_id = title
-
-        # 3) fallback to latest battle
-        if not active_battle_id:
-            active_battle_id = list(battles.keys())[-1]
-
-        battle = battles.get(active_battle_id)
-        if not battle:
-            return await interaction.followup.send("❌ Could not determine current battle.", ephemeral=True)
-
-        # ---------------- CONTRIBUTIONS ----------------
-        contributions = sorted(
-            battle.get("PointContributions", []),
-            key=lambda x: x.get("Points", 0),
-            reverse=True
-        )
-
-        total_points = battle.get("Points", 0)
-
-        user_entry = next(
-            (e for e in contributions if int(e.get("UserID", 0)) == roblox_id),
-            None
-        )
-
-        rank = next(
-            (i + 1 for i, e in enumerate(contributions)
-             if int(e.get("UserID", 0)) == roblox_id),
-            None
-        )
-
-        friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', active_battle_id)).strip()
-
-        # ---------------- EMBED ----------------
-        embed = discord.Embed(
-            title=f"📊 {roblox_name} — {friendly}",
-            color=discord.Color.red()
-        )
-
-        embed.add_field(name="Discord", value=discord_display, inline=True)
-
-        if not user_entry:
-            embed.description = "😴 No contributions recorded yet for this war."
-            return await interaction.followup.send(embed=embed)
-
-        pts = user_entry.get("Points", 0)
-        pct = (pts / total_points * 100) if total_points else 0
-
-        top_pts = max(contributions[0].get("Points", 1), 1)
-
-        bar_len = int((pts / top_pts) * 20)
-        bar = "█" * bar_len + "░" * (20 - bar_len)
-
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        rank_display = medals.get(rank, f"#{rank}")
-
-        embed.add_field(name="🏅 Rank", value=rank_display, inline=True)
-        embed.add_field(name="⚔️ Points", value=format_points(pts), inline=True)
-        embed.add_field(name="📈 Share", value=f"{pct:.1f}%", inline=True)
-        embed.add_field(name="Progress vs #1", value=f"`{bar}`", inline=False)
-        embed.add_field(name="🔢 Clan Total", value=format_points(total_points), inline=True)
-
-        embed.add_field(name="Discord", value=discord_display, inline=True)
-
-await interaction.followup.send(embed=embed)
-
-retry_after = check_cooldown(interaction)
-if retry_after:
-    return await interaction.followup.send(
-        f"⏳ Slow down! Try again in {round(retry_after, 1)}s",
-        ephemeral=True
-    )
 
 @bot.tree.command(
     name="profile",
@@ -821,7 +737,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 war_data = await war_r.json()
                 clan_data = await clan_r.json()
 
-                war_config = war_data.get("data", {}).get("configData", {})
                 battles = clan_data.get("data", {}).get("Battles", {})
 
                 now = datetime.now(timezone.utc).timestamp()
@@ -873,18 +788,19 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="🆔 User ID", value=str(roblox_id), inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
-if battle:
-    embed.add_field(
-        name="⚔️ Current War",
-        value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
-        inline=False
-    )
-else:
-    embed.add_field(
-        name="⚔️ Current War",
-        value="No contributions / no active war",
-        inline=False
-    )
+        if battle:
+            embed.add_field(
+                name="⚔️ Current War",
+                value=f"Rank: **{rank_display}**\nPoints: **{format_points(pts)}**",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="⚔️ Current War",
+                value="No contributions / no active war",
+                inline=False
+            )
+
         # ---------------- PROFILE IMAGE ----------------
         buffer = generate_profile_card(
             roblox_name,
