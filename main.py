@@ -499,6 +499,55 @@ async def on_ready():
 
 # ---------------- SLASH COMMANDS ----------------
 
+@bot.tree.command(name="forceunlink", description="Force unlink a user (requires confirmation)")
+@require_role()
+async def forceunlink(interaction: discord.Interaction, discord_id: str):
+    class ForceUnlinkView(discord.ui.View):
+        def __init__(self, discord_id: str):
+            super().__init__(timeout=30)
+            self.discord_id = discord_id
+
+        @discord.ui.button(label="Confirm Unlink", style=discord.ButtonStyle.danger)
+        async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+            try:
+                await db.execute(
+                    "DELETE FROM user_links WHERE discord_id = $1",
+                    self.discord_id
+                )
+
+                status_cache.pop(self.discord_id, None)
+                offline_since.pop(self.discord_id, None)
+
+                await interaction.response.edit_message(
+                    content=f"✅ Successfully force unlinked `{self.discord_id}`",
+                    view=None
+                )
+
+            except Exception as e:
+                await interaction.response.edit_message(
+                    content=f"❌ Failed to unlink: {e}",
+                    view=None
+                )
+
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(
+                content="❎ Force unlink cancelled.",
+                view=None
+            )
+
+        async def on_timeout(self):
+            for item in self.children:
+                item.disabled = True
+
+    view = ForceUnlinkView(discord_id)
+
+    await interaction.response.send_message(
+        f"⚠️ Are you sure you want to force unlink `{discord_id}`?",
+        view=view,
+        ephemeral=True
+    )
+
 @bot.tree.command(name="ping", description="Test command", guild=guild_obj)
 @require_role()
 async def ping(interaction: discord.Interaction):
