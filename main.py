@@ -578,43 +578,68 @@ async def remove(interaction: discord.Interaction, member: discord.Member):
     offline_since.pop(str(member.id), None)
     await interaction.response.send_message(f"✅ Removed {member.mention} from tracking.", ephemeral=True)
 
-@bot.tree.command(name="list", description="Show all tracked users and their current Roblox status", guild=guild_obj)
+@bot.tree.command(
+    name="list",
+    description="Show all tracked users and their current Roblox status",
+    guild=guild_obj
+)
 @require_role()
 async def list_users(interaction: discord.Interaction):
     users = db_get_all()
 
     if not users:
-        return await interaction.response.send_message("No users are being tracked.", ephemeral=True)
+        return await interaction.response.send_message(
+            "No users are being tracked.",
+            ephemeral=True
+        )
 
-    status_icons = {0: "⚫", 1: "🟢", 2: "🎮", 3: "🔧"}
+    status_icons = {
+        0: "⚫",
+        1: "🟢",
+        2: "🎮",
+        3: "🔧"
+    }
 
+    # ---------------- SAFE SORT (string key fix) ----------------
     def sort_key(u):
-        return status_cache.get(u[0], 0) == 0  # offline (0) sorts last
+        roblox_id = str(u[0])
+        return status_cache.get(roblox_id, 0) == 0  # offline last
 
     online_lines = []
     offline_lines = []
+
     for roblox_id, discord_id, username in sorted(users, key=sort_key):
-        current = status_cache.get(roblox_id, 0)
+        rid = str(roblox_id)
+
+        current = status_cache.get(rid, 0)
         icon = status_icons.get(current, "❓")
+
         extra = ""
-        if current == 0 and roblox_id in offline_since:
-            extra = f" — {format_duration(offline_since[roblox_id])}"
+        if current == 0 and rid in offline_since:
+            extra = f" — {format_duration(offline_since[rid])}"
+
         line = f"{icon} <@{discord_id}> — **{username}**{extra}"
+
         if current == 0:
             offline_lines.append(line)
         else:
             online_lines.append(line)
 
     lines = online_lines + offline_lines
-    online_count  = len(online_lines)
+
+    online_count = len(online_lines)
     offline_count = len(offline_lines)
 
     embed = discord.Embed(
         title="📋 Tracked Members",
-        description="\n".join(lines),
+        description="\n".join(lines) if lines else "No status data available.",
         color=discord.Color.blurple()
     )
-    embed.set_footer(text=f"🟢 {online_count} online  •  ⚫ {offline_count} offline  •  {len(users)} total")
+
+    embed.set_footer(
+        text=f"🟢 {online_count} online  •  ⚫ {offline_count} offline  •  {len(users)} total"
+    )
+
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
