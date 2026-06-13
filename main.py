@@ -738,67 +738,111 @@ async def warinfo(interaction: discord.Interaction):
     try:
         async with session.get(PS99_API) as r:
             if r.status != 200:
-                return await interaction.followup.send("❌ Could not reach the PS99 API right now.", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 API right now.",
+                    ephemeral=True
+                )
             data = await r.json()
-    except Exception as e:
-        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
+    except Exception:
+        return await interaction.followup.send(
+            "❌ API request failed.",
+            ephemeral=True
+        )
 
-    config = data.get("data", {}).get("configData", {})
-    raw_name = config.get("Title") or data.get("data", {}).get("configName", "Unknown")
-    start_ts = config.get("StartTime")
-    finish_ts = config.get("FinishTime")
+    # ---------------- SAFE BATTLE SELECTION (FIX) ----------------
+    battles = data.get("data", {}).get("Battles", {})
+
+    if not battles:
+        return await interaction.followup.send(
+            "❌ No clan war data found.",
+            ephemeral=True
+        )
+
+    battle_id = max(
+        battles.items(),
+        key=lambda x: x[1].get("FinishTime") or 0
+    )[0]
+
+    battle = battles.get(battle_id)
+
+    if not battle:
+        return await interaction.followup.send(
+            "❌ Could not determine current war.",
+            ephemeral=True
+        )
+
+    # ---------------- USE REAL BATTLE DATA ----------------
+    raw_name = battle_id
+
+    start_ts = battle.get("StartTime")
+    finish_ts = battle.get("FinishTime")
 
     if not start_ts or not finish_ts:
-        return await interaction.followup.send("❌ No clan war data found.", ephemeral=True)
+        return await interaction.followup.send(
+            "❌ War timing data missing.",
+            ephemeral=True
+        )
 
     now = datetime.now(timezone.utc).timestamp()
     total_duration = finish_ts - start_ts
     elapsed = now - start_ts
 
-    # Friendly name (e.g. "AngelBattle2026" → "Angel Battle 2026")
     friendly_name = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', raw_name)).strip()
 
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
 
+    # ---------------- STATUS ----------------
     if now < start_ts:
         status_line = "⏳  **UPCOMING**"
         color = discord.Color.gold()
         bar = "`" + "░" * 20 + "`"
         time_field = f"Starts {discord.utils.format_dt(start_dt, 'R')}"
+
     elif now > finish_ts:
         status_line = "🏁  **WAR ENDED**"
         color = discord.Color.dark_gray()
         bar = "`" + "█" * 20 + "`"
         time_field = f"Ended {discord.utils.format_dt(finish_dt, 'R')}"
+
     else:
         status_line = "⚔️  **ACTIVE — IN PROGRESS**"
         color = discord.Color.red()
+
         progress = max(0.0, min(1.0, elapsed / total_duration))
         filled = int(progress * 20)
+
         bar = "`" + "█" * filled + "░" * (20 - filled) + f"` {int(progress * 100)}%"
+
         secs_left = int(finish_ts - now)
         h, rem = divmod(secs_left, 3600)
         m = rem // 60
+
         time_field = f"Ends {discord.utils.format_dt(finish_dt, 'R')} ({h}h {m}m left)"
 
+    # ---------------- EMBED ----------------
     embed = discord.Embed(
         title=f"🎮  {friendly_name}",
         color=color
     )
+
     embed.add_field(name="Status", value=status_line, inline=False)
     embed.add_field(name="Progress", value=bar, inline=False)
+
     embed.add_field(
         name="🕐  Start",
         value=discord.utils.format_dt(start_dt, 'F'),
         inline=True
     )
+
     embed.add_field(
         name="🏁  End",
         value=discord.utils.format_dt(finish_dt, 'F'),
         inline=True
     )
+
     embed.add_field(name="⏱️  Time", value=time_field, inline=False)
+
     embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
 
     await interaction.followup.send(embed=embed)
