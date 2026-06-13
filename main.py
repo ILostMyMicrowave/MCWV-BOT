@@ -8,17 +8,17 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from io import BytesIO
 import math
 import random
-
-session = None
-status_cooldown = {}
-
 from datetime import datetime, timezone
+
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from flask import Flask
 from threading import Thread
-import os
+
+# ---------------- GLOBALS ----------------
+session = None
+status_cooldown = {}
 
 app = Flask(__name__)
 
@@ -26,10 +26,13 @@ app = Flask(__name__)
 def home():
     return "Bot is alive"
 
+
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
+
+# start web server (keep-alive)
 Thread(target=run_web).start()
 
 def get_latest_battle(clan_data):
