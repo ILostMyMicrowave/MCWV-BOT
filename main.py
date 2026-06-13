@@ -1516,11 +1516,9 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         f"{icon} **{target[2]}** — {status_text(current)}{extra}",
         ephemeral=True
     )
-
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
 @tasks.loop(minutes=2)
 async def check_loop():
-    
     users = db_get_all()
     if not users or not bot_enabled:
         return
@@ -1541,50 +1539,54 @@ async def check_loop():
 
     try:
         for u in data.get("userPresences", []):
+            rid = str(u["userId"])
+            current = u["userPresenceType"]
 
-    rid = str(u["userId"])
-    current = u["userPresenceType"]
+            old = status_cache.get(rid)
+            status_cache[rid] = current
 
-    # previous cached state
-    old = status_cache.get(rid)
+            # save to Neon (persistent state)
+            try:
+                cur.execute("""
+                    INSERT INTO user_status (roblox_id, status, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (roblox_id)
+                    DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+                """, (rid, current))
+                conn.commit()
+            except Exception as db_error:
+                print("Loop error (DB write):", db_error)
 
-    # update memory cache (still needed for transitions + /list logic)
-    status_cache[rid] = current
+            # no change → skip processing
+            if old == current:
+                continue
 
-    # save to Neon (persistent state)
-    await db.execute("""
-    INSERT INTO user_status (roblox_id, status, updated_at)
-    VALUES ($1, $2, NOW())
-    ON CONFLICT (roblox_id)
-    DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
-    """, rid, current)
+            now = datetime.now(timezone.utc)
 
-    # no change → skip processing
-    if old == current:
-        continue
+            info = next((x for x in users if x[0] == rid), None)
+            if not info:
+                continue
 
-    now = datetime.now(timezone.utc)
+            # IN GAME → reset offline tracking
+            if current == 2:
+                offline_since.pop(rid, None)
+                continue
 
-    info = next((x for x in users if x[0] == rid), None)
-    if not info:
-        continue
+            # first time seen outside game
+            if rid not in offline_since:
+                offline_since[rid] = now
 
-    # IN GAME → reset offline tracking
-    if current == 2:
-        offline_since.pop(rid, None)
-        continue
+            # ONLY ping when leaving IN GAME
+            if old == 2 and db_get_setting("offline_tracking") == "true":
+                channel = await bot.fetch_channel(CHANNEL_ID)
+                await channel.send(
+                    f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+                    allowed_mentions=discord.AllowedMentions(users=True)
+                )
 
-    # first time seen outside game
-    if rid not in offline_since:
-        offline_since[rid] = now
+    except Exception as e:
+        print("Loop error (processing):", e)
 
-    # ONLY ping when leaving IN GAME
-    if old == 2 and db_get("offline_tracking") == "true":
-        channel = await bot.fetch_channel(CHANNEL_ID)
-        await channel.send(
-            f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
 
 # ---------------- REMINDER LOOP (every 30 min — re-pings offline users) ----------------
 @tasks.loop(minutes=30)
