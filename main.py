@@ -498,7 +498,6 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
-
 @bot.tree.command(name="forceunlink", description="Force unlink a user (requires confirmation)")
 @require_role()
 async def forceunlink(interaction: discord.Interaction, discord_id: str):
