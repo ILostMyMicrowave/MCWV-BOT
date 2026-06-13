@@ -29,6 +29,35 @@ def run_web():
 
 Thread(target=run_web).start()
 
+async def run_initial_presence_check(channel):
+    try:
+        users = db_get_all()
+        if not users:
+            return
+
+        user_ids = [int(u[0]) for u in users]
+
+        async with session.post(
+            "https://presence.roblox.com/v1/presence/users",
+            json={"userIds": user_ids}
+        ) as pr:
+
+            if pr.status != 200:
+                return
+
+            presences = (await pr.json()).get("userPresences", [])
+            now_dt = datetime.now(timezone.utc)
+
+            for p in presences:
+                rid = str(p["userId"])
+                status_cache[rid] = p["userPresenceType"]
+
+                if p["userPresenceType"] == 0:
+                    offline_since[rid] = now_dt
+
+    except Exception as e:
+        print("Initial sync error:", e)
+
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 
@@ -1626,76 +1655,62 @@ async def reminder_loop():
 
     await channel.send("\n\n".join(lines))
 
-# ---------------- PS99 WAR POLL (every 5 min — auto-detects clan wars) ----------------
+# ---------------- PS99 WAR POLL (SAFE STATE MACHINE VERSION) ----------------
 @tasks.loop(minutes=5)
 async def war_poll_loop():
     global bot_enabled, ps99_war_active, ps99_first_check
 
     try:
         async with session.get(PS99_API) as r:
-            if r.status != 200:
-                return
+            api_ok = r.status == 200
+            data = await r.json() if api_ok else {}
 
-            data = await r.json()
-            config = data.get("data", {}).get("configData", {})
-            start = config.get("StartTime")
-            finish = config.get("FinishTime")
+        config = data.get("data", {}).get("configData", {})
+        start = config.get("StartTime")
+        finish = config.get("FinishTime")
 
-            if start is None or finish is None:
-                return
+        now = datetime.now(timezone.utc).timestamp()
 
-            now = datetime.now(timezone.utc).timestamp()
-            currently_active = start <= now <= finish
+        # SAFE CALCULATION (never locks into True incorrectly)
+        currently_active = (
+            api_ok and
+            isinstance(start, (int, float)) and
+            isinstance(finish, (int, float)) and
+            start <= now <= finish
+        )
 
-            if ps99_first_check:
-                ps99_first_check = False
-                ps99_war_active = currently_active
-                if currently_active:
-                    bot_enabled = True
-                    print("PS99 clan war already in progress — tracking enabled silently")
-                return
+        # FIRST RUN INITIALISATION
+        if ps99_first_check:
+            ps99_first_check = False
+            ps99_war_active = currently_active
+            bot_enabled = currently_active
+            print(f"[INIT] War state set to {currently_active}")
+            return
 
-            if currently_active and not ps99_war_active:
-                ps99_war_active = True
-                bot_enabled = True
-                alert_channel = await bot.fetch_channel(CHANNEL_ID)
-                await alert_channel.send("CLAN WAR TRACKING STARTED!! LETS GO MCWV!!!!!")
-                print("PS99 clan war started — tracking auto-enabled")
+        # WAR STARTED
+        if currently_active and not ps99_war_active:
+            ps99_war_active = True
+            bot_enabled = True
 
-                # immediately check who is already offline and ping them
-                users = db_get_all()
-                if users:
-                    try:
-                        user_ids = [int(u[0]) for u in users]
-                        async with session.post(
-                            "https://presence.roblox.com/v1/presence/users",
-                            json={"userIds": user_ids}
-                        ) as pr:
-                            if pr.status == 200:
-                                presences = (await pr.json()).get("userPresences", [])
-                                now_dt = datetime.now(timezone.utc)
-                                for p in presences:
-                                    rid = str(p["userId"])
-                                    status_cache[rid] = p["userPresenceType"]
-                                    if p["userPresenceType"] == 0 and offline_ping_enabled:
-                                        offline_since[rid] = now_dt
-                                        info = next((u for u in users if u[0] == rid), None)
-                                        if info:
-                                            await alert_channel.send(
-                                                f"⚫ <@{info[1]}> **({info[2]})** is already offline — {discord.utils.format_dt(now_dt, 'R')}",
-                                                allowed_mentions=discord.AllowedMentions(users=True)
-                                            )
-                    except Exception as e:
-                        print(f"War start offline check error: {e}")
+            channel = await bot.fetch_channel(CHANNEL_ID)
+            await channel.send("CLAN WAR STARTED!! LETS GO MCWV!!!!!")
 
-            elif not currently_active and ps99_war_active:
-                ps99_war_active = False
-                bot_enabled = False
-                offline_since.clear()
-                status_cache.clear()
-                channel = await bot.fetch_channel(CHANNEL_ID)
-                await channel.send("CLAN WAR OVER. GG EVERYONE!!")
-                print("PS99 clan war ended — tracking auto-disabled")
+            print("War started → tracking enabled")
+
+            await run_initial_presence_check(channel)
+
+        # WAR ENDED
+        elif not currently_active and ps99_war_active:
+            ps99_war_active = False
+            bot_enabled = False
+
+            offline_since.clear()
+            status_cache.clear()
+
+            channel = await bot.fetch_channel(CHANNEL_ID)
+            await channel.send("CLAN WAR OVER. GG EVERYONE!!")
+
+            print("War ended → tracking disabled")
 
     except Exception as e:
         print("War poll error:", e)
