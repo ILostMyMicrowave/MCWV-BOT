@@ -31,14 +31,31 @@ def run_web():
 
 Thread(target=run_web).start()
 
-def get_latest_battle(battles):
-    if not battles:
-        return None
+def get_latest_battle(clan_data):
+    """
+    Safely gets latest battle from PS99 API response.
+    Returns: (battle_id, battle_dict) or (None, None)
+    """
 
-    return max(
+    root = clan_data.get("data", {})
+
+    battles = (
+        root.get("Battles")
+        or root.get("battles")
+        or root.get("clanWar", {}).get("Battles")
+        or root.get("Wars", {}).get("Battles")
+        or {}
+    )
+
+    if not battles:
+        return None, None
+
+    battle_id = max(
         battles.items(),
-        key=lambda x: x[1].get("FinishTime", 0)
+        key=lambda x: x[1].get("FinishTime") or 0
     )[0]
+
+    return battle_id, battles.get(battle_id)
 
 async def run_initial_presence_check(channel):
     try:
@@ -749,25 +766,12 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- SAFE BATTLE SELECTION (FIX) ----------------
-    battles = data.get("data", {}).get("Battles", {})
-
-    if not battles:
-        return await interaction.followup.send(
-            "❌ No clan war data found.",
-            ephemeral=True
-        )
-
-    battle_id = max(
-        battles.items(),
-        key=lambda x: x[1].get("FinishTime") or 0
-    )[0]
-
-    battle = battles.get(battle_id)
+    # ---------------- SAFE BATTLE SELECTION ----------------
+    battle_id, battle = get_latest_battle(data)
 
     if not battle:
         return await interaction.followup.send(
-            "❌ Could not determine current war.",
+            "❌ No clan war data found.",
             ephemeral=True
         )
 
@@ -787,7 +791,11 @@ async def warinfo(interaction: discord.Interaction):
     total_duration = finish_ts - start_ts
     elapsed = now - start_ts
 
-    friendly_name = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', raw_name)).strip()
+    friendly_name = re.sub(
+        r'(\d+)',
+        r' \1',
+        re.sub(r'([A-Z])', r' \1', raw_name)
+    ).strip()
 
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
