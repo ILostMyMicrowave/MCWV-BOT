@@ -1651,18 +1651,24 @@ async def check_loop():
         return
 
     try:
-        user_ids = [int(u[0]) for u in users]
-        url = "https://presence.roblox.com/v1/presence/users"
+    global session
 
-        async with session.post(url, json={"userIds": user_ids}) as r:
-            if r.status != 200:
-                return
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
 
-            data = await r.json()
+    user_ids = [int(u[0]) for u in users]
+    url = "https://presence.roblox.com/v1/presence/users"
 
-    except Exception as e:
-        print("Loop error (API fetch):", e)
-        return
+    async with session.post(url, json={"userIds": user_ids}) as r:
+        if r.status != 200:
+            print("Presence API returned:", r.status)
+            return
+
+        data = await r.json()
+
+except Exception as e:
+    print("Loop error (API fetch):", e)
+    return
 
     try:
         for u in data.get("userPresences", []):
