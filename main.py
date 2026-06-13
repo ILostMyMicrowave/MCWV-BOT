@@ -1656,7 +1656,7 @@ async def reminder_loop():
     await channel.send("\n\n".join(lines))
 
 # ---------------- PS99 WAR POLL (SAFE STATE MACHINE VERSION) ----------------
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=2)
 async def war_poll_loop():
     global bot_enabled, ps99_war_active, ps99_first_check
 
@@ -1687,30 +1687,26 @@ async def war_poll_loop():
             print(f"[INIT] War state set to {currently_active}")
             return
 
-        # WAR STARTED
-        if currently_active and not ps99_war_active:
-            ps99_war_active = True
-            bot_enabled = True
+        # ALWAYS SYNC WAR STATE (no missed transitions)
+if ps99_war_active != currently_active:
+    ps99_war_active = currently_active
+    bot_enabled = currently_active
 
-            channel = await bot.fetch_channel(CHANNEL_ID)
-            await channel.send("CLAN WAR STARTED!! LETS GO MCWV!!!!!")
+    channel = await bot.fetch_channel(CHANNEL_ID)
 
-            print("War started → tracking enabled")
+    if currently_active:
+        await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
+        print("War started (state synced)")
 
-            await run_initial_presence_check(channel)
+        # run initial scan when war starts
+        await run_initial_presence_check(channel)
 
-        # WAR ENDED
-        elif not currently_active and ps99_war_active:
-            ps99_war_active = False
-            bot_enabled = False
+    else:
+        offline_since.clear()
+        status_cache.clear()
 
-            offline_since.clear()
-            status_cache.clear()
-
-            channel = await bot.fetch_channel(CHANNEL_ID)
-            await channel.send("CLAN WAR OVER. GG EVERYONE!!")
-
-            print("War ended → tracking disabled")
+        await channel.send("🛑 CLAN WAR OVER. GG EVERYONE!!")
+        print("War ended (state synced)")
 
     except Exception as e:
         print("War poll error:", e)
@@ -1824,6 +1820,13 @@ async def approve(self, interaction: discord.Interaction, button: discord.ui.But
 
 
 # ---------------- CLEANUP ----------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+
+    # force immediate war sync on startup
+    bot.loop.create_task(war_poll_loop())
+
 @bot.event
 async def on_disconnect():
     global session
