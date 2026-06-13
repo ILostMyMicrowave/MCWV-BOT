@@ -1671,7 +1671,7 @@ async def war_poll_loop():
 
         now = datetime.now(timezone.utc).timestamp()
 
-        # SAFE CALCULATION (never locks into True incorrectly)
+        # SAFE CALCULATION
         currently_active = (
             api_ok and
             isinstance(start, (int, float)) and
@@ -1688,29 +1688,27 @@ async def war_poll_loop():
             return
 
         # ALWAYS SYNC WAR STATE (no missed transitions)
-if ps99_war_active != currently_active:
-    ps99_war_active = currently_active
-    bot_enabled = currently_active
+        if ps99_war_active != currently_active:
+            ps99_war_active = currently_active
+            bot_enabled = currently_active
 
-    channel = await bot.fetch_channel(CHANNEL_ID)
+            channel = await bot.fetch_channel(CHANNEL_ID)
 
-    if currently_active:
-        await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
-        print("War started (state synced)")
+            if currently_active:
+                await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
+                print("War started (state synced)")
 
-        # run initial scan when war starts
-        await run_initial_presence_check(channel)
+                await run_initial_presence_check(channel)
 
-    else:
-        offline_since.clear()
-        status_cache.clear()
+            else:
+                offline_since.clear()
+                status_cache.clear()
 
-        await channel.send("🛑 CLAN WAR OVER. GG EVERYONE!!")
-        print("War ended (state synced)")
+                await channel.send("🛑 CLAN WAR OVER. GG EVERYONE!!")
+                print("War ended (state synced)")
 
     except Exception as e:
         print("War poll error:", e)
-
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
 
 pending_clan_removals = {}
