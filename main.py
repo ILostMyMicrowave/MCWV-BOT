@@ -498,6 +498,13 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
+@bot.tree.command(name="dbtest", guild=guild_obj)
+async def dbtest(interaction: discord.Interaction):
+    try:
+        users = db_get_all()
+        await interaction.response.send_message(f"DB OK: {len(users)} users", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"DB ERROR: {e}", ephemeral=True)
 
 @bot.tree.command(name="ping", description="Test command", guild=guild_obj)
 @require_role()
