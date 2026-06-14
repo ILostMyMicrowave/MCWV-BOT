@@ -779,7 +779,7 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR ----------------
+    # ---------------- CURRENT WAR (HELPER) ----------------
     battle_id, battle = get_current_war(war_data, clan_data)
 
     if not battle:
@@ -788,11 +788,14 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- SAFE DATA EXTRACTION ----------------
-    war_config = war_data.get("data", {}).get("configData", {})
+    # ---------------- SAFE TIMING (FIXED) ----------------
+    start_ts = battle.get("StartTime")
+    finish_ts = battle.get("FinishTime")
 
-    start_ts = war_config.get("StartTime")
-    finish_ts = war_config.get("FinishTime")
+    if not start_ts or not finish_ts:
+        war_config = war_data.get("data", {}).get("configData", {})
+        start_ts = start_ts or war_config.get("StartTime")
+        finish_ts = finish_ts or war_config.get("FinishTime")
 
     if not start_ts or not finish_ts:
         return await interaction.followup.send(
@@ -800,6 +803,7 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
+    # ---------------- CALCULATIONS ----------------
     now = datetime.now(timezone.utc).timestamp()
     total_duration = max(finish_ts - start_ts, 1)
     elapsed = now - start_ts
@@ -815,19 +819,19 @@ async def warinfo(interaction: discord.Interaction):
 
     # ---------------- STATUS ----------------
     if now < start_ts:
-        status_line = "⏳  **UPCOMING**"
+        status_line = "⏳ **UPCOMING**"
         color = discord.Color.gold()
         bar = "`" + "░" * 20 + "`"
         time_field = f"Starts {discord.utils.format_dt(start_dt, 'R')}"
 
     elif now > finish_ts:
-        status_line = "🏁  **WAR ENDED**"
+        status_line = "🏁 **WAR ENDED**"
         color = discord.Color.dark_gray()
         bar = "`" + "█" * 20 + "`"
         time_field = f"Ended {discord.utils.format_dt(finish_dt, 'R')}"
 
     else:
-        status_line = "⚔️  **ACTIVE — IN PROGRESS**"
+        status_line = "⚔️ **ACTIVE — IN PROGRESS**"
         color = discord.Color.red()
 
         progress = max(0.0, min(1.0, elapsed / total_duration))
@@ -843,7 +847,7 @@ async def warinfo(interaction: discord.Interaction):
 
     # ---------------- EMBED ----------------
     embed = discord.Embed(
-        title=f"🎮  {friendly_name}",
+        title=f"🎮 {friendly_name}",
         color=color
     )
 
@@ -851,18 +855,18 @@ async def warinfo(interaction: discord.Interaction):
     embed.add_field(name="Progress", value=bar, inline=False)
 
     embed.add_field(
-        name="🕐  Start",
+        name="🕐 Start",
         value=discord.utils.format_dt(start_dt, 'F'),
         inline=True
     )
 
     embed.add_field(
-        name="🏁  End",
+        name="🏁 End",
         value=discord.utils.format_dt(finish_dt, 'F'),
         inline=True
     )
 
-    embed.add_field(name="⏱️  Time", value=time_field, inline=False)
+    embed.add_field(name="⏱️ Time", value=time_field, inline=False)
 
     embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
 
