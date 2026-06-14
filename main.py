@@ -1474,7 +1474,7 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
 
     # --- ask for alts ---
     await channel.send(
-        "Got it! If it was part of your application, please reply with any **alt account usernames** "
+        "Got it! If you have any other accounts **IN THE CLAN**, please reply with any **alt account usernames** "
         "(comma-separated if multiple), or type `none` if you have none."
     )
 
