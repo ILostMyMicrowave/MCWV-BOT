@@ -779,7 +779,7 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR ----------------
+    # ---------------- CURRENT WAR (COMPARE-STYLE) ----------------
     battle_id, battle = get_current_war(war_data, clan_data)
 
     if not battle:
@@ -788,14 +788,11 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- SAFE TIMING (CORRECT SOURCE) ----------------
-    start_ts = battle.get("StartTime")
-    finish_ts = battle.get("FinishTime")
+    # ---------------- SAFE TIMING (FIXED SOURCE PRIORITY) ----------------
+    war_config = war_data.get("data", {}).get("configData", {})
 
-    if not start_ts or not finish_ts:
-        war_config = war_data.get("data", {}).get("configData", {})
-        start_ts = start_ts or war_config.get("StartTime")
-        finish_ts = finish_ts or war_config.get("FinishTime")
+    start_ts = battle.get("StartTime") or war_config.get("StartTime")
+    finish_ts = battle.get("FinishTime") or war_config.get("FinishTime")
 
     if not start_ts or not finish_ts:
         return await interaction.followup.send(
@@ -803,31 +800,12 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CONTRIBUTIONS ----------------
-    contributions = sorted(
-        battle.get("PointContributions", []),
-        key=lambda x: x.get("Points", 0),
-        reverse=True
-    )
-
-    # 🥇 TOP CONTRIBUTOR
-    top_player = contributions[0] if contributions else None
-    top_name = str(top_player.get("Username") or top_player.get("UserID")) if top_player else "Unknown"
-    top_points = top_player.get("Points", 0) if top_player else 0
-
-    # ⏱ SIMPLE "LAST HOUR GAINED" (snapshot-based estimate)
-    # NOTE: API doesn't give history, so we approximate using proportional scaling
-    total_points = sum(c.get("Points", 0) for c in contributions) or 1
-
-    # assume war progress ratio = time elapsed ratio
     now = datetime.now(timezone.utc).timestamp()
-    elapsed = max(0, now - start_ts)
-    duration = max(1, finish_ts - start_ts)
-    progress = min(1.0, elapsed / duration)
+    total_duration = max(finish_ts - start_ts, 1)
+    elapsed = now - start_ts
+    progress = max(0.0, min(1.0, elapsed / total_duration))
 
-    estimated_hour_gain = int(total_points * progress * 0.04)  # rough smoothing
-
-    # ---------------- FORMATTING ----------------
+    # ---------------- NAME ----------------
     friendly_name = re.sub(
         r'(\d+)',
         r' \1',
@@ -836,6 +814,32 @@ async def warinfo(interaction: discord.Interaction):
 
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
+
+    # ---------------- CONTRIBUTIONS ----------------
+    contributions = sorted(
+        battle.get("PointContributions", []),
+        key=lambda x: x.get("Points", 0),
+        reverse=True
+    )
+
+    # ---------------- TOP CONTRIBUTOR (ROBLOX + DISCORD LINK) ----------------
+    top_name = "Unknown"
+    top_points = 0
+    top_discord = "Not linked"
+
+    if contributions:
+        top = contributions[0]
+        top_points = top.get("Points", 0)
+        top_user_id = int(top.get("UserID", 0))
+
+        db_users = db_get_all()
+        linked = next((u for u in db_users if int(u[0]) == top_user_id), None)
+
+        if linked:
+            top_name = linked[2]
+            top_discord = f"<@{linked[1]}>"
+        else:
+            top_name = str(top_user_id)
 
     # ---------------- STATUS ----------------
     if now < start_ts:
@@ -886,16 +890,10 @@ async def warinfo(interaction: discord.Interaction):
 
     embed.add_field(name="⏱ Time", value=time_field, inline=False)
 
-    # ---------------- NEW HUD STATS ----------------
+    # ---------------- HUD STATS ----------------
     embed.add_field(
         name="🥇 Top Contributor",
-        value=f"{top_name}\n**{format_points(top_points)} pts**",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📈 Est. Hour Gain",
-        value=f"~{format_points(estimated_hour_gain)} pts",
+        value=f"**{top_name}**\n{top_discord}\n**{format_points(top_points)} pts**",
         inline=True
     )
 
