@@ -757,6 +757,7 @@ async def warinfo(interaction: discord.Interaction):
                     ephemeral=True
                 )
             data = await r.json()
+
     except Exception:
         return await interaction.followup.send(
             "❌ API request failed.",
@@ -766,15 +767,14 @@ async def warinfo(interaction: discord.Interaction):
     # ---------------- CURRENT WAR ----------------
     battle_id, battle = get_current_war(data)
 
-    if not battle:
+    # HARD SAFETY CHECK (prevents infinite "thinking")
+    if not battle_id or not battle:
         return await interaction.followup.send(
             "❌ No clan war data found.",
             ephemeral=True
         )
 
-    # ---------------- USE REAL BATTLE DATA ----------------
-    raw_name = battle_id
-
+    # ---------------- SAFE DATA EXTRACTION ----------------
     start_ts = battle.get("StartTime")
     finish_ts = battle.get("FinishTime")
 
@@ -785,13 +785,15 @@ async def warinfo(interaction: discord.Interaction):
         )
 
     now = datetime.now(timezone.utc).timestamp()
-    total_duration = finish_ts - start_ts
+
+    total_duration = max(finish_ts - start_ts, 1)
     elapsed = now - start_ts
 
+    # Friendly name
     friendly_name = re.sub(
         r'(\d+)',
         r' \1',
-        re.sub(r'([A-Z])', r' \1', raw_name)
+        re.sub(r'([A-Z])', r' \1', str(battle_id))
     ).strip()
 
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
