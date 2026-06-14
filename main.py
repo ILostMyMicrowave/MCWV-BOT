@@ -641,46 +641,23 @@ async def list_users(interaction: discord.Interaction):
     online_lines = []
     offline_lines = []
 
-    # ---------------- LOOP USERS ----------------
+    now = datetime.now(timezone.utc)
+
+    # ---------------- BUILD LIST (CACHE ONLY — NO API CALLS) ----------------
     for roblox_id, discord_id, username in users:
 
         rid = str(roblox_id).strip()
 
-        # ---------------- CACHE FIRST ----------------
-        current = status_cache.get(rid)
-
-        # ---------------- SAFE FALLBACK (ONLY IF MISSING) ----------------
-        if current is None:
-            try:
-                async with session.post(
-                    "https://presence.roblox.com/v1/presence/users",
-                    json={"userIds": [int(rid)]}
-                ) as r:
-
-                    if r.status == 200:
-                        data = await r.json()
-                        pres = data.get("userPresences", [{}])[0]
-                        current = pres.get("userPresenceType", 0)
-
-                        # update cache immediately
-                        status_cache[rid] = current
-                        status_cache_time[rid] = datetime.now(timezone.utc)
-
-                    else:
-                        current = 0
-
-            except Exception:
-                current = 0
+        current = status_cache.get(rid, 0)  # NEVER BLOCK HERE
 
         icon = status_icons.get(current, "❓")
         label = status_map.get(current, "Unknown")
 
-        # ---------------- OFFLINE DURATION (OPTIONAL) ----------------
         extra = ""
 
         if current == 0 and rid in offline_since:
             since = offline_since[rid]
-            mins = int((datetime.now(timezone.utc) - since).total_seconds() // 60)
+            mins = int((now - since).total_seconds() // 60)
 
             if mins < 60:
                 extra = f" — offline {mins}m"
@@ -694,7 +671,7 @@ async def list_users(interaction: discord.Interaction):
         else:
             online_lines.append(line)
 
-    # ---------------- BUILD EMBED ----------------
+    # ---------------- SEND IMMEDIATELY ----------------
     embed = discord.Embed(
         title="📋 Tracked Members",
         color=discord.Color.blurple()
@@ -717,6 +694,39 @@ async def list_users(interaction: discord.Interaction):
     )
 
     await interaction.followup.send(embed=embed)
+
+    # ---------------- BACKGROUND CACHE REPAIR (NON-BLOCKING) ----------------
+    async def refresh_missing():
+        missing = []
+
+        for roblox_id, _, _ in users:
+            rid = str(roblox_id).strip()
+            if rid not in status_cache:
+                missing.append(int(rid))
+
+        if not missing:
+            return
+
+        try:
+            async with session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": missing}
+            ) as r:
+
+                if r.status != 200:
+                    return
+
+                data = await r.json()
+
+                for u in data.get("userPresences", []):
+                    rid = str(u["userId"])
+                    status_cache[rid] = u.get("userPresenceType", 0)
+                    status_cache_time[rid] = datetime.now(timezone.utc)
+
+        except Exception as e:
+            print("[list cache refresh error]", e)
+
+    asyncio.create_task(refresh_missing())
 
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
 @require_role()
