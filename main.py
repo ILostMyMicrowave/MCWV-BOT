@@ -764,7 +764,7 @@ async def warinfo(interaction: discord.Interaction):
         )
 
     # ---------------- CURRENT WAR ----------------
-    battle_id, battle = get_current_war(data, data)
+    battle_id, battle = get_current_war(data)
 
     if not battle:
         return await interaction.followup.send(
