@@ -788,11 +788,11 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- SAFE TIMING (FIXED SOURCE PRIORITY) ----------------
+    # ---------------- TIMING (CONFIG FIRST, BATTLE FALLBACK) ----------------
     war_config = war_data.get("data", {}).get("configData", {})
 
-    start_ts = battle.get("StartTime") or war_config.get("StartTime")
-    finish_ts = battle.get("FinishTime") or war_config.get("FinishTime")
+    start_ts = war_config.get("StartTime") or battle.get("StartTime")
+    finish_ts = war_config.get("FinishTime") or battle.get("FinishTime")
 
     if not start_ts or not finish_ts:
         return await interaction.followup.send(
@@ -890,7 +890,6 @@ async def warinfo(interaction: discord.Interaction):
 
     embed.add_field(name="⏱ Time", value=time_field, inline=False)
 
-    # ---------------- HUD STATS ----------------
     embed.add_field(
         name="🥇 Top Contributor",
         value=f"**{top_name}**\n{top_discord}\n**{format_points(top_points)} pts**",
