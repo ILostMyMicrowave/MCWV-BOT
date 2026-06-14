@@ -36,23 +36,25 @@ def run_web():
 Thread(target=run_web).start()
 
 def get_current_war(war_data, clan_data):
-    war_config = war_data.get("data", {}).get("configData", {})
+    root = clan_data.get("data", {})
 
-    active_battle_id = (
-        war_config.get("Title")
-        or war_data.get("data", {}).get("configName")
+    battles = (
+        root.get("Battles")
+        or root.get("battles")
+        or root.get("clanWar", {}).get("Battles")
+        or root.get("Wars", {}).get("Battles")
+        or {}
     )
 
-    battles = clan_data.get("data", {}).get("Battles", {})
-
-    if active_battle_id and active_battle_id in battles:
-        battle_id = active_battle_id
-    elif battles:
-        battle_id = list(battles.keys())[-1]
-    else:
+    if not battles:
         return None, None
 
-    return battle_id, battles.get(battle_id)
+    battle_id, battle = max(
+        battles.items(),
+        key=lambda x: x[1].get("FinishTime") or 0
+    )
+
+    return battle_id, battle
 
 async def run_initial_presence_check(channel):
     try:
@@ -1028,18 +1030,8 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
             war_data = await war_r.json()
             clan_data = await clan_r.json()
 
-        war_config = war_data.get("data", {}).get("configData", {})
-        battles = clan_data.get("data", {}).get("Battles", {})
-
-        if not battles:
-            return await interaction.followup.send(
-                "❌ No battles found.",
-                ephemeral=True
-            )
-
-        # ---------------- FIND CURRENT WAR (FIXED) ----------------
-        battle_id = get_latest_battle(battles)
-        battle = battles.get(battle_id)
+        # ---------------- CURRENT WAR ----------------
+        battle_id, battle = get_current_war(war_data, clan_data)
 
         if not battle:
             return await interaction.followup.send(
@@ -1061,26 +1053,12 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
             None
         )
 
-        rank = next(
-            (i + 1 for i, e in enumerate(contributions)
-             if int(e.get("UserID", 0)) == roblox_id),
-            None
-        )
-
-        friendly = re.sub(
-            r'(\d+)', r' \1',
-            re.sub(r'([A-Z])', r' \1', active_battle_id)
-        ).strip()
-
-        # ---------------- EMBED ----------------
-        embed = discord.Embed(
-            title=f"📊 {roblox_name} — {friendly}",
-            color=discord.Color.red()
-        )
-
-        embed.add_field(name="Discord", value=discord_display, inline=True)
-
         if not user_entry:
+            embed = discord.Embed(
+                title=f"📊 {roblox_name} — Stats",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Discord", value=discord_display, inline=True)
             embed.description = "😴 No contributions recorded yet for this war."
             await interaction.followup.send(embed=embed)
             return
@@ -1088,17 +1066,44 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         pts = user_entry.get("Points", 0)
         pct = (pts / total_points * 100) if total_points else 0
 
-        top_pts = max(contributions[0].get("Points", 1), 1)
+        rank = next(
+            (i + 1 for i, e in enumerate(contributions)
+             if int(e.get("UserID", 0)) == roblox_id),
+            None
+        )
 
+        total_players = len(contributions)
+        if rank and total_players > 0:
+            top_percent = (1 - ((rank - 1) / total_players)) * 100
+        else:
+            top_percent = 0
+
+        top_pts = max(contributions[0].get("Points", 1), 1)
         bar_len = int((pts / top_pts) * 20)
         bar = "█" * bar_len + "░" * (20 - bar_len)
 
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        rank_display = medals.get(rank, f"#{rank}")
+        rank_display = medals.get(rank, f"#{rank}" if rank else "—")
 
+        friendly = re.sub(
+            r'(\d+)', r' \1',
+            re.sub(r'([A-Z])', r' \1', str(battle_id))
+        ).strip()
+
+        embed = discord.Embed(
+            title=f"📊 {roblox_name} — {friendly}",
+            color=discord.Color.red()
+        )
+
+        embed.add_field(name="Discord", value=discord_display, inline=True)
         embed.add_field(name="🏅 Rank", value=rank_display, inline=True)
         embed.add_field(name="⚔️ Points", value=format_points(pts), inline=True)
         embed.add_field(name="📈 Share", value=f"{pct:.1f}%", inline=True)
+        embed.add_field(
+            name="Clan Position",
+            value=f"🏅 You are in the top **{top_percent:.1f}%** of the clan",
+            inline=False
+        )
         embed.add_field(name="Progress vs #1", value=f"`{bar}`", inline=False)
         embed.add_field(name="🔢 Clan Total", value=format_points(total_points), inline=True)
 
