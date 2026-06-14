@@ -617,137 +617,78 @@ async def remove(interaction: discord.Interaction, member: discord.Member):
 )
 @require_role()
 async def list_users(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer()
 
     users = db_get_all()
     if not users:
-        return await interaction.followup.send(
-            "No users are being tracked.",
-            ephemeral=True
-        )
+        return await interaction.followup.send("No users are being tracked.")
 
     status_icons = {
-        0: "⚫",
-        1: "🟢",
-        2: "🎮",
-        3: "🔧"
-    }
-
-    section_titles = {
-        2: "🎮 In Game",
+        0: "⚫ Offline",
         1: "🟢 Website",
-        3: "🔧 Studio",
-        0: "⚫ Offline"
+        2: "🎮 In Game",
+        3: "🔧 Studio"
     }
 
-    # Keep online users first, offline last
-    status_order = {
-        2: 0,
-        1: 1,
-        3: 2,
-        0: 3
-    }
-
-    grouped = {
+    status_groups = {
         2: [],
         1: [],
         3: [],
         0: []
     }
 
-    for row in users:
-        try:
-            roblox_id = str(row[0])
-            discord_id = row[1]
-            username = row[2]
+    for roblox_id, discord_id, username in users:
+        rid = str(roblox_id)
 
-            current = status_cache.get(roblox_id, 0)
-            if current not in grouped:
-                current = 0
+        current = status_cache.get(rid, None)
 
-            extra = ""
-            if current == 0 and roblox_id in offline_since:
-                try:
-                    extra = f" — offline for {format_duration(offline_since[roblox_id])}"
-                except Exception:
-                    extra = ""
-
-            line = f"{status_icons.get(current, '❓')} <@{discord_id}> — **{username}**{extra}"
-            grouped[current].append(line)
-
-        except Exception:
+        # if cache not ready yet
+        if current is None:
+            status_groups[0].append(f"⏳ <@{discord_id}> — **{username}** (loading)")
             continue
 
-    for key in grouped:
-        grouped[key].sort(key=lambda s: s.lower())
+        line = f"{status_icons.get(current, '❓')} <@{discord_id}> — **{username}**"
 
-    total_users = len(users)
-    online_count = len(grouped[2]) + len(grouped[1]) + len(grouped[3])
-    offline_count = len(grouped[0])
+        if current == 0 and rid in offline_since:
+            line += f" — offline for {format_duration(offline_since[rid])}"
 
-    def split_lines(lines, limit=1024):
-        chunks = []
-        current = ""
-        for line in lines:
-            add = line + "\n"
-            if len(current) + len(add) > limit:
-                if current:
-                    chunks.append(current.rstrip())
-                current = add
-            else:
-                current += add
-        if current:
-            chunks.append(current.rstrip())
-        return chunks
+        status_groups[current].append(line)
 
-    pages = []
-
-    def new_page():
-        return discord.Embed(
-            title="📋 Tracked Members",
-            description="Live status from the local cache, sorted with online users first.",
-            color=discord.Color.blurple()
-        )
-
-    current_embed = new_page()
-    field_count = 0
-
-    summary = (
-        f"🟢 **{online_count}** online  •  "
-        f"⚫ **{offline_count}** offline  •  "
-        f"**{total_users}** total"
+    embed = discord.Embed(
+        title="📋 Tracked Members",
+        color=discord.Color.blurple()
     )
-    current_embed.add_field(name="Summary", value=summary, inline=False)
-    field_count += 1
 
-    for key in [2, 1, 3, 0]:
-        lines = grouped.get(key, [])
-        if not lines:
-            continue
+    embed.add_field(
+        name="🎮 In Game",
+        value="\n".join(status_groups[2]) or "None",
+        inline=False
+    )
 
-        chunks = split_lines(lines, limit=1024)
-        for i, chunk in enumerate(chunks):
-            if field_count >= 25:
-                pages.append(current_embed)
-                current_embed = new_page()
-                field_count = 0
+    embed.add_field(
+        name="🟢 Website",
+        value="\n".join(status_groups[1]) or "None",
+        inline=False
+    )
 
-            title = section_titles[key] if i == 0 else f"{section_titles[key]} (cont.)"
-            current_embed.add_field(name=title, value=chunk, inline=False)
-            field_count += 1
+    embed.add_field(
+        name="🔧 Studio",
+        value="\n".join(status_groups[3]) or "None",
+        inline=False
+    )
 
-    if field_count > 0:
-        pages.append(current_embed)
+    embed.add_field(
+        name="⚫ Offline",
+        value="\n".join(status_groups[0]) or "None",
+        inline=False
+    )
 
-    if not pages:
-        return await interaction.followup.send(
-            "No status data available.",
-            ephemeral=True
-        )
+    online = len(status_groups[1]) + len(status_groups[2]) + len(status_groups[3])
+    offline = len(status_groups[0])
 
-    await interaction.followup.send(embed=pages[0])
-    for page in pages[1:]:
-        await interaction.followup.send(embed=page)
+    embed.set_footer(text=f"{online} online • {offline} offline • {len(users)} total")
+
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
 @require_role()
