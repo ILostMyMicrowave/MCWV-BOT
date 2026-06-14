@@ -1837,7 +1837,7 @@ async def check_loop():
     if not users or not bot_enabled:
         return
 
-    print("Loop running, users:", len(users))  # DEBUG LINE
+    print("Loop running, users:", len(users))
 
     try:
         global session
@@ -1846,9 +1846,12 @@ async def check_loop():
             session = aiohttp.ClientSession()
 
         user_ids = [int(u[0]) for u in users]
-        url = "https://presence.roblox.com/v1/presence/users"
 
-        async with session.post(url, json={"userIds": user_ids}) as r:
+        async with session.post(
+            "https://presence.roblox.com/v1/presence/users",
+            json={"userIds": user_ids}
+        ) as r:
+
             if r.status != 200:
                 print("Presence API returned:", r.status)
                 return
@@ -1860,15 +1863,18 @@ async def check_loop():
         return
 
     try:
+        now = datetime.now(timezone.utc)  # ✅ FIXED (must be early)
+
         for u in data.get("userPresences", []):
-            rid = str(u["userId"])
+
+            rid = str(u["userId"])          # ✅ string everywhere
             current = u["userPresenceType"]
 
             old = status_cache.get(rid)
             status_cache[rid] = current
-            status_cache_time[rid] = now
+            status_cache_time[rid] = now    # ✅ FIXED
 
-            # save to Neon (persistent state)
+            # ---------------- DB SAVE ----------------
             try:
                 cur.execute("""
                     INSERT INTO user_status (roblox_id, status, updated_at)
@@ -1877,16 +1883,15 @@ async def check_loop():
                     DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
                 """, (rid, current))
                 conn.commit()
+
             except Exception as db_error:
                 print("Loop error (DB write):", db_error)
 
-            # no change → skip processing
+            # no change → skip
             if old == current:
                 continue
 
-            now = datetime.now(timezone.utc)
-
-            info = next((x for x in users if x[0] == rid), None)
+            info = next((x for x in users if str(x[0]) == rid), None)
             if not info:
                 continue
 
@@ -1895,20 +1900,23 @@ async def check_loop():
                 offline_since.pop(rid, None)
                 continue
 
-            # first time seen outside game
+            # first time seen offline
             if rid not in offline_since:
                 offline_since[rid] = now
 
-            # ONLY ping when leaving IN GAME
-            if old is not None and old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
-                channel = await bot.fetch_channel(CHANNEL_ID)
-                await channel.send(
-                    f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-                    allowed_mentions=discord.AllowedMentions(users=True)
-                )
+            # ping only when leaving game
+            try:
+                if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
+                    channel = await bot.fetch_channel(CHANNEL_ID)
+                    await channel.send(
+                        f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+                        allowed_mentions=discord.AllowedMentions(users=True)
+                    )
+            except Exception as e:
+                print("Loop ping error:", e)
 
     except Exception as e:
-        print("Loop error (processing):", e)
+        print("Loop processing error:", e)
 
 
 # ---------------- REMINDER LOOP (every 30 min — re-pings offline users) ----------------
