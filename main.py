@@ -637,7 +637,7 @@ async def list_users(interaction: discord.Interaction):
     for roblox_id, discord_id, username in users:
         rid = str(roblox_id)
 
-        current = status_cache.get(rid, 0)
+        status_cache.get(str(rid).strip(), 0)
 
         icon = status_icons.get(current, "❓")
         label = status_text(current)
@@ -1797,7 +1797,7 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         roblox_name = target[2]
 
         # ---------------- STATUS (CACHE ONLY) ----------------
-        current = status_cache.get(roblox_id, 0)
+        current = status_cache.get(str(roblox_id).strip(), 0)
 
         status_map = {
             0: "⚫ Offline",
@@ -1867,7 +1867,7 @@ async def check_loop():
 
         for u in data.get("userPresences", []):
 
-            rid = str(u["userId"])          # ✅ string everywhere
+            rid = str(u["userId"]).strip()          # ✅ string everywhere
             current = u["userPresenceType"]
 
             old = status_cache.get(rid)
