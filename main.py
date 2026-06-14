@@ -35,29 +35,22 @@ def run_web():
 # start web server (keep-alive)
 Thread(target=run_web).start()
 
-def get_latest_battle(clan_data):
-    """
-    Safely gets latest battle from PS99 API response.
-    Returns: (battle_id, battle_dict) or (None, None)
-    """
+def get_current_war(war_data, clan_data):
+    war_config = war_data.get("data", {}).get("configData", {})
 
-    root = clan_data.get("data", {})
-
-    battles = (
-        root.get("Battles")
-        or root.get("battles")
-        or root.get("clanWar", {}).get("Battles")
-        or root.get("Wars", {}).get("Battles")
-        or {}
+    active_battle_id = (
+        war_config.get("Title")
+        or war_data.get("data", {}).get("configName")
     )
 
-    if not battles:
-        return None, None
+    battles = clan_data.get("data", {}).get("Battles", {})
 
-    battle_id = max(
-        battles.items(),
-        key=lambda x: x[1].get("FinishTime") or 0
-    )[0]
+    if active_battle_id and active_battle_id in battles:
+        battle_id = active_battle_id
+    elif battles:
+        battle_id = list(battles.keys())[-1]
+    else:
+        return None, None
 
     return battle_id, battles.get(battle_id)
 
@@ -894,22 +887,8 @@ async def leaderboard(interaction: discord.Interaction):
     # ---------------- WAR CONFIG ----------------
     war_config = war_data.get("data", {}).get("configData", {})
 
-    # ---------------- DETERMINE CURRENT WAR ----------------
-    battles = clan_data.get("data", {}).get("Battles", {})
-
-    if not battles:
-        return await interaction.followup.send(
-            "❌ No battle data found for MCWV.",
-            ephemeral=True
-        )
-
-    # safer selection (handles missing FinishTime)
-    battle_id = max(
-        battles.items(),
-        key=lambda x: x[1].get("FinishTime") or 0
-    )[0]
-
-    battle = battles.get(battle_id)
+    # ---------------- CURRENT WAR ----------------
+    battle_id, battle = get_current_war(war_data, clan_data)
 
     if not battle:
         return await interaction.followup.send(
