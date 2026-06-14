@@ -612,121 +612,60 @@ async def remove(interaction: discord.Interaction, member: discord.Member):
 
 @bot.tree.command(
     name="list",
-    description="Show all tracked users and their current Roblox status",
+    description="Show all tracked users",
     guild=guild_obj
 )
 @require_role()
 async def list_users(interaction: discord.Interaction):
-    await interaction.response.defer()
 
-    users = db_get_all()
+    try:
+        users = db_get_all()
 
-    if not users:
-        return await interaction.followup.send("No users are being tracked.")
+        if not users:
+            return await interaction.response.send_message(
+                "No users are being tracked.",
+                ephemeral=True
+            )
 
-    status_icons = {
-        0: "⚫",
-        1: "🟢",
-        2: "🎮",
-        3: "🔧"
-    }
+        status_icons = {
+            0: "⚫",
+            1: "🟢",
+            2: "🎮",
+            3: "🔧"
+        }
 
-    status_map = {
-        0: "Offline",
-        1: "Website",
-        2: "In Game",
-        3: "Studio"
-    }
+        lines = []
 
-    online_lines = []
-    offline_lines = []
+        for roblox_id, discord_id, username in users:
 
-    now = datetime.now(timezone.utc)
-
-    # ---------------- BUILD LIST (CACHE ONLY — NO API CALLS) ----------------
-    for roblox_id, discord_id, username in users:
-
-        rid = str(roblox_id).strip()
-
-        current = status_cache.get(rid, 0)  # NEVER BLOCK HERE
-
-        icon = status_icons.get(current, "❓")
-        label = status_map.get(current, "Unknown")
-
-        extra = ""
-
-        if current == 0 and rid in offline_since:
-            since = offline_since[rid]
-            mins = int((now - since).total_seconds() // 60)
-
-            if mins < 60:
-                extra = f" — offline {mins}m"
-            else:
-                extra = f" — offline {mins // 60}h {mins % 60}m"
-
-        line = f"{icon} <@{discord_id}> — **{username}** ({label}){extra}"
-
-        if current == 0:
-            offline_lines.append(line)
-        else:
-            online_lines.append(line)
-
-    # ---------------- SEND IMMEDIATELY ----------------
-    embed = discord.Embed(
-        title="📋 Tracked Members",
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="🟢 Online",
-        value="\n".join(online_lines) if online_lines else "None",
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚫ Offline",
-        value="\n".join(offline_lines) if offline_lines else "None",
-        inline=False
-    )
-
-    embed.set_footer(
-        text=f"🟢 {len(online_lines)} online • ⚫ {len(offline_lines)} offline • {len(users)} total"
-    )
-
-    await interaction.followup.send(embed=embed)
-
-    # ---------------- BACKGROUND CACHE REPAIR (NON-BLOCKING) ----------------
-    async def refresh_missing():
-        missing = []
-
-        for roblox_id, _, _ in users:
             rid = str(roblox_id).strip()
-            if rid not in status_cache:
-                missing.append(int(rid))
 
-        if not missing:
-            return
+            current = status_cache.get(rid, 0)
 
-        try:
-            async with session.post(
-                "https://presence.roblox.com/v1/presence/users",
-                json={"userIds": missing}
-            ) as r:
+            icon = status_icons.get(current, "❓")
 
-                if r.status != 200:
-                    return
+            lines.append(
+                f"{icon} <@{discord_id}> — **{username}**"
+            )
 
-                data = await r.json()
+        embed = discord.Embed(
+            title="📋 Tracked Members",
+            description="\n".join(lines[:50]),
+            color=discord.Color.blurple()
+        )
 
-                for u in data.get("userPresences", []):
-                    rid = str(u["userId"])
-                    status_cache[rid] = u.get("userPresenceType", 0)
-                    status_cache_time[rid] = datetime.now(timezone.utc)
+        embed.set_footer(text=f"{len(users)} tracked members")
 
-        except Exception as e:
-            print("[list cache refresh error]", e)
+        await interaction.response.send_message(embed=embed)
 
-    asyncio.create_task(refresh_missing())
+    except Exception as e:
+        print("[LIST ERROR]", repr(e))
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "❌ List command failed.",
+                ephemeral=True
+            )
 
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
 @require_role()
