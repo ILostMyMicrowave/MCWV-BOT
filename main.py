@@ -1772,19 +1772,19 @@ async def status(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        now_ts = datetime.now(timezone.utc).timestamp()
+        now = datetime.now(timezone.utc)
         user_id = interaction.user.id
 
         # ---------------- COOLDOWN ----------------
         last_used = status_cooldown.get(user_id, 0)
-        if now_ts - last_used < 5:
-            remaining = round(5 - (now_ts - last_used), 1)
+        if now.timestamp() - last_used < 5:
+            remaining = round(5 - (now.timestamp() - last_used), 1)
             return await interaction.followup.send(
                 f"⏳ Slow down — wait {remaining}s",
                 ephemeral=True
             )
 
-        status_cooldown[user_id] = now_ts
+        status_cooldown[user_id] = now.timestamp()
 
         # ---------------- DB LOOKUP ----------------
         users = db_get_all()
@@ -1796,38 +1796,9 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         roblox_id = str(target[0])
         roblox_name = target[2]
 
-        # ---------------- STATUS ----------------
-        current = status_cache.get(roblox_id)
+        # ---------------- STATUS (CACHE ONLY) ----------------
+        current = status_cache.get(roblox_id, 0)
 
-        # fallback if missing
-        if current is None:
-            async with session.post(
-                "https://presence.roblox.com/v1/presence/users",
-                json={"userIds": [int(roblox_id)]}
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    pres = data.get("userPresences", [{}])[0]
-                    current = pres.get("userPresenceType", 0)
-
-                    status_cache[roblox_id] = current
-                    status_cache_time[roblox_id] = datetime.now(timezone.utc)
-                else:
-                    current = 0
-
-        # ---------------- TIME TRACKING ----------------
-        last_change = status_cache_time.get(roblox_id, datetime.now(timezone.utc))
-        duration = datetime.now(timezone.utc) - last_change
-
-        def format_short(td):
-            secs = int(td.total_seconds())
-            h = secs // 3600
-            m = (secs % 3600) // 60
-            if h > 0:
-                return f"{h}h {m}m"
-            return f"{m}m"
-
-        # ---------------- ICONS ----------------
         status_map = {
             0: "⚫ Offline",
             1: "🟢 Website",
@@ -1835,17 +1806,23 @@ async def status(interaction: discord.Interaction, member: discord.Member):
             3: "🔧 Studio"
         }
 
-        icon = status_map.get(current, "❓ Unknown")
+        label = status_map.get(current, "❓ Unknown")
 
-        # ---------------- EXTRA TEXT ----------------
-        extra = f"\n⏱ In this state for: **{format_short(duration)}**"
+        # ---------------- OFFLINE DURATION ONLY ----------------
+        extra = ""
 
         if current == 0 and roblox_id in offline_since:
-            extra += f"\n📴 Offline since: {discord.utils.format_dt(offline_since[roblox_id], 'R')}"
+            since = offline_since[roblox_id]
+            mins = int((now - since).total_seconds() // 60)
+
+            if mins < 60:
+                extra = f"\n📴 Offline for {mins}m"
+            else:
+                extra = f"\n📴 Offline for {mins // 60}h {mins % 60}m"
 
         # ---------------- OUTPUT ----------------
         await interaction.followup.send(
-            f"{icon} **{roblox_name}**{extra}",
+            f"{label} **{roblox_name}**{extra}",
             ephemeral=True
         )
 
