@@ -779,7 +779,7 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR (HELPER) ----------------
+    # ---------------- CURRENT WAR ----------------
     battle_id, battle = get_current_war(war_data, clan_data)
 
     if not battle:
@@ -788,7 +788,7 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- SAFE TIMING (FIXED) ----------------
+    # ---------------- SAFE TIMING (CORRECT SOURCE) ----------------
     start_ts = battle.get("StartTime")
     finish_ts = battle.get("FinishTime")
 
@@ -803,11 +803,31 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CALCULATIONS ----------------
-    now = datetime.now(timezone.utc).timestamp()
-    total_duration = max(finish_ts - start_ts, 1)
-    elapsed = now - start_ts
+    # ---------------- CONTRIBUTIONS ----------------
+    contributions = sorted(
+        battle.get("PointContributions", []),
+        key=lambda x: x.get("Points", 0),
+        reverse=True
+    )
 
+    # 🥇 TOP CONTRIBUTOR
+    top_player = contributions[0] if contributions else None
+    top_name = str(top_player.get("Username") or top_player.get("UserID")) if top_player else "Unknown"
+    top_points = top_player.get("Points", 0) if top_player else 0
+
+    # ⏱ SIMPLE "LAST HOUR GAINED" (snapshot-based estimate)
+    # NOTE: API doesn't give history, so we approximate using proportional scaling
+    total_points = sum(c.get("Points", 0) for c in contributions) or 1
+
+    # assume war progress ratio = time elapsed ratio
+    now = datetime.now(timezone.utc).timestamp()
+    elapsed = max(0, now - start_ts)
+    duration = max(1, finish_ts - start_ts)
+    progress = min(1.0, elapsed / duration)
+
+    estimated_hour_gain = int(total_points * progress * 0.04)  # rough smoothing
+
+    # ---------------- FORMATTING ----------------
     friendly_name = re.sub(
         r'(\d+)',
         r' \1',
@@ -834,9 +854,7 @@ async def warinfo(interaction: discord.Interaction):
         status_line = "⚔️ **ACTIVE — IN PROGRESS**"
         color = discord.Color.red()
 
-        progress = max(0.0, min(1.0, elapsed / total_duration))
         filled = int(progress * 20)
-
         bar = "`" + "█" * filled + "░" * (20 - filled) + f"` {int(progress * 100)}%"
 
         secs_left = int(finish_ts - now)
@@ -866,7 +884,20 @@ async def warinfo(interaction: discord.Interaction):
         inline=True
     )
 
-    embed.add_field(name="⏱️ Time", value=time_field, inline=False)
+    embed.add_field(name="⏱ Time", value=time_field, inline=False)
+
+    # ---------------- NEW HUD STATS ----------------
+    embed.add_field(
+        name="🥇 Top Contributor",
+        value=f"{top_name}\n**{format_points(top_points)} pts**",
+        inline=True
+    )
+
+    embed.add_field(
+        name="📈 Est. Hour Gain",
+        value=f"~{format_points(estimated_hour_gain)} pts",
+        inline=True
+    )
 
     embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
 
