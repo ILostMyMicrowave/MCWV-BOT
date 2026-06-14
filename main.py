@@ -764,15 +764,8 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR (COMPARE-STYLE LIVE FIX) ----------------
+    # ---------------- CURRENT WAR (MATCH /COMPARE LOGIC EXACTLY) ----------------
     root = data.get("data", {})
-
-    war_config = root.get("configData", {})
-
-    active_battle_id = (
-        war_config.get("Title")
-        or root.get("configName")
-    )
 
     battles = (
         root.get("Battles")
@@ -788,22 +781,9 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    battle_id = None
-
-    if active_battle_id and active_battle_id in battles:
-        battle_id = active_battle_id
-    else:
-        battle_id = max(
-            battles.items(),
-            key=lambda x: x[1].get("FinishTime") or 0
-        )[0]
-
-    battle = battles.get(battle_id)
-
-    if not battle:
-        return await interaction.followup.send(
-            "❌ Could not determine current war.",
-            ephemeral=True
+    battle_id, battle = max(
+        battles.items(),
+        key=lambda x: x[1].get("FinishTime") or 0
     )
     
     # ---------------- SAFE DATA EXTRACTION ----------------
