@@ -779,7 +779,7 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR (COMPARE-STYLE) ----------------
+    # ---------------- CURRENT WAR ----------------
     battle_id, battle = get_current_war(war_data, clan_data)
 
     if not battle:
@@ -788,11 +788,15 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- TIMING (CONFIG FIRST, BATTLE FALLBACK) ----------------
+    # ---------------- TIMING (BATTLE FIRST, CONFIG FALLBACK) ----------------
     war_config = war_data.get("data", {}).get("configData", {})
 
-    start_ts = war_config.get("StartTime") or battle.get("StartTime")
-    finish_ts = war_config.get("FinishTime") or battle.get("FinishTime")
+    start_ts = battle.get("StartTime")
+    finish_ts = battle.get("FinishTime")
+
+    if not start_ts or not finish_ts:
+        start_ts = start_ts or war_config.get("StartTime")
+        finish_ts = finish_ts or war_config.get("FinishTime")
 
     if not start_ts or not finish_ts:
         return await interaction.followup.send(
@@ -802,18 +806,18 @@ async def warinfo(interaction: discord.Interaction):
 
     now = datetime.now(timezone.utc).timestamp()
     total_duration = max(finish_ts - start_ts, 1)
-    elapsed = now - start_ts
+    elapsed = max(0, now - start_ts)
     progress = max(0.0, min(1.0, elapsed / total_duration))
 
-    # ---------------- NAME ----------------
+    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
+
+    # Friendly war name
     friendly_name = re.sub(
         r'(\d+)',
         r' \1',
         re.sub(r'([A-Z])', r' \1', str(battle_id))
     ).strip()
-
-    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
 
     # ---------------- CONTRIBUTIONS ----------------
     contributions = sorted(
@@ -822,10 +826,13 @@ async def warinfo(interaction: discord.Interaction):
         reverse=True
     )
 
-    # ---------------- TOP CONTRIBUTOR (ROBLOX + DISCORD LINK) ----------------
+    total_points = battle.get("Points", 0)
+    contributor_count = len(contributions)
+
+    # ---------------- TOP CONTRIBUTOR ----------------
     top_name = "Unknown"
-    top_points = 0
     top_discord = "Not linked"
+    top_points = 0
 
     if contributions:
         top = contributions[0]
@@ -843,19 +850,19 @@ async def warinfo(interaction: discord.Interaction):
 
     # ---------------- STATUS ----------------
     if now < start_ts:
-        status_line = "⏳ **UPCOMING**"
+        status_line = "⏳ UPCOMING"
         color = discord.Color.gold()
         bar = "`" + "░" * 20 + "`"
         time_field = f"Starts {discord.utils.format_dt(start_dt, 'R')}"
 
     elif now > finish_ts:
-        status_line = "🏁 **WAR ENDED**"
+        status_line = "🏁 WAR ENDED"
         color = discord.Color.dark_gray()
         bar = "`" + "█" * 20 + "`"
         time_field = f"Ended {discord.utils.format_dt(finish_dt, 'R')}"
 
     else:
-        status_line = "⚔️ **ACTIVE — IN PROGRESS**"
+        status_line = "⚔️ ACTIVE — IN PROGRESS"
         color = discord.Color.red()
 
         filled = int(progress * 20)
@@ -864,16 +871,15 @@ async def warinfo(interaction: discord.Interaction):
         secs_left = int(finish_ts - now)
         h, rem = divmod(secs_left, 3600)
         m = rem // 60
-
         time_field = f"Ends {discord.utils.format_dt(finish_dt, 'R')} ({h}h {m}m left)"
 
     # ---------------- EMBED ----------------
     embed = discord.Embed(
         title=f"🎮 {friendly_name}",
+        description=f"**{status_line}**",
         color=color
     )
 
-    embed.add_field(name="Status", value=status_line, inline=False)
     embed.add_field(name="Progress", value=bar, inline=False)
 
     embed.add_field(
@@ -888,11 +894,27 @@ async def warinfo(interaction: discord.Interaction):
         inline=True
     )
 
-    embed.add_field(name="⏱ Time", value=time_field, inline=False)
+    embed.add_field(
+        name="⏱ Time",
+        value=time_field,
+        inline=False
+    )
 
     embed.add_field(
         name="🥇 Top Contributor",
         value=f"**{top_name}**\n{top_discord}\n**{format_points(top_points)} pts**",
+        inline=True
+    )
+
+    embed.add_field(
+        name="🔢 Clan Total",
+        value=f"**{format_points(total_points)} pts**",
+        inline=True
+    )
+
+    embed.add_field(
+        name="👥 Contributors",
+        value=f"**{contributor_count}**",
         inline=True
     )
 
