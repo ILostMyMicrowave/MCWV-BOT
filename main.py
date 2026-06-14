@@ -764,15 +764,23 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR (USE COMPARE LOGIC) ----------------
-    war_config = data.get("data", {}).get("configData", {})
+    # ---------------- CURRENT WAR (COMPARE-STYLE LIVE FIX) ----------------
+    root = data.get("data", {})
+
+    war_config = root.get("configData", {})
 
     active_battle_id = (
         war_config.get("Title")
-        or data.get("data", {}).get("configName")
+        or root.get("configName")
     )
 
-    battles = data.get("data", {}).get("Battles", {})
+    battles = (
+        root.get("Battles")
+        or root.get("battles")
+        or root.get("clanWar", {}).get("Battles")
+        or root.get("Wars", {}).get("Battles")
+        or {}
+    )
 
     if not battles:
         return await interaction.followup.send(
@@ -784,16 +792,19 @@ async def warinfo(interaction: discord.Interaction):
 
     if active_battle_id and active_battle_id in battles:
         battle_id = active_battle_id
-    elif battles:
-        battle_id = list(battles.keys())[-1]
+    else:
+        battle_id = max(
+            battles.items(),
+            key=lambda x: x[1].get("FinishTime") or 0
+        )[0]
 
-    if not battle_id:
+    battle = battles.get(battle_id)
+
+    if not battle:
         return await interaction.followup.send(
             "❌ Could not determine current war.",
             ephemeral=True
-        )
-
-    battle = battles[battle_id]
+    )
     
     # ---------------- SAFE DATA EXTRACTION ----------------
     start_ts = battle.get("StartTime")
