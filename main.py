@@ -35,7 +35,9 @@ def run_web():
 # start web server (keep-alive)
 Thread(target=run_web).start()
 
+status_cache = {}
 status_cache_time = {}
+offline_since = {}
 
 def get_current_war(war_data, clan_data):
     war_config = war_data.get("data", {}).get("configData", {})
