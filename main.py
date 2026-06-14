@@ -1762,146 +1762,94 @@ async def settings(interaction: discord.Interaction):
 # ---------------- STATUS COMMAND ----------------
 @bot.tree.command(name="status", description="Check Roblox status", guild=guild_obj)
 async def status(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
 
-    # ---------------- COOLDOWN CHECK ----------------
-    now = datetime.now(timezone.utc).timestamp()
-    user_id = interaction.user.id
+    try:
+        # ---------------- COOLDOWN CHECK ----------------
+        now_ts = datetime.now(timezone.utc).timestamp()
+        user_id = interaction.user.id
 
-    last_used = status_cooldown.get(user_id, 0)
+        last_used = status_cooldown.get(user_id, 0)
+        if now_ts - last_used < 5:
+            remaining = round(5 - (now_ts - last_used), 1)
+            return await interaction.followup.send(
+                f"⏳ Slow down — wait {remaining}s before using this again.",
+                ephemeral=True
+            )
 
-    if now - last_used < 5:
-        remaining = round(5 - (now - last_used), 1)
-        return await interaction.response.send_message(
-            f"⏳ Slow down — wait {remaining}s before using this again.",
+        status_cooldown[user_id] = now_ts
+
+        # ---------------- DB LOOKUP ----------------
+        users = db_get_all()
+        target = next((u for u in users if int(u[1]) == member.id), None)
+
+        if not target:
+            return await interaction.followup.send(
+                f"❌ {member.mention} is not linked to a Roblox account.",
+                ephemeral=True
+            )
+
+        roblox_id = str(target[0])
+        roblox_name = target[2]
+
+        # ---------------- LIVE STATUS ----------------
+        current = status_cache.get(roblox_id)
+
+        # fallback to Roblox if cache is missing
+        if current is None:
+            global session
+
+            if session is None or session.closed:
+                session = aiohttp.ClientSession()
+
+            async with session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": [int(roblox_id)]}
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    pres = data.get("userPresences", [{}])[0]
+                    current = pres.get("userPresenceType", 0)
+                    status_cache[roblox_id] = current
+                else:
+                    current = 0
+
+        # ---------------- ICONS ----------------
+        status_icons = {
+            0: "⚫",
+            1: "🟢",
+            2: "🎮",
+            3: "🔧"
+        }
+
+        status_texts = {
+            0: "Not in game",
+            1: "On Roblox",
+            2: "In game",
+            3: "In studio"
+        }
+
+        icon = status_icons.get(current, "❓")
+        text = status_texts.get(current, "Unknown")
+
+        # ---------------- OFFLINE INFO ----------------
+        extra = ""
+        if current == 0 and roblox_id in offline_since:
+            since_dt = offline_since[roblox_id]
+            extra = f"\nOffline since {discord.utils.format_dt(since_dt, 'R')} ({format_duration(since_dt)})"
+
+        # ---------------- RESPONSE ----------------
+        await interaction.followup.send(
+            f"{icon} **{roblox_name}** — {text}{extra}",
             ephemeral=True
         )
 
-    status_cooldown[user_id] = now
-
-    # ---------------- DB LOOKUP ----------------
-    users = db_get_all()
-
-    target = next((u for u in users if int(u[1]) == member.id), None)
-
-    if not target:
-        return await interaction.response.send_message("Not linked", ephemeral=True)
-
-    roblox_id = str(target[0])   # 🔥 FIX: force string
-    roblox_name = target[2]
-
-    # ---------------- STATUS ----------------
-    current = status_cache.get(roblox_id, 0)  # 🔥 FIX: string key
-
-    status_icons = {
-        0: "⚫",
-        1: "🟢",
-        2: "🎮",
-        3: "🔧"
-    }
-
-    icon = status_icons.get(current, "❓")
-
-    # ---------------- OFFLINE INFO ----------------
-    extra = ""
-
-    if current == 0 and roblox_id in offline_since:
-        since_dt = offline_since[roblox_id]
-        extra = f"\nOffline since {discord.utils.format_dt(since_dt, 'R')} ({format_duration(since_dt)})"
-
-    # ---------------- RESPONSE ----------------
-    await interaction.response.send_message(
-        f"{icon} **{roblox_name}** — {status_text(current)}{extra}",
-        ephemeral=True
-    )
-
-
-# ---------------- ROBLOX LOOP ----------------
-@tasks.loop(minutes=2)
-async def check_loop():
-    users = db_get_all()
-
-    if not users or not bot_enabled:
-        return
-
-    print("Loop running, users:", len(users))
-
-    try:
-        global session
-
-        if session is None or session.closed:
-            session = aiohttp.ClientSession()
-
-        user_ids = [int(u[0]) for u in users]
-
-        url = "https://presence.roblox.com/v1/presence/users"
-
-        async with session.post(url, json={"userIds": user_ids}) as r:
-            if r.status != 200:
-                print("Presence API returned:", r.status)
-                return
-
-            data = await r.json()
-
     except Exception as e:
-        print("Loop error (API fetch):", e)
-        return
-
-    try:
-        for u in data.get("userPresences", []):
-
-            rid = str(u["userId"])  # 🔥 STRING KEY CONSISTENCY
-            current = u["userPresenceType"]
-
-            old = status_cache.get(rid)
-            status_cache[rid] = current
-
-            # ---------------- DB SAVE ----------------
-            try:
-                cur.execute("""
-                    INSERT INTO user_status (roblox_id, status, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (roblox_id)
-                    DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
-                """, (rid, current))
-                conn.commit()
-
-            except Exception as db_error:
-                print("Loop error (DB write):", db_error)
-
-            # no change → skip
-            if old == current:
-                continue
-
-            now = datetime.now(timezone.utc)
-
-            info = next((x for x in users if str(x[0]) == rid), None)
-            if not info:
-                continue
-
-            # IN GAME → reset offline tracking
-            if current == 2:
-                offline_since.pop(rid, None)
-                continue
-
-            # first time seen offline
-            if rid not in offline_since:
-                offline_since[rid] = now
-
-            # ping on leaving game
-            try:
-                if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
-                    channel = await bot.fetch_channel(CHANNEL_ID)
-
-                    await channel.send(
-                        f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-                        allowed_mentions=discord.AllowedMentions(users=True)
-                    )
-
-            except Exception as e:
-                print("Loop error (ping):", e)
-
-    except Exception as e:
-        print("Loop error (processing):", e)
+        print("[status error]", repr(e))
+        await interaction.followup.send(
+            "❌ Something went wrong while checking status.",
+            ephemeral=True
+        )
         
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
 @tasks.loop(minutes=2)
