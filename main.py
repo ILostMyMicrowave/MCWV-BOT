@@ -1772,32 +1772,26 @@ async def status(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        now = datetime.now(timezone.utc)
-        user_id = interaction.user.id
-
-        # ---------------- COOLDOWN ----------------
-        last_used = status_cooldown.get(user_id, 0)
-        if now.timestamp() - last_used < 5:
-            remaining = round(5 - (now.timestamp() - last_used), 1)
-            return await interaction.followup.send(
-                f"⏳ Slow down — wait {remaining}s",
-                ephemeral=True
-            )
-
-        status_cooldown[user_id] = now.timestamp()
-
-        # ---------------- DB LOOKUP ----------------
         users = db_get_all()
         target = next((u for u in users if int(u[1]) == member.id), None)
 
         if not target:
             return await interaction.followup.send("❌ Not linked", ephemeral=True)
 
-        roblox_id = str(target[0])
+        roblox_id = int(target[0])
         roblox_name = target[2]
 
-        # ---------------- STATUS (CACHE ONLY) ----------------
-        current = status_cache.get(str(roblox_id).strip(), 0)
+        async with session.post(
+            "https://presence.roblox.com/v1/presence/users",
+            json={"userIds": [roblox_id]}
+        ) as r:
+
+            if r.status != 200:
+                return await interaction.followup.send("❌ Roblox API error", ephemeral=True)
+
+            data = await r.json()
+            pres = data.get("userPresences", [{}])[0]
+            current = pres.get("userPresenceType", 0)
 
         status_map = {
             0: "⚫ Offline",
@@ -1806,28 +1800,13 @@ async def status(interaction: discord.Interaction, member: discord.Member):
             3: "🔧 Studio"
         }
 
-        label = status_map.get(current, "❓ Unknown")
-
-        # ---------------- OFFLINE DURATION ONLY ----------------
-        extra = ""
-
-        if current == 0 and roblox_id in offline_since:
-            since = offline_since[roblox_id]
-            mins = int((now - since).total_seconds() // 60)
-
-            if mins < 60:
-                extra = f"\n📴 Offline for {mins}m"
-            else:
-                extra = f"\n📴 Offline for {mins // 60}h {mins % 60}m"
-
-        # ---------------- OUTPUT ----------------
         await interaction.followup.send(
-            f"{label} **{roblox_name}**{extra}",
+            f"{status_map.get(current, '❓ Unknown')} **{roblox_name}**",
             ephemeral=True
         )
 
     except Exception as e:
-        print("[status error]", repr(e))
+        print("[status error]", e)
         await interaction.followup.send("❌ Error", ephemeral=True)
         
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
