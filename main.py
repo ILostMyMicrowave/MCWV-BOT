@@ -1105,7 +1105,7 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="📈 Share", value=f"{pct:.1f}%", inline=True)
         embed.add_field(
             name="Clan Position",
-            value=f"🏅 You are in the top **{top_percent:.1f}%** of the clan",
+            value=f"🏅 You below the top **{top_percent:.1f}%** of the clan",
             inline=False
         )
         embed.add_field(name="Progress vs #1", value=f"`{bar}`", inline=False)
