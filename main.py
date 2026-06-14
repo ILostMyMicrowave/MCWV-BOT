@@ -631,51 +631,90 @@ async def list_users(interaction: discord.Interaction):
         3: "🔧"
     }
 
-    lines_online = []
-    lines_offline = []
+    status_map = {
+        0: "Offline",
+        1: "Website",
+        2: "In Game",
+        3: "Studio"
+    }
 
+    online_lines = []
+    offline_lines = []
+
+    # ---------------- LOOP USERS ----------------
     for roblox_id, discord_id, username in users:
-        rid = str(roblox_id)
 
-        status_cache.get(str(rid).strip(), 0)
+        rid = str(roblox_id).strip()
+
+        # ---------------- CACHE FIRST ----------------
+        current = status_cache.get(rid)
+
+        # ---------------- SAFE FALLBACK (ONLY IF MISSING) ----------------
+        if current is None:
+            try:
+                async with session.post(
+                    "https://presence.roblox.com/v1/presence/users",
+                    json={"userIds": [int(rid)]}
+                ) as r:
+
+                    if r.status == 200:
+                        data = await r.json()
+                        pres = data.get("userPresences", [{}])[0]
+                        current = pres.get("userPresenceType", 0)
+
+                        # update cache immediately
+                        status_cache[rid] = current
+                        status_cache_time[rid] = datetime.now(timezone.utc)
+
+                    else:
+                        current = 0
+
+            except Exception:
+                current = 0
 
         icon = status_icons.get(current, "❓")
-        label = status_text(current)
+        label = status_map.get(current, "Unknown")
 
+        # ---------------- OFFLINE DURATION (OPTIONAL) ----------------
         extra = ""
 
-        # reuse same logic as /status
         if current == 0 and rid in offline_since:
-            extra = f" — offline {format_duration(offline_since[rid])}"
+            since = offline_since[rid]
+            mins = int((datetime.now(timezone.utc) - since).total_seconds() // 60)
+
+            if mins < 60:
+                extra = f" — offline {mins}m"
+            else:
+                extra = f" — offline {mins // 60}h {mins % 60}m"
 
         line = f"{icon} <@{discord_id}> — **{username}** ({label}){extra}"
 
         if current == 0:
-            lines_offline.append(line)
+            offline_lines.append(line)
         else:
-            lines_online.append(line)
+            online_lines.append(line)
 
+    # ---------------- BUILD EMBED ----------------
     embed = discord.Embed(
         title="📋 Tracked Members",
         color=discord.Color.blurple()
     )
 
     embed.add_field(
-        name="🟢 Active",
-        value="\n".join(lines_online) if lines_online else "None",
+        name="🟢 Online",
+        value="\n".join(online_lines) if online_lines else "None",
         inline=False
     )
 
     embed.add_field(
         name="⚫ Offline",
-        value="\n".join(lines_offline) if lines_offline else "None",
+        value="\n".join(offline_lines) if offline_lines else "None",
         inline=False
     )
 
-    online = len(lines_online)
-    offline = len(lines_offline)
-
-    embed.set_footer(text=f"{online} online • {offline} offline • {len(users)} total")
+    embed.set_footer(
+        text=f"🟢 {len(online_lines)} online • ⚫ {len(offline_lines)} offline • {len(users)} total"
+    )
 
     await interaction.followup.send(embed=embed)
 
