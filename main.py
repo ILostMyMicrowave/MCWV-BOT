@@ -620,39 +620,40 @@ async def list_users(interaction: discord.Interaction):
     await interaction.response.defer()
 
     users = db_get_all()
+
     if not users:
         return await interaction.followup.send("No users are being tracked.")
 
     status_icons = {
-        0: "⚫ Offline",
-        1: "🟢 Website",
-        2: "🎮 In Game",
-        3: "🔧 Studio"
+        0: "⚫",
+        1: "🟢",
+        2: "🎮",
+        3: "🔧"
     }
 
-    status_groups = {
-        2: [],
-        1: [],
-        3: [],
-        0: []
-    }
+    lines_online = []
+    lines_offline = []
 
     for roblox_id, discord_id, username in users:
         rid = str(roblox_id)
 
-        current = status_cache.get(rid, None)
+        current = status_cache.get(rid, 0)
 
-        # if cache not ready yet
-        if current is None:
-            status_groups[0].append(f"⏳ <@{discord_id}> — **{username}** (loading)")
-            continue
+        icon = status_icons.get(current, "❓")
+        label = status_text(current)
 
-        line = f"{status_icons.get(current, '❓')} <@{discord_id}> — **{username}**"
+        extra = ""
 
+        # reuse same logic as /status
         if current == 0 and rid in offline_since:
-            line += f" — offline for {format_duration(offline_since[rid])}"
+            extra = f" — offline {format_duration(offline_since[rid])}"
 
-        status_groups[current].append(line)
+        line = f"{icon} <@{discord_id}> — **{username}** ({label}){extra}"
+
+        if current == 0:
+            lines_offline.append(line)
+        else:
+            lines_online.append(line)
 
     embed = discord.Embed(
         title="📋 Tracked Members",
@@ -660,31 +661,19 @@ async def list_users(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="🎮 In Game",
-        value="\n".join(status_groups[2]) or "None",
-        inline=False
-    )
-
-    embed.add_field(
-        name="🟢 Website",
-        value="\n".join(status_groups[1]) or "None",
-        inline=False
-    )
-
-    embed.add_field(
-        name="🔧 Studio",
-        value="\n".join(status_groups[3]) or "None",
+        name="🟢 Active",
+        value="\n".join(lines_online) if lines_online else "None",
         inline=False
     )
 
     embed.add_field(
         name="⚫ Offline",
-        value="\n".join(status_groups[0]) or "None",
+        value="\n".join(lines_offline) if lines_offline else "None",
         inline=False
     )
 
-    online = len(status_groups[1]) + len(status_groups[2]) + len(status_groups[3])
-    offline = len(status_groups[0])
+    online = len(lines_online)
+    offline = len(lines_offline)
 
     embed.set_footer(text=f"{online} online • {offline} offline • {len(users)} total")
 
