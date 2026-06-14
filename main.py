@@ -763,7 +763,15 @@ async def warinfo(interaction: discord.Interaction):
                     "❌ Could not reach the PS99 API right now.",
                     ephemeral=True
                 )
-            data = await r.json()
+            war_data = await r.json()
+
+        async with session.get(CLAN_API) as r:
+            if r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach the clan API right now.",
+                    ephemeral=True
+                )
+            clan_data = await r.json()
 
     except Exception:
         return await interaction.followup.send(
@@ -771,29 +779,16 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR (MATCH /COMPARE LOGIC EXACTLY) ----------------
-    root = data.get("data", {})
+    # ---------------- CURRENT WAR ----------------
+    battle_id, battle = get_current_war(war_data, clan_data)
 
-    battles = (
-        root.get("Battles")
-        or root.get("battles")
-        or root.get("clanWar", {}).get("Battles")
-        or root.get("Wars", {}).get("Battles")
-        or {}
-    )
-
-    if not battles:
+    if not battle:
         return await interaction.followup.send(
-            "❌ No clan war data found.",
+            "❌ Could not determine current war.",
             ephemeral=True
         )
 
-    battle_id, battle = max(
-        battles.items(),
-        key=lambda x: x[1].get("FinishTime") or 0
-    )
-    
-    # ---------------- SAFE DATA EXTRACTION ----------------
+    # ---------------- DATA ----------------
     start_ts = battle.get("StartTime")
     finish_ts = battle.get("FinishTime")
 
@@ -804,11 +799,9 @@ async def warinfo(interaction: discord.Interaction):
         )
 
     now = datetime.now(timezone.utc).timestamp()
-
     total_duration = max(finish_ts - start_ts, 1)
     elapsed = now - start_ts
 
-    # Friendly name
     friendly_name = re.sub(
         r'(\d+)',
         r' \1',
@@ -872,7 +865,7 @@ async def warinfo(interaction: discord.Interaction):
     embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
 
     await interaction.followup.send(embed=embed)
-
+    
 @bot.tree.command(name="leaderboard", description="Show MCWV clan war contribution leaderboard", guild=guild_obj)
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
