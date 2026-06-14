@@ -764,16 +764,37 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR ----------------
-    battle_id, battle = get_current_war(data)
+    # ---------------- CURRENT WAR (USE COMPARE LOGIC) ----------------
+    war_config = data.get("data", {}).get("configData", {})
 
-    # HARD SAFETY CHECK (prevents infinite "thinking")
-    if not battle_id or not battle:
+    active_battle_id = (
+        war_config.get("Title")
+        or data.get("data", {}).get("configName")
+    )
+
+    battles = data.get("data", {}).get("Battles", {})
+
+    if not battles:
         return await interaction.followup.send(
             "❌ No clan war data found.",
             ephemeral=True
         )
 
+    battle_id = None
+
+    if active_battle_id and active_battle_id in battles:
+        battle_id = active_battle_id
+    elif battles:
+        battle_id = list(battles.keys())[-1]
+
+    if not battle_id:
+        return await interaction.followup.send(
+            "❌ Could not determine current war.",
+            ephemeral=True
+        )
+
+    battle = battles[battle_id]
+    
     # ---------------- SAFE DATA EXTRACTION ----------------
     start_ts = battle.get("StartTime")
     finish_ts = battle.get("FinishTime")
