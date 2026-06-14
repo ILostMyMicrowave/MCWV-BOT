@@ -626,11 +626,66 @@ async def list_users(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
+    status_icons = {
+        0: "⚫",
+        1: "🟢",
+        2: "🎮",
+        3: "🔧"
+    }
 
-    def chunk_lines(lines, limit=1024):
+    section_titles = {
+        2: "🎮 In Game",
+        1: "🟢 Website",
+        3: "🔧 Studio",
+        0: "⚫ Offline"
+    }
+
+    # Keep online users first, offline last
+    status_order = {
+        2: 0,
+        1: 1,
+        3: 2,
+        0: 3
+    }
+
+    grouped = {
+        2: [],
+        1: [],
+        3: [],
+        0: []
+    }
+
+    for row in users:
+        try:
+            roblox_id = str(row[0])
+            discord_id = row[1]
+            username = row[2]
+
+            current = status_cache.get(roblox_id, 0)
+            if current not in grouped:
+                current = 0
+
+            extra = ""
+            if current == 0 and roblox_id in offline_since:
+                try:
+                    extra = f" — offline for {format_duration(offline_since[roblox_id])}"
+                except Exception:
+                    extra = ""
+
+            line = f"{status_icons.get(current, '❓')} <@{discord_id}> — **{username}**{extra}"
+            grouped[current].append(line)
+
+        except Exception:
+            continue
+
+    for key in grouped:
+        grouped[key].sort(key=lambda s: s.lower())
+
+    total_users = len(users)
+    online_count = len(grouped[2]) + len(grouped[1]) + len(grouped[3])
+    offline_count = len(grouped[0])
+
+    def split_lines(lines, limit=1024):
         chunks = []
         current = ""
         for line in lines:
@@ -645,116 +700,54 @@ async def list_users(interaction: discord.Interaction):
             chunks.append(current.rstrip())
         return chunks
 
-    status_icons = {
-        0: "⚫",
-        1: "🟢",
-        2: "🎮",
-        3: "🔧"
-    }
+    pages = []
 
-    status_names = {
-        0: "⚫ Offline",
-        1: "🟢 Website",
-        2: "🎮 In Game",
-        3: "🔧 Studio"
-    }
-
-    status_order = {
-        2: 0,
-        1: 1,
-        3: 2,
-        0: 3
-    }
-
-    user_ids = [int(u[0]) for u in users]
-
-    try:
-        async with session.post(
-            "https://presence.roblox.com/v1/presence/users",
-            json={"userIds": user_ids}
-        ) as r:
-            if r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the Roblox Presence API.",
-                    ephemeral=True
-                )
-
-            data = await r.json()
-
-    except Exception:
-        return await interaction.followup.send(
-            "❌ Failed to fetch live Roblox status.",
-            ephemeral=True
+    def new_page():
+        return discord.Embed(
+            title="📋 Tracked Members",
+            description="Live status from the local cache, sorted with online users first.",
+            color=discord.Color.blurple()
         )
 
-    presence_map = {}
-    for p in data.get("userPresences", []):
-        try:
-            presence_map[int(p.get("userId", 0))] = int(p.get("userPresenceType", 0))
-        except Exception:
-            continue
-
-    grouped = {
-        2: [],
-        1: [],
-        3: [],
-        0: []
-    }
-
-    for roblox_id, discord_id, username in sorted(
-        users,
-        key=lambda u: (
-            status_order.get(presence_map.get(int(u[0]), 0), 99),
-            str(u[2]).lower()
-        )
-    ):
-        rid = int(roblox_id)
-        current = presence_map.get(rid, 0)
-        icon = status_icons.get(current, "❓")
-
-        extra = ""
-        if current == 0 and str(rid) in offline_since:
-            since_dt = offline_since[str(rid)]
-            extra = f" — offline for {format_duration(since_dt)}"
-
-        line = f"{icon} <@{discord_id}> — **{username}**{extra}"
-        grouped.setdefault(current, []).append(line)
+    current_embed = new_page()
+    field_count = 0
 
     summary = (
-        f"🎮 {len(grouped.get(2, []))} in game • "
-        f"🟢 {len(grouped.get(1, []))} on website • "
-        f"🔧 {len(grouped.get(3, []))} in studio • "
-        f"⚫ {len(grouped.get(0, []))} offline"
+        f"🟢 **{online_count}** online  •  "
+        f"⚫ **{offline_count}** offline  •  "
+        f"**{total_users}** total"
     )
-
-    embed = discord.Embed(
-        title="📋 Tracked Members",
-        description="Live Roblox presence, sorted with online users first.",
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(name="Summary", value=summary, inline=False)
-
-    section_titles = {
-        2: "🎮 In Game",
-        1: "🟢 Website",
-        3: "🔧 Studio",
-        0: "⚫ Offline"
-    }
+    current_embed.add_field(name="Summary", value=summary, inline=False)
+    field_count += 1
 
     for key in [2, 1, 3, 0]:
         lines = grouped.get(key, [])
         if not lines:
             continue
 
-        chunks = chunk_lines(lines, limit=1024)
+        chunks = split_lines(lines, limit=1024)
         for i, chunk in enumerate(chunks):
+            if field_count >= 25:
+                pages.append(current_embed)
+                current_embed = new_page()
+                field_count = 0
+
             title = section_titles[key] if i == 0 else f"{section_titles[key]} (cont.)"
-            embed.add_field(name=title, value=chunk, inline=False)
+            current_embed.add_field(name=title, value=chunk, inline=False)
+            field_count += 1
 
-    embed.set_footer(text=f"{len(users)} total tracked users")
+    if field_count > 0:
+        pages.append(current_embed)
 
-    await interaction.followup.send(embed=embed)
+    if not pages:
+        return await interaction.followup.send(
+            "No status data available.",
+            ephemeral=True
+        )
+
+    await interaction.followup.send(embed=pages[0])
+    for page in pages[1:]:
+        await interaction.followup.send(embed=page)
 
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
 @require_role()
