@@ -36,8 +36,13 @@ def run_web():
 Thread(target=run_web).start()
 
 def get_current_war(war_data, clan_data):
-    root = clan_data.get("data", {})
+    war_config = war_data.get("data", {}).get("configData", {})
+    active_battle_id = (
+        war_config.get("Title")
+        or war_data.get("data", {}).get("configName")
+    )
 
+    root = clan_data.get("data", {})
     battles = (
         root.get("Battles")
         or root.get("battles")
@@ -49,12 +54,12 @@ def get_current_war(war_data, clan_data):
     if not battles:
         return None, None
 
-    battle_id, battle = max(
-        battles.items(),
-        key=lambda x: x[1].get("FinishTime") or 0
-    )
+    if active_battle_id and active_battle_id in battles:
+        battle_id = active_battle_id
+    else:
+        battle_id = list(battles.keys())[-1]
 
-    return battle_id, battle
+    return battle_id, battles.get(battle_id)
 
 async def run_initial_presence_check(channel):
     try:
