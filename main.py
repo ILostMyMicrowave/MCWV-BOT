@@ -788,9 +788,11 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- DATA ----------------
-    start_ts = battle.get("StartTime")
-    finish_ts = battle.get("FinishTime")
+    # ---------------- SAFE DATA EXTRACTION ----------------
+    war_config = war_data.get("data", {}).get("configData", {})
+
+    start_ts = war_config.get("StartTime")
+    finish_ts = war_config.get("FinishTime")
 
     if not start_ts or not finish_ts:
         return await interaction.followup.send(
