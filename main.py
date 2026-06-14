@@ -763,23 +763,12 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- SAFE BATTLE SELECTION ----------------
-    battles = data.get("data", {}).get("Battles", {})
-
-    if not battles:
-        return await interaction.followup.send(
-            "❌ No clan war data found.",
-            ephemeral=True
-        )
-
-    battle_id, battle = max(
-        battles.items(),
-        key=lambda x: x[1].get("FinishTime") or 0
-    )
+    # ---------------- CURRENT WAR ----------------
+    battle_id, battle = get_current_war(data, data)
 
     if not battle:
         return await interaction.followup.send(
-            "❌ Could not determine current war.",
+            "❌ No clan war data found.",
             ephemeral=True
         )
 
