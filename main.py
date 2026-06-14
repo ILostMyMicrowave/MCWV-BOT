@@ -35,6 +35,8 @@ def run_web():
 # start web server (keep-alive)
 Thread(target=run_web).start()
 
+status_cache_time = {}
+
 def get_current_war(war_data, clan_data):
     war_config = war_data.get("data", {}).get("configData", {})
     active_battle_id = (
@@ -1765,15 +1767,15 @@ async def status(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # ---------------- COOLDOWN CHECK ----------------
         now_ts = datetime.now(timezone.utc).timestamp()
         user_id = interaction.user.id
 
+        # ---------------- COOLDOWN ----------------
         last_used = status_cooldown.get(user_id, 0)
         if now_ts - last_used < 5:
             remaining = round(5 - (now_ts - last_used), 1)
             return await interaction.followup.send(
-                f"⏳ Slow down — wait {remaining}s before using this again.",
+                f"⏳ Slow down — wait {remaining}s",
                 ephemeral=True
             )
 
@@ -1784,24 +1786,16 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         target = next((u for u in users if int(u[1]) == member.id), None)
 
         if not target:
-            return await interaction.followup.send(
-                f"❌ {member.mention} is not linked to a Roblox account.",
-                ephemeral=True
-            )
+            return await interaction.followup.send("❌ Not linked", ephemeral=True)
 
         roblox_id = str(target[0])
         roblox_name = target[2]
 
-        # ---------------- LIVE STATUS ----------------
+        # ---------------- STATUS ----------------
         current = status_cache.get(roblox_id)
 
-        # fallback to Roblox if cache is missing
+        # fallback if missing
         if current is None:
-            global session
-
-            if session is None or session.closed:
-                session = aiohttp.ClientSession()
-
             async with session.post(
                 "https://presence.roblox.com/v1/presence/users",
                 json={"userIds": [int(roblox_id)]}
@@ -1810,46 +1804,49 @@ async def status(interaction: discord.Interaction, member: discord.Member):
                     data = await r.json()
                     pres = data.get("userPresences", [{}])[0]
                     current = pres.get("userPresenceType", 0)
+
                     status_cache[roblox_id] = current
+                    status_cache_time[roblox_id] = datetime.now(timezone.utc)
                 else:
                     current = 0
 
+        # ---------------- TIME TRACKING ----------------
+        last_change = status_cache_time.get(roblox_id, datetime.now(timezone.utc))
+        duration = datetime.now(timezone.utc) - last_change
+
+        def format_short(td):
+            secs = int(td.total_seconds())
+            h = secs // 3600
+            m = (secs % 3600) // 60
+            if h > 0:
+                return f"{h}h {m}m"
+            return f"{m}m"
+
         # ---------------- ICONS ----------------
-        status_icons = {
-            0: "⚫",
-            1: "🟢",
-            2: "🎮",
-            3: "🔧"
+        status_map = {
+            0: "⚫ Offline",
+            1: "🟢 Website",
+            2: "🎮 In Game",
+            3: "🔧 Studio"
         }
 
-        status_texts = {
-            0: "Not in game",
-            1: "On Roblox",
-            2: "In game",
-            3: "In studio"
-        }
+        icon = status_map.get(current, "❓ Unknown")
 
-        icon = status_icons.get(current, "❓")
-        text = status_texts.get(current, "Unknown")
+        # ---------------- EXTRA TEXT ----------------
+        extra = f"\n⏱ In this state for: **{format_short(duration)}**"
 
-        # ---------------- OFFLINE INFO ----------------
-        extra = ""
         if current == 0 and roblox_id in offline_since:
-            since_dt = offline_since[roblox_id]
-            extra = f"\nOffline since {discord.utils.format_dt(since_dt, 'R')} ({format_duration(since_dt)})"
+            extra += f"\n📴 Offline since: {discord.utils.format_dt(offline_since[roblox_id], 'R')}"
 
-        # ---------------- RESPONSE ----------------
+        # ---------------- OUTPUT ----------------
         await interaction.followup.send(
-            f"{icon} **{roblox_name}** — {text}{extra}",
+            f"{icon} **{roblox_name}**{extra}",
             ephemeral=True
         )
 
     except Exception as e:
         print("[status error]", repr(e))
-        await interaction.followup.send(
-            "❌ Something went wrong while checking status.",
-            ephemeral=True
-        )
+        await interaction.followup.send("❌ Error", ephemeral=True)
         
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
 @tasks.loop(minutes=2)
@@ -1887,6 +1884,7 @@ async def check_loop():
 
             old = status_cache.get(rid)
             status_cache[rid] = current
+            status_cache_time[rid] = now
 
             # save to Neon (persistent state)
             try:
