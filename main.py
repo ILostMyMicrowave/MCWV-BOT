@@ -1819,7 +1819,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             roblox_name=roblox_name,
             roblox_id=int(roblox_id),
             discord_tag=discord_display,
-            points=pts,
+            points=points,
             rank=rank if rank else 0,
             top_points=top_points,
             animated=True
