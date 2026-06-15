@@ -644,6 +644,99 @@ class ListView(discord.ui.View):
         self.mode = "offline"
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+LEADERBOARD_PAGE_SIZE = 10
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, entries, battle_title, total_points, is_active):
+        super().__init__(timeout=300)
+        self.entries = entries
+        self.battle_title = battle_title
+        self.total_points = total_points
+        self.is_active = is_active
+        self.page = 0
+        self.max_points = max((e["points"] for e in entries), default=1) or 1
+
+    def _total_pages(self) -> int:
+        return max(1, (len(self.entries) + LEADERBOARD_PAGE_SIZE - 1) // LEADERBOARD_PAGE_SIZE)
+
+    def _page_slice(self):
+        start = self.page * LEADERBOARD_PAGE_SIZE
+        end = start + LEADERBOARD_PAGE_SIZE
+        return self.entries[start:end], start, end
+
+    def _build_line(self, entry: dict) -> str:
+        rank = entry["rank"]
+        uid = entry["user_id"]
+        name = entry["name"]
+        pts = entry["points"]
+        discord_id = entry.get("discord_id")
+
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        medal = medals.get(rank, f"`#{rank:>2}`")
+
+        bar_len = int((pts / self.max_points) * 10) if self.max_points > 0 else 0
+        bar_len = max(0, min(10, bar_len))
+        bar = "█" * bar_len + "░" * (10 - bar_len)
+
+        profile_url = f"https://www.roblox.com/users/{uid}/profile"
+        safe_name = discord.utils.escape_markdown(str(name))
+        roblox_display = f"[{safe_name}]({profile_url})"
+
+        discord_part = f" • <@{discord_id}>" if discord_id else ""
+
+        return f"{medal} {roblox_display}{discord_part}\n`{bar}` **{format_points(pts)}**"
+
+    def build_embed(self) -> discord.Embed:
+        page_entries, start, end = self._page_slice()
+        lines = [self._build_line(entry) for entry in page_entries]
+
+        embed = discord.Embed(
+            title=f"🏆 {CLAN_NAME} — {self.battle_title}",
+            description="\n\n".join(lines) if lines else "No entries on this page.",
+            color=discord.Color.red() if self.is_active else discord.Color.dark_gold()
+        )
+
+        embed.add_field(
+            name="🔢 Total Clan Points",
+            value=f"**{format_points(self.total_points)}**",
+            inline=True
+        )
+
+        embed.add_field(
+            name="👥 Contributors",
+            value=f"**{len(self.entries)}**",
+            inline=True
+        )
+
+        embed.add_field(
+            name="📄 Page",
+            value=f"**{self.page + 1}/{self._total_pages()}**",
+            inline=True
+        )
+
+        embed.set_footer(
+            text=f"Showing {start + 1}-{min(end, len(self.entries))} of {len(self.entries)} • ps99.biggamesapi.io"
+        )
+        return embed
+
+    async def _move_page(self, interaction: discord.Interaction, delta: int):
+        total_pages = self._total_pages()
+        self.page = (self.page + delta) % total_pages
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._move_page(interaction, -1)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._move_page(interaction, 1)
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary)
+    async def refresh_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
 # ---------------- CONFIG ----------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
@@ -1355,131 +1448,162 @@ async def warinfo(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
     
-@bot.tree.command(name="leaderboard", description="Show MCWV clan war contribution leaderboard", guild=guild_obj)
+@bot.tree.command(
+    name="leaderboard",
+    description="Show MCWV clan war contribution leaderboard",
+    guild=guild_obj
+)
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
-        async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
-            if war_r.status != 200 or clan_r.status != 200:
+        global session
+
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with session.get(PS99_API, timeout=timeout) as war_r:
+            if war_r.status != 200:
                 return await interaction.followup.send(
-                    "❌ Could not reach the PS99 API.",
+                    "❌ Could not reach the PS99 war API.",
                     ephemeral=True
                 )
-
             war_data = await war_r.json()
+
+        async with session.get(CLAN_API, timeout=timeout) as clan_r:
+            if clan_r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 clan API.",
+                    ephemeral=True
+                )
             clan_data = await clan_r.json()
 
-    except Exception:
+    except Exception as e:
+        print("[LEADERBOARD API ERROR]", repr(e))
         return await interaction.followup.send(
-            "❌ API request failed.",
+            f"❌ API request failed.\n```{type(e).__name__}: {e}```",
             ephemeral=True
         )
-
-    # ---------------- WAR CONFIG ----------------
-    war_config = war_data.get("data", {}).get("configData", {})
-
-    # ---------------- CURRENT WAR ----------------
-    battle_id, battle = get_current_war(war_data, clan_data)
-
-    if not battle:
-        return await interaction.followup.send(
-            "❌ No battle data found for MCWV.",
-            ephemeral=True
-        )
-
-    # ---------------- CONTRIBUTIONS ----------------
-    contributions = sorted(
-        battle.get("PointContributions", []),
-        key=lambda x: x.get("Points", 0),
-        reverse=True
-    )
-
-    total_points = battle.get("Points", 0)
-
-    if not contributions:
-        return await interaction.followup.send(
-            "❌ No contribution data yet for this war.",
-            ephemeral=True
-        )
-
-    # ---------------- ROBLOX NAMES ----------------
-    top = contributions[:15]
-    user_ids = [e.get("UserID") for e in top if e.get("UserID") is not None]
 
     try:
-        async with session.post(
-            ROBLOX_USERS_API,
-            json={"userIds": user_ids, "excludeBannedUsers": False}
-        ) as r:
-            roblox_data = await r.json()
-            id_to_name = {u["id"]: u["name"] for u in roblox_data.get("data", [])}
-    except Exception:
+        war_config = war_data.get("data", {}).get("configData", {})
+        battle_id, battle = get_current_war(war_data, clan_data)
+
+        if not battle:
+            return await interaction.followup.send(
+                "❌ No battle data found for MCWV.",
+                ephemeral=True
+            )
+
+        contributions = sorted(
+            battle.get("PointContributions", []),
+            key=lambda x: x.get("Points", 0),
+            reverse=True
+        )
+
+        total_points = battle.get("Points", 0)
+
+        if not contributions:
+            return await interaction.followup.send(
+                "❌ No contribution data yet for this war.",
+                ephemeral=True
+            )
+
+        top = contributions[:15]
+        user_ids = [e.get("UserID") for e in top if e.get("UserID") is not None]
+
         id_to_name = {}
+        try:
+            async with session.post(
+                ROBLOX_USERS_API,
+                json={"userIds": user_ids, "excludeBannedUsers": False},
+                timeout=timeout
+            ) as r:
+                if r.status == 200:
+                    roblox_data = await r.json()
+                    for u in roblox_data.get("data", []):
+                        try:
+                            uid = int(u.get("id"))
+                            uname = str(u.get("name", f"Unknown ({uid})"))
+                            id_to_name[uid] = uname
+                        except Exception:
+                            continue
+        except Exception as e:
+            print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
-    # ---------------- DISCORD LOOKUP ----------------
-    users = db_get_all_tracked()
-    roblox_to_discord = {int(u[0]): u[1] for u in db_users}
+        tracked_rows = db_get_all_tracked()
+        roblox_to_discord = {}
+        for row in tracked_rows:
+            try:
+                rid = int(row[0])
+                did = int(row[1])
+                roblox_to_discord[rid] = did
+            except Exception:
+                continue
 
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    top_points = top[0]["Points"] if top else 1
+        battle_name = re.sub(
+            r'(\d+)',
+            r' \1',
+            re.sub(r'([A-Z])', r' \1', battle_id)
+        ).strip()
 
-    lines = []
+        now = datetime.now(timezone.utc).timestamp()
+        finish_ts = war_config.get("FinishTime")
+        start_ts = war_config.get("StartTime", 0)
 
-    for i, entry in enumerate(top, 1):
-        uid = entry.get("UserID")
-        pts = entry.get("Points", 0)
+        is_active = False
+        if finish_ts:
+            is_active = start_ts <= now <= finish_ts
 
-        name = id_to_name.get(uid, f"Unknown ({uid})")
-        medal = medals.get(i, f"`#{i:>2}`")
+        entries = []
+        for rank, entry in enumerate(contributions, start=1):
+            uid = entry.get("UserID")
+            if uid is None:
+                continue
 
-        bar_len = int((pts / top_points) * 10)
-        bar = "█" * bar_len + "░" * (10 - bar_len)
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
 
-        discord_mention = f" <@{roblox_to_discord[uid]}>" if uid in roblox_to_discord else ""
+            pts = int(entry.get("Points", 0) or 0)
+            name = id_to_name.get(uid_int, f"Unknown ({uid_int})")
+            discord_id = roblox_to_discord.get(uid_int)
 
-        lines.append(f"{medal} **{name}**{discord_mention}\n`{bar}` **{format_points(pts)}**")
+            entries.append({
+                "rank": rank,
+                "user_id": uid_int,
+                "name": name,
+                "points": pts,
+                "discord_id": discord_id
+            })
 
-    # ---------------- DISPLAY ----------------
-    friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', battle_id)).strip()
+        if not entries:
+            return await interaction.followup.send(
+                "❌ No valid leaderboard entries found.",
+                ephemeral=True
+            )
 
-    now = datetime.now(timezone.utc).timestamp()
-    finish_ts = war_config.get("FinishTime")
-    start_ts = war_config.get("StartTime", 0)
+        view = LeaderboardView(
+            entries=entries,
+            battle_title=battle_name,
+            total_points=total_points,
+            is_active=is_active
+        )
 
-    is_active = False
-    if finish_ts:
-        is_active = start_ts <= now <= finish_ts
+        await interaction.followup.send(
+            embed=view.build_embed(),
+            view=view
+        )
 
-    embed = discord.Embed(
-        title=f"🏆  {CLAN_NAME} — {friendly}",
-        description="\n".join(lines),
-        color=discord.Color.red() if is_active else discord.Color.dark_gold()
-    )
-
-    embed.add_field(
-        name="🔢  Total Clan Points",
-        value=f"**{format_points(total_points)}**",
-        inline=True
-    )
-
-    embed.add_field(
-        name="👥  Contributors",
-        value=f"**{len(contributions)}**",
-        inline=True
-    )
-
-    embed.add_field(
-        name="Status",
-        value="⚔️ Active" if is_active else "🏁 Ended",
-        inline=True
-    )
-
-    embed.set_footer(
-        text=f"Showing top {len(top)} of {len(contributions)} • ps99.biggamesapi.io"
-    )
-
-    await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print("[LEADERBOARD ERROR]", repr(e))
+        await interaction.followup.send(
+            f"❌ Leaderboard failed.\n```{type(e).__name__}: {e}```",
+            ephemeral=True
+        )
     
 @bot.tree.command(
     name="mystats",
