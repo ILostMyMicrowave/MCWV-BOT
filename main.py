@@ -685,14 +685,6 @@ async def add(interaction: discord.Interaction, member: discord.Member, roblox_u
             ephemeral=True
         )
 
-@bot.tree.command(name="remove", description="Remove user", guild=guild_obj)
-@require_role()
-async def remove(interaction: discord.Interaction, member: discord.Member):
-
-    db_remove(member.id)
-    offline_since.pop(str(member.id), None)
-    await interaction.response.send_message(f"✅ Removed {member.mention} from tracking.", ephemeral=True)
-
 @bot.tree.command(
     name="list",
     description="Show all tracked users",
