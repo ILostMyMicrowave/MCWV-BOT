@@ -2049,6 +2049,7 @@ async def resolve_cleanup_target(guild: discord.Guild, target: str, db_users: li
 
 
 class CleanupConfirmView(discord.ui.View):
+
     def __init__(self, guild, target, reason, requestor):
         super().__init__(timeout=86400)
         self.guild = guild
@@ -2058,13 +2059,13 @@ class CleanupConfirmView(discord.ui.View):
 
     async def run_cleanup(self, interaction: discord.Interaction):
 
-    users = db_get_all_tracked()
+        users = db_get_all_tracked()
 
-    member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
-        self.guild, self.target, users
-    )
+        member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
+            self.guild, self.target, users
+        )
 
-    actions = []
+        actions = []
 
     # ---------------- REMOVE ROLE ----------------
     if member:
