@@ -33,6 +33,210 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+def db_get_main_link(discord_id):
+    if not db_enabled():
+        return None
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id, username
+                FROM users
+                WHERE discord_id = %s
+            """, (int(discord_id),))
+            return cur.fetchone()
+    except Exception as e:
+        print("db_get_main_link error:", e)
+        return None
+
+
+def db_get_alts(discord_id):
+    if not db_enabled():
+        return []
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id, username
+                FROM user_alts
+                WHERE discord_id = %s
+                ORDER BY username
+            """, (int(discord_id),))
+            return cur.fetchall()
+    except Exception as e:
+        print("db_get_alts error:", e)
+        return []
+
+
+def db_get_all_tracked():
+    if not db_enabled():
+        return []
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id, discord_id, username
+                FROM (
+                    SELECT roblox_id, discord_id, username FROM users
+                    UNION ALL
+                    SELECT roblox_id, discord_id, username FROM user_alts
+                ) t
+                ORDER BY discord_id, username
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        print("db_get_all_tracked error:", e)
+        return []
+
+
+def db_find_roblox_link(roblox_id):
+    if not db_enabled():
+        return None
+
+    rid = str(roblox_id).strip()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT discord_id, username
+                FROM users
+                WHERE roblox_id = %s
+            """, (rid,))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "kind": "main",
+                    "discord_id": row[0],
+                    "username": row[1],
+                    "roblox_id": rid
+                }
+
+            cur.execute("""
+                SELECT discord_id, username
+                FROM user_alts
+                WHERE roblox_id = %s
+            """, (rid,))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "kind": "alt",
+                    "discord_id": row[0],
+                    "username": row[1],
+                    "roblox_id": rid
+                }
+
+    except Exception as e:
+        print("db_find_roblox_link error:", e)
+
+    return None
+
+def db_get_all_tracked():
+    if not db_enabled():
+        return []
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT roblox_id, discord_id, username FROM users
+            UNION ALL
+            SELECT roblox_id, discord_id, username FROM user_alts
+        """)
+        return cur.fetchall()
+
+def db_add_alt(discord_id, roblox_id, username):
+    if not db_enabled():
+        return False, "Database is not available."
+
+    did = int(discord_id)
+    rid = str(roblox_id).strip()
+    uname = str(username).strip()
+
+    try:
+        with conn.cursor() as cur:
+            # prevent the same Roblox account from being linked elsewhere
+            cur.execute("""
+                SELECT discord_id
+                FROM users
+                WHERE roblox_id = %s
+            """, (rid,))
+            row = cur.fetchone()
+            if row:
+                if int(row[0]) == did:
+                    return False, "That Roblox account is already the main account for this user."
+                return False, f"That Roblox account is already linked to <@{row[0]}>."
+
+            cur.execute("""
+                SELECT discord_id
+                FROM user_alts
+                WHERE roblox_id = %s
+            """, (rid,))
+            row = cur.fetchone()
+            if row:
+                if int(row[0]) == did:
+                    return False, "That Roblox account is already added as an alt for this user."
+                return False, f"That Roblox account is already linked as an alt for <@{row[0]}>."
+
+            cur.execute("""
+                INSERT INTO user_alts (discord_id, roblox_id, username)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (discord_id, roblox_id)
+                DO UPDATE SET username = EXCLUDED.username
+            """, (did, rid, uname))
+
+        conn.commit()
+        return True, f"Added **{uname}** as an alt."
+
+    except Exception as e:
+        conn.rollback()
+        print("db_add_alt error:", e)
+        return False, "Failed to add alt."
+
+
+def db_remove_alt(discord_id, alt_value):
+    if not db_enabled():
+        return False, None, "Database is not available."
+
+    did = int(discord_id)
+    alt_clean = str(alt_value).strip()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM user_alts
+                WHERE discord_id = %s
+                  AND (
+                        LOWER(username) = LOWER(%s)
+                        OR roblox_id = %s
+                  )
+                RETURNING roblox_id, username
+            """, (did, alt_clean, alt_clean))
+            row = cur.fetchone()
+
+        conn.commit()
+
+        if not row:
+            return False, None, "Alt not found."
+
+        return True, row[0], f"Removed **{row[1]}**."
+
+    except Exception as e:
+        conn.rollback()
+        print("db_remove_alt error:", e)
+        return False, None, "Failed to remove alt."
+
+
+def db_remove_all_links_for_discord(discord_id):
+    if not db_enabled():
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_alts WHERE discord_id = %s", (int(discord_id),))
+            cur.execute("DELETE FROM users WHERE discord_id = %s", (int(discord_id),))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print("db_remove_all_links_for_discord error:", e)
+
 status_cache = {}
 status_cache_time = {}
 offline_since = {}
@@ -353,6 +557,8 @@ if DATABASE_URL:
         print("Database connected")
 
         with conn.cursor() as cur:
+
+            # ---------------- MAIN USERS ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     roblox_id TEXT PRIMARY KEY,
@@ -361,6 +567,7 @@ if DATABASE_URL:
                 )
             """)
 
+            # ---------------- SETTINGS ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -368,6 +575,7 @@ if DATABASE_URL:
                 )
             """)
 
+            # ---------------- STATUS CACHE ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_status (
                     roblox_id TEXT PRIMARY KEY,
@@ -376,11 +584,23 @@ if DATABASE_URL:
                 )
             """)
 
+            # ---------------- ALTS SYSTEM (NEW) ----------------
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_alts (
+                    discord_id BIGINT NOT NULL,
+                    roblox_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    added_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (discord_id, roblox_id)
+                )
+            """)
+
         conn.commit()
 
     except Exception as e:
         print("DB connection failed:", e)
         conn = None
+
 else:
     print("DATABASE_URL not set - running without DB")
 
@@ -694,7 +914,7 @@ async def add(interaction: discord.Interaction, member: discord.Member, roblox_u
 async def list_users(interaction: discord.Interaction):
 
     try:
-        users = db_get_all()
+        users = db_get_all_tracked()
 
         if not users:
             return await interaction.response.send_message(
@@ -1070,7 +1290,7 @@ async def leaderboard(interaction: discord.Interaction):
         id_to_name = {}
 
     # ---------------- DISCORD LOOKUP ----------------
-    db_users = db_get_all()
+    users = db_get_all_tracked()
     roblox_to_discord = {int(u[0]): u[1] for u in db_users}
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -1837,51 +2057,81 @@ class CleanupConfirmView(discord.ui.View):
         self.requestor = requestor
 
     async def run_cleanup(self, interaction: discord.Interaction):
-        db_users = db_get_all()
 
-        member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
-            self.guild, self.target, db_users
-        )
+    users = db_get_all_tracked()
 
-        actions = []
+    member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
+        self.guild, self.target, users
+    )
 
-        if member:
-            role = self.guild.get_role(CLAN_MEMBER_ROLE_ID)
-            if role and role in member.roles:
-                try:
-                    await member.remove_roles(role, reason=self.reason)
-                    actions.append("✅ Removed clan role")
-                except Exception as e:
-                    actions.append(f"⚠️ Role removal failed: {e}")
+    actions = []
 
-        if linked_row:
+    # ---------------- REMOVE ROLE ----------------
+    if member:
+        role = self.guild.get_role(CLAN_MEMBER_ROLE_ID)
+        if role and role in member.roles:
             try:
-                db_remove(member.id if member else int(linked_row[1]))
-                actions.append("✅ Unlinked database")
+                await member.remove_roles(role, reason=self.reason)
+                actions.append("✅ Removed clan role")
             except Exception as e:
-                actions.append(f"⚠️ DB unlink failed: {e}")
+                actions.append(f"⚠️ Role removal failed: {e}")
 
-        if roblox_id:
+    # ---------------- REMOVE DB LINKS (MAIN + ALTS) ----------------
+    try:
+        if member:
+            db_remove_all_links_for_discord(member.id)
+            actions.append("✅ Removed main + alts from DB")
+        elif linked_row:
+            db_remove_all_links_for_discord(int(linked_row[1]))
+            actions.append("✅ Removed DB links (fallback)")
+    except Exception as e:
+        actions.append(f"⚠️ DB unlink failed: {e}")
+
+    # ---------------- CACHE CLEANUP (IMPORTANT FIX) ----------------
+    try:
+        if member:
+            discord_id = member.id
+            alts = db_get_alts(discord_id)
+            main = db_get_main_link(discord_id)
+
+            all_ids = []
+
+            if main:
+                all_ids.append(str(main[0]).strip())
+
+            for rid, _ in alts:
+                all_ids.append(str(rid).strip())
+
+            for rid in all_ids:
+                status_cache.pop(rid, None)
+                status_cache_time.pop(rid, None)
+                offline_since.pop(rid, None)
+
+            actions.append("✅ Cleared all caches (main + alts)")
+        elif roblox_id:
             clear_tracking_for_roblox_id(roblox_id)
             actions.append("✅ Cleared caches")
+    except Exception as e:
+        actions.append(f"⚠️ Cache cleanup failed: {e}")
 
-        embed = discord.Embed(
-            title="✅ Cleanup Completed",
-            description=(
-                f"**Target:** {self.target}\n"
-                f"**Roblox:** {roblox_name or 'Unknown'}\n"
-                f"**Requested by:** {self.requestor.mention}"
-            ),
-            color=discord.Color.green()
-        )
+    # ---------------- RESPONSE ----------------
+    embed = discord.Embed(
+        title="✅ Cleanup Completed",
+        description=(
+            f"**Target:** {self.target}\n"
+            f"**Roblox:** {roblox_name or 'Unknown'}\n"
+            f"**Requested by:** {self.requestor.mention}"
+        ),
+        color=discord.Color.green()
+    )
 
-        embed.add_field(
-            name="Actions",
-            value="\n".join(actions) if actions else "None",
-            inline=False
-        )
+    embed.add_field(
+        name="Actions",
+        value="\n".join(actions) if actions else "None",
+        inline=False
+    )
 
-        await interaction.response.edit_message(embed=embed, view=None)
+    await interaction.response.edit_message(embed=embed, view=None)
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1908,9 +2158,9 @@ class CleanupConfirmView(discord.ui.View):
 async def cleanup(interaction: discord.Interaction, target: str, reason: str = "No reason provided"):
     await interaction.response.defer(ephemeral=True)
 
-    db_users = db_get_all()
+    users = db_get_all_tracked()
     member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
-        interaction.guild, target, db_users
+        interaction.guild, target, users
     )
 
     if not member and not linked_row:
@@ -2055,6 +2305,133 @@ async def testreminder(interaction: discord.Interaction):
         "✅ Test reminder sent successfully.",
         ephemeral=True
     )
+
+from discord import app_commands
+
+@bot.tree.command(
+    name="addalt",
+    description="Add an alt Roblox account to a member",
+    guild=guild_obj
+)
+@require_role()
+async def addalt(interaction: discord.Interaction, member: discord.Member, roblox_username: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        resolved = await resolve_roblox_username(roblox_username)
+
+        if not resolved:
+            return await interaction.followup.send(
+                "❌ Roblox username not found.",
+                ephemeral=True
+            )
+
+        roblox_id = str(resolved["id"]).strip()
+        username = str(resolved["name"]).strip()
+
+        ok, msg = db_add_alt(member.id, roblox_id, username)
+        if not ok:
+            return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+
+        await interaction.followup.send(
+            f"✅ Added **{username}** as an alt for {member.mention}.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print("addalt error:", e)
+        await interaction.followup.send("❌ Failed to add alt.", ephemeral=True)
+
+@bot.tree.command(
+    name="listalts",
+    description="List a member's linked Roblox accounts",
+    guild=guild_obj
+)
+@require_role()
+async def listalts(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        main = db_get_main_link(member.id)
+        alts = db_get_alts(member.id)
+
+        embed = discord.Embed(
+            title=f"👥 Alts for {member.display_name}",
+            color=discord.Color.blurple()
+        )
+
+        if main:
+            main_rid, main_name = main
+            main_status = status_cache.get(str(main_rid).strip(), 0)
+            status_icons = {0: "⚫", 1: "🟢", 2: "🎮", 3: "🔧"}
+            embed.add_field(
+                name="Main",
+                value=f"{status_icons.get(main_status, '❓')} **{main_name}**",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="Main",
+                value="Not linked",
+                inline=False
+            )
+
+        if alts:
+            lines = []
+            status_icons = {0: "⚫", 1: "🟢", 2: "🎮", 3: "🔧"}
+
+            for rid, uname in alts:
+                st = status_cache.get(str(rid).strip(), 0)
+                lines.append(f"{status_icons.get(st, '❓')} **{uname}**")
+
+            embed.add_field(
+                name=f"Alts ({len(alts)})",
+                value="\n".join(lines),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="Alts",
+                value="None",
+                inline=False
+            )
+
+        embed.set_footer(text=f"{member.id}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        print("listalts error:", e)
+        await interaction.followup.send("❌ Failed to list alts.", ephemeral=True)
+
+@bot.tree.command(
+    name="removealt",
+    description="Remove one alt Roblox account from a member",
+    guild=guild_obj
+)
+@require_role()
+async def removealt(interaction: discord.Interaction, member: discord.Member, alt: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        ok, roblox_id, msg = db_remove_alt(member.id, alt)
+        if not ok:
+            return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+
+        if roblox_id:
+            rid = str(roblox_id).strip()
+            status_cache.pop(rid, None)
+            status_cache_time.pop(rid, None)
+            offline_since.pop(rid, None)
+
+        await interaction.followup.send(
+            f"✅ {msg} for {member.mention}.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print("removealt error:", e)
+        await interaction.followup.send("❌ Failed to remove alt.", ephemeral=True)
+        
 # ---------------- STATUS COMMAND ----------------
 @bot.tree.command(name="status", description="Check Roblox status", guild=guild_obj)
 async def status(interaction: discord.Interaction, member: discord.Member):
@@ -2109,7 +2486,7 @@ def _chunks(items, size=50):
 async def check_loop():
     print("🔄 CHECK_LOOP HIT")
 
-    users = db_get_all()
+    users = db_get_all_tracked()
     if not users or not bot_enabled:
         return
 
