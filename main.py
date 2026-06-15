@@ -339,38 +339,45 @@ import os
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 conn = None
-cur = None
 
 def db_enabled():
-    return conn is not None and cur is not None
+    return conn is not None
 
 if DATABASE_URL:
     try:
         conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
+        conn.autocommit = False
         print("Database connected")
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            roblox_id TEXT PRIMARY KEY,
-            discord_id BIGINT,
-            username TEXT
-        )
-        """)
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    roblox_id TEXT PRIMARY KEY,
+                    discord_id BIGINT,
+                    username TEXT
+                )
+            """)
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_status (
+                    roblox_id TEXT PRIMARY KEY,
+                    status INTEGER,
+                    updated_at TIMESTAMP
+                )
+            """)
 
         conn.commit()
 
     except Exception as e:
         print("DB connection failed:", e)
         conn = None
-        cur = None
 else:
     print("DATABASE_URL not set - running without DB")
 
@@ -379,57 +386,130 @@ def db_add(rid, did, name):
     if not db_enabled():
         return
 
-    cur.execute("""
-        INSERT INTO users (roblox_id, discord_id, username)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (roblox_id)
-        DO UPDATE SET discord_id = EXCLUDED.discord_id,
-                      username = EXCLUDED.username
-    """, (rid, did, name))
-
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (roblox_id, discord_id, username)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (roblox_id)
+                DO UPDATE SET
+                    discord_id = EXCLUDED.discord_id,
+                    username = EXCLUDED.username
+            """, (str(rid).strip(), int(did), str(name).strip()))
+        conn.commit()
+    except Exception as e:
+        print("db_add error:", e)
+        conn.rollback()
 
 
 def db_remove(did):
     if not db_enabled():
         return
 
-    cur.execute("""
-        DELETE FROM users WHERE discord_id = %s
-    """, (did,))
-
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM users
+                WHERE discord_id = %s
+            """, (int(did),))
+        conn.commit()
+    except Exception as e:
+        print("db_remove error:", e)
+        conn.rollback()
 
 
 def db_get_all():
     if not db_enabled():
         return []
 
-    cur.execute("SELECT roblox_id, discord_id, username FROM users")
-    return cur.fetchall()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id, discord_id, username
+                FROM users
+            """)
+            rows = cur.fetchall()
+
+        return rows
+    except Exception as e:
+        print("db_get_all error:", e)
+        return []
 
 
 def db_get_setting(key, default=None):
     if not db_enabled():
         return default
 
-    cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
-    row = cur.fetchone()
-    return row[0] if row else default
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT value
+                FROM settings
+                WHERE key = %s
+            """, (str(key),))
+            row = cur.fetchone()
+
+        return row[0] if row else default
+    except Exception as e:
+        print("db_get_setting error:", e)
+        return default
 
 
 def db_set_setting(key, value):
     if not db_enabled():
         return
 
-    cur.execute("""
-        INSERT INTO settings (key, value)
-        VALUES (%s, %s)
-        ON CONFLICT (key)
-        DO UPDATE SET value = EXCLUDED.value
-    """, (key, str(value)))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO settings (key, value)
+                VALUES (%s, %s)
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value
+            """, (str(key), str(value)))
+        conn.commit()
+    except Exception as e:
+        print("db_set_setting error:", e)
+        conn.rollback()
 
-    conn.commit()
+
+def db_set_user_status(rid, status):
+    if not db_enabled():
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_status (roblox_id, status, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (roblox_id)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    updated_at = NOW()
+            """, (str(rid).strip(), int(status)))
+        conn.commit()
+    except Exception as e:
+        print("db_set_user_status error:", e)
+        conn.rollback()
+
+
+def db_get_user_status(rid):
+    if not db_enabled():
+        return None
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status
+                FROM user_status
+                WHERE roblox_id = %s
+            """, (str(rid).strip(),))
+            row = cur.fetchone()
+
+        return row[0] if row else None
+    except Exception as e:
+        print("db_get_user_status error:", e)
+        return None
 
 # ---------------- STATUS ----------------
 status_cache = {}
@@ -1803,6 +1883,7 @@ def _chunks(items, size=50):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
+
 @tasks.loop(minutes=2)
 async def check_loop():
     print("🔄 CHECK_LOOP HIT")
@@ -1822,12 +1903,13 @@ async def check_loop():
         user_ids = [int(u[0]) for u in users]
         all_presences = []
 
-        # Roblox presence API is safer in chunks
+        # ---------------- ROBLOX API (chunked) ----------------
         for chunk in _chunks(user_ids, 50):
             async with session.post(
                 "https://presence.roblox.com/v1/presence/users",
                 json={"userIds": chunk}
             ) as r:
+
                 if r.status != 200:
                     print("Presence API returned:", r.status)
                     continue
@@ -1835,7 +1917,7 @@ async def check_loop():
                 data = await r.json()
                 presences = data.get("userPresences", [])
 
-                if isinstance(presences, list) and presences:
+                if isinstance(presences, list):
                     all_presences.extend(presences)
 
     except Exception as e:
@@ -1853,12 +1935,13 @@ async def check_loop():
 
     try:
         for u in all_presences:
+
             try:
                 rid = str(u.get("userId", "")).strip()
                 if not rid:
                     continue
 
-                current = u.get("userPresenceType", None)
+                current = u.get("userPresenceType")
                 if current is None:
                     continue
 
@@ -1868,19 +1951,20 @@ async def check_loop():
 
                 old = status_cache.get(rid)
 
-                # update cache only after validation
+                # ---------------- CACHE UPDATE ----------------
                 status_cache[rid] = current
                 status_cache_time[rid] = now
 
-                # save to DB
+                # ---------------- DB UPDATE (NO COMMIT HERE) ----------------
                 try:
-                    cur.execute("""
-                        INSERT INTO user_status (roblox_id, status, updated_at)
-                        VALUES (%s, %s, NOW())
-                        ON CONFLICT (roblox_id)
-                        DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
-                    """, (rid, current))
-                    conn.commit()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO user_status (roblox_id, status, updated_at)
+                            VALUES (%s, %s, NOW())
+                            ON CONFLICT (roblox_id)
+                            DO UPDATE SET status = EXCLUDED.status,
+                                          updated_at = NOW()
+                        """, (rid, current))
                 except Exception as db_error:
                     print("Loop DB error:", db_error)
 
@@ -1892,16 +1976,16 @@ async def check_loop():
                 if not info:
                     continue
 
-                # in game -> clear offline tracking
+                # ---------------- IN GAME ----------------
                 if current == 2:
                     offline_since.pop(rid, None)
                     continue
 
-                # first time seen offline
+                # ---------------- OFFLINE TRACKING ----------------
                 if rid not in offline_since:
                     offline_since[rid] = now
 
-                # leaving game ping
+                # ---------------- LEAVE GAME PING ----------------
                 try:
                     if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
                         channel = await bot.fetch_channel(CHANNEL_ID)
@@ -1912,12 +1996,17 @@ async def check_loop():
                 except Exception as e:
                     print("Ping error:", e)
 
-            except Exception as inner_e:
-                print("Loop user error:", inner_e)
+            except Exception as inner:
+                print("Loop user error:", inner)
+
+        # ---------------- SINGLE COMMIT (IMPORTANT) ----------------
+        try:
+            conn.commit()
+        except Exception as e:
+            print("DB commit error:", e)
 
     except Exception as e:
         print("Loop processing error:", e)
-
 
 # ---------------- REMINDER LOOP (every 30 min — re-pings offline users) ----------------
 @tasks.loop(minutes=30)
