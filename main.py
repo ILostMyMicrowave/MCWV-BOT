@@ -16,7 +16,6 @@ from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 
-# ---------------- GLOBALS ----------------
 session = None
 status_cooldown = {}
 
@@ -32,8 +31,7 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 
-# start web server (keep-alive)
-Thread(target=run_web).start()
+Thread(target=run_web, daemon=True).start()
 
 status_cache = {}
 status_cache_time = {}
@@ -2164,17 +2162,5 @@ async def on_disconnect():
 
 
 # ---------------- RUN ----------------
-from threading import Thread
-import asyncio
-
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-
-async def main():
-    await bot.start(TOKEN)
-
-
 if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+    bot.run(TOKEN)
