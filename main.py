@@ -1805,6 +1805,8 @@ def _chunks(items, size=50):
 
 @tasks.loop(minutes=2)
 async def check_loop():
+    print("🔄 CHECK_LOOP HIT")
+
     users = db_get_all()
     if not users or not bot_enabled:
         return
@@ -2121,6 +2123,8 @@ async def approve(self, interaction: discord.Interaction, button: discord.ui.But
 async def on_ready():
     global session
 
+    print("🚀 ON_READY HIT")
+
     if session is None or session.closed:
         session = aiohttp.ClientSession()
 
@@ -2149,7 +2153,7 @@ async def on_ready():
             print(f"❌ Failed to start {name}: {e}")
 
     print(f"👥 Tracking {len(db_get_all())} users")
-    print("✅ Bot ready")
+    print("✅ ON_READY DONE")
 
 
 # ---------------- CLEANUP ----------------
