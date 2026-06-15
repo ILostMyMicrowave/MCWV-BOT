@@ -647,6 +647,11 @@ class ListView(discord.ui.View):
 LEADERBOARD_PAGE_SIZE = 10
 
 
+def chunk_list(items, size=100):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 class LeaderboardView(discord.ui.View):
     def __init__(self, entries, battle_title, total_points, is_active):
         super().__init__(timeout=300)
@@ -1480,14 +1485,6 @@ async def leaderboard(interaction: discord.Interaction):
                 )
             clan_data = await clan_r.json()
 
-    except Exception as e:
-        print("[LEADERBOARD API ERROR]", repr(e))
-        return await interaction.followup.send(
-            f"❌ API request failed.\n```{type(e).__name__}: {e}```",
-            ephemeral=True
-        )
-
-    try:
         war_config = war_data.get("data", {}).get("configData", {})
         battle_id, battle = get_current_war(war_data, clan_data)
 
@@ -1511,21 +1508,41 @@ async def leaderboard(interaction: discord.Interaction):
                 ephemeral=True
             )
 
-        top = contributions[:15]
-        user_ids = [e.get("UserID") for e in top if e.get("UserID") is not None]
+        # ---------------- ROBLOX USERNAME LOOKUP FOR ALL CONTRIBUTORS ----------------
+        user_ids = []
+        seen_ids = set()
+
+        for entry in contributions:
+            uid = entry.get("UserID")
+            if uid is None:
+                continue
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
+
+            if uid_int not in seen_ids:
+                seen_ids.add(uid_int)
+                user_ids.append(uid_int)
 
         id_to_name = {}
         try:
-            async with session.post(
-                ROBLOX_USERS_API,
-                json={"userIds": user_ids, "excludeBannedUsers": False},
-                timeout=timeout
-            ) as r:
-                if r.status == 200:
+            for chunk in chunk_list(user_ids, 100):
+                async with session.post(
+                    ROBLOX_USERS_API,
+                    json={
+                        "userIds": chunk,
+                        "excludeBannedUsers": False
+                    },
+                    timeout=timeout
+                ) as r:
+                    if r.status != 200:
+                        continue
+
                     roblox_data = await r.json()
                     for u in roblox_data.get("data", []):
                         try:
-                            uid = int(u.get("id"))
+                            uid = int(u["id"])
                             uname = str(u.get("name", f"Unknown ({uid})"))
                             id_to_name[uid] = uname
                         except Exception:
@@ -1533,6 +1550,7 @@ async def leaderboard(interaction: discord.Interaction):
         except Exception as e:
             print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
+        # ---------------- DISCORD LOOKUP ----------------
         tracked_rows = db_get_all_tracked()
         roblox_to_discord = {}
         for row in tracked_rows:
@@ -1546,7 +1564,7 @@ async def leaderboard(interaction: discord.Interaction):
         battle_name = re.sub(
             r'(\d+)',
             r' \1',
-            re.sub(r'([A-Z])', r' \1', battle_id)
+            re.sub(r'([A-Z])', r' \1', str(battle_id))
         ).strip()
 
         now = datetime.now(timezone.utc).timestamp()
