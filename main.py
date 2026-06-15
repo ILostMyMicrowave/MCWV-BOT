@@ -1800,6 +1800,11 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         await interaction.followup.send("❌ Error", ephemeral=True)
         
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
+
+def _chunks(items, size=50):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
 @tasks.loop(minutes=2)
 async def check_loop():
     users = db_get_all()
@@ -1808,84 +1813,107 @@ async def check_loop():
 
     print("Loop running, users:", len(users))
 
-    try:
-        global session
+    global session
 
+    try:
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
         user_ids = [int(u[0]) for u in users]
+        all_presences = []
 
-        async with session.post(
-            "https://presence.roblox.com/v1/presence/users",
-            json={"userIds": user_ids}
-        ) as r:
+        # Roblox presence API is safer in chunks
+        for chunk in _chunks(user_ids, 50):
+            async with session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": chunk}
+            ) as r:
+                if r.status != 200:
+                    print("Presence API returned:", r.status)
+                    continue
 
-            if r.status != 200:
-                print("Presence API returned:", r.status)
-                return
+                data = await r.json()
+                presences = data.get("userPresences", [])
 
-            data = await r.json()
+                if isinstance(presences, list) and presences:
+                    all_presences.extend(presences)
 
     except Exception as e:
         print("Loop error (API fetch):", e)
         return
 
-    # ---------------- DEBUG (IMPORTANT) ----------------
-    print("RAW KEYS:", data.keys())
-    print("PRESENCE COUNT:", len(data.get("userPresences", [])))
+    if not all_presences:
+        print("❌ No presence data returned")
+        return
+
+    print("PRESENCE COUNT:", len(all_presences))
+
+    now = datetime.now(timezone.utc)
+    users_map = {str(u[0]).strip(): u for u in users}
 
     try:
-        now = datetime.now(timezone.utc)
-
-        presences = data.get("userPresences", [])
-        if not presences:
-            print("❌ NO PRESENCE DATA RETURNED")
-            return
-
-        for u in presences:
-
-            rid = str(u.get("userId")).strip()
-            current = u.get("userPresenceType", 0)
-
-            old = status_cache.get(rid)
-
-            status_cache[rid] = current
-            status_cache_time[rid] = now
-
-            # DB SAVE
+        for u in all_presences:
             try:
-                cur.execute("""
-                    INSERT INTO user_status (roblox_id, status, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (roblox_id)
-                    DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
-                """, (rid, current))
-                conn.commit()
+                rid = str(u.get("userId", "")).strip()
+                if not rid:
+                    continue
 
-            except Exception as db_error:
-                print("Loop DB error:", db_error)
+                current = u.get("userPresenceType", None)
+                if current is None:
+                    continue
 
-            if old == current:
-                continue
+                current = int(current)
+                if current not in (0, 1, 2, 3):
+                    continue
 
-            info = next((x for x in users if str(x[0]) == rid), None)
-            if not info:
-                continue
+                old = status_cache.get(rid)
 
-            if current == 2:
-                offline_since.pop(rid, None)
-                continue
+                # update cache only after validation
+                status_cache[rid] = current
+                status_cache_time[rid] = now
 
-            if rid not in offline_since:
-                offline_since[rid] = now
+                # save to DB
+                try:
+                    cur.execute("""
+                        INSERT INTO user_status (roblox_id, status, updated_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (roblox_id)
+                        DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+                    """, (rid, current))
+                    conn.commit()
+                except Exception as db_error:
+                    print("Loop DB error:", db_error)
 
-            if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
-                channel = await bot.fetch_channel(CHANNEL_ID)
-                await channel.send(
-                    f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-                    allowed_mentions=discord.AllowedMentions(users=True)
-                )
+                # no change
+                if old == current:
+                    continue
+
+                info = users_map.get(rid)
+                if not info:
+                    continue
+
+                # in game -> clear offline tracking
+                if current == 2:
+                    offline_since.pop(rid, None)
+                    continue
+
+                # first time seen offline
+                if rid not in offline_since:
+                    offline_since[rid] = now
+
+                # leaving game ping
+                try:
+                    if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
+                        channel = await bot.fetch_channel(CHANNEL_ID)
+                        await channel.send(
+                            f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+                            allowed_mentions=discord.AllowedMentions(users=True)
+                        )
+                except Exception as e:
+                    print("Ping error:", e)
+
+            except Exception as inner_e:
+                print("Loop user error:", inner_e)
 
     except Exception as e:
         print("Loop processing error:", e)
@@ -2090,7 +2118,7 @@ async def approve(self, interaction: discord.Interaction, button: discord.ui.But
         except:
             pass
 
-# ---------------- CLEANUP ----------------
+# ---------------- READY ----------------
 @bot.event
 async def on_ready():
     global session
@@ -2100,28 +2128,41 @@ async def on_ready():
 
     try:
         synced = await bot.tree.sync(guild=guild_obj)
-        print(f"Synced {len(synced)} commands")
+        print(f"✅ Synced {len(synced)} commands")
     except Exception as e:
-        print("Sync error:", e)
+        print("❌ Sync error:", e)
 
-    print(f"Logged in as {bot.user}")
+    print(f"🤖 Logged in as {bot.user} ({bot.user.id})")
 
-    # start war loop safely (only once)
-    if not war_poll_loop.is_running():
-        war_poll_loop.start()
+    loops = [
+        ("war_poll_loop", war_poll_loop),
+        ("check_loop", check_loop),
+        ("reminder_loop", reminder_loop),
+    ]
 
-    # start check loop safely (ONLY FIX YOU NEEDED)
-    if not check_loop.is_running():
-        check_loop.start()
-        print("check_loop started")
+    for name, loop in loops:
+        try:
+            if not loop.is_running():
+                loop.start()
+                print(f"✅ {name} started")
+            else:
+                print(f"ℹ️ {name} already running")
+        except Exception as e:
+            print(f"❌ Failed to start {name}: {e}")
+
+    print(f"👥 Tracking {len(db_get_all())} users")
+    print("✅ Bot ready")
 
 
+# ---------------- CLEANUP ----------------
 @bot.event
 async def on_disconnect():
     global session
-    if session:
+
+    if session and not session.closed:
         await session.close()
-        
+
+
 # ---------------- RUN ----------------
 from threading import Thread
 import asyncio
@@ -2129,9 +2170,11 @@ import asyncio
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
+
 async def main():
     await bot.start(TOKEN)
 
+
 if __name__ == "__main__":
-    Thread(target=run_flask).start()
+    Thread(target=run_flask, daemon=True).start()
     asyncio.run(main())
