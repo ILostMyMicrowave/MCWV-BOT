@@ -714,27 +714,42 @@ async def list_users(interaction: discord.Interaction):
             3: "🔧"
         }
 
-        lines = []
+        # ---------------- GROUPED LISTS ----------------
+        ingame = []
+        online = []
+        studio = []
+        offline = []
 
         for roblox_id, discord_id, username in users:
 
             rid = str(roblox_id).strip()
-
             current = status_cache.get(rid, 0)
 
             icon = status_icons.get(current, "❓")
 
-            lines.append(
-                f"{icon} <@{discord_id}> — **{username}**"
-            )
+            line = f"{icon} <@{discord_id}> — **{username}**"
+
+            if current == 2:
+                ingame.append(line)
+            elif current == 1:
+                online.append(line)
+            elif current == 3:
+                studio.append(line)
+            else:
+                offline.append(line)
+
+        # ---------------- FINAL ORDER ----------------
+        lines = ingame + online + studio + offline
 
         embed = discord.Embed(
             title="📋 Tracked Members",
-            description="\n".join(lines[:50]),
+            description="\n".join(lines[:50]) if lines else "No data available.",
             color=discord.Color.blurple()
         )
 
-        embed.set_footer(text=f"{len(users)} tracked members")
+        embed.set_footer(
+            text=f"🎮 {len(ingame)} In Game • 🟢 {len(online)} Online • 🔧 {len(studio)} Studio • ⚫ {len(offline)} Offline • {len(users)} total"
+        )
 
         await interaction.response.send_message(embed=embed)
 
@@ -746,7 +761,7 @@ async def list_users(interaction: discord.Interaction):
                 "❌ List command failed.",
                 ephemeral=True
             )
-
+            
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
 @require_role()
 async def offlinelist(interaction: discord.Interaction):
