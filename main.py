@@ -32,142 +32,20 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
-class ListView(discord.ui.View):
-    def __init__(self, users):
-        super().__init__(timeout=300)
-        self.users = users
-        self.mode = "ingame"
+def db_get_all_alts():
+    if not db_enabled():
+        return []
 
-    @staticmethod
-    def _status_icon(status: int) -> str:
-        return {
-            0: "⚫",
-            1: "🟢",
-            2: "🎮",
-            3: "🔧",
-        }.get(int(status), "❓")
-
-    @staticmethod
-    def _status_label(status: int) -> str:
-        return {
-            0: "Offline",
-            1: "Online",
-            2: "In Game",
-            3: "Studio",
-        }.get(int(status), "Unknown")
-
-    def _status_for(self, roblox_id) -> int:
-        return int(status_cache.get(str(roblox_id).strip(), 0) or 0)
-
-    def _matches_mode(self, status: int) -> bool:
-        if self.mode == "all":
-            return True
-        if self.mode == "ingame":
-            return status == 2
-        if self.mode == "offline":
-            return status == 0
-        return True
-
-    def _mode_title(self) -> str:
-        return {
-            "all": "📋 Tracked Members",
-            "ingame": "🎮 In Game Members",
-            "offline": "⚫ Offline Members",
-        }.get(self.mode, "📋 Tracked Members")
-
-    def _append_section(self, parts: list[str], title: str, lines: list[str]):
-        if not lines:
-            return
-        parts.append(f"__{title}__")
-        parts.extend(lines)
-        parts.append("")
-
-    def build_embed(self) -> discord.Embed:
-        main_sections = {0: [], 1: [], 2: [], 3: []}
-        alt_sections = {0: [], 1: [], 2: [], 3: []}
-        shown_alts = 0
-
-        for roblox_id, discord_id, username in self.users:
-            main_status = self._status_for(roblox_id)
-
-            try:
-                alts = db_get_alts(discord_id) or []
-            except Exception:
-                alts = []
-
-            if self._matches_mode(main_status):
-                main_sections[main_status].append(
-                    f"{self._status_icon(main_status)} <@{discord_id}> — **{username}**"
-                )
-
-            for alt_roblox_id, alt_username in alts:
-                alt_status = self._status_for(alt_roblox_id)
-                if self._matches_mode(alt_status):
-                    shown_alts += 1
-                    alt_sections[alt_status].append(
-                        f"{self._status_icon(alt_status)} **{alt_username}** — <@{discord_id}>"
-                    )
-
-        order = [2, 1, 3, 0] if self.mode == "all" else ([2] if self.mode == "ingame" else [0])
-
-        parts: list[str] = []
-
-        if self.mode == "all":
-            for status in order:
-                self._append_section(
-                    parts,
-                    f"{self._status_label(status)} Members",
-                    main_sections[status]
-                )
-        else:
-            status = order[0]
-            self._append_section(
-                parts,
-                f"{self._status_label(status)} Members",
-                main_sections[status]
-            )
-
-        alt_has_content = any(alt_sections[s] for s in order)
-        if alt_has_content:
-            parts.append("**Alts**")
-            for status in order:
-                self._append_section(
-                    parts,
-                    f"{self._status_label(status)} Alts",
-                    alt_sections[status]
-                )
-            if parts and parts[-1] == "":
-                parts.pop()
-
-        description = "\n".join(parts).strip() or "None"
-
-        if len(description) > 3900:
-            description = description[:3890].rstrip() + "\n…"
-
-        embed = discord.Embed(
-            title=self._mode_title(),
-            description=description,
-            color=discord.Color.blurple()
-        )
-        embed.set_footer(
-            text=f"{len(self.users)} tracked members • {shown_alts} alts shown"
-        )
-        return embed
-
-    @discord.ui.button(label="🎮 In Game", style=discord.ButtonStyle.success)
-    async def show_ingame(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.mode = "ingame"
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="📋 All", style=discord.ButtonStyle.primary)
-    async def show_all_members(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.mode = "all"
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="⚫ Offline", style=discord.ButtonStyle.secondary)
-    async def show_offline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.mode = "offline"
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT discord_id, roblox_id, username
+                FROM user_alts
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        print("db_get_all_alts error:", e)
+        return []
 
 def db_get_main_link(discord_id):
     if not db_enabled():
@@ -635,6 +513,137 @@ async def generate_profile_card(
     buffer.seek(0)
     return buffer
 
+class ListView(discord.ui.View):
+    def __init__(self, users, alts_by_discord):
+        super().__init__(timeout=300)
+        self.users = users
+        self.alts_by_discord = alts_by_discord
+        self.mode = "ingame"
+
+    @staticmethod
+    def _status_icon(status: int) -> str:
+        return {
+            0: "⚫",
+            1: "🟢",
+            2: "🎮",
+            3: "🔧",
+        }.get(int(status), "❓")
+
+    @staticmethod
+    def _status_label(status: int) -> str:
+        return {
+            0: "Offline",
+            1: "Online",
+            2: "In Game",
+            3: "Studio",
+        }.get(int(status), "Unknown")
+
+    def _status_for(self, roblox_id) -> int:
+        return int(status_cache.get(str(roblox_id).strip(), 0) or 0)
+
+    def _matches_mode(self, status: int) -> bool:
+        if self.mode == "all":
+            return True
+        if self.mode == "ingame":
+            return status == 2
+        if self.mode == "offline":
+            return status == 0
+        return True
+
+    def _mode_title(self) -> str:
+        return {
+            "all": "📋 Tracked Members",
+            "ingame": "🎮 In Game Members",
+            "offline": "⚫ Offline Members",
+        }.get(self.mode, "📋 Tracked Members")
+
+    def _append_section(self, parts: list[str], title: str, lines: list[str]):
+        if not lines:
+            return
+        parts.append(f"__{title}__")
+        parts.extend(lines)
+        parts.append("")
+
+    def build_embed(self) -> discord.Embed:
+        main_sections = {0: [], 1: [], 2: [], 3: []}
+        alt_sections = {0: [], 1: [], 2: [], 3: []}
+        shown_alts = 0
+
+        for roblox_id, discord_id, username in self.users:
+            main_status = self._status_for(roblox_id)
+            alts = self.alts_by_discord.get(int(discord_id), [])
+
+            if self._matches_mode(main_status):
+                main_sections[main_status].append(
+                    f"{self._status_icon(main_status)} <@{discord_id}> — **{username}**"
+                )
+
+            for alt_roblox_id, alt_username in alts:
+                alt_status = self._status_for(alt_roblox_id)
+                if self._matches_mode(alt_status):
+                    shown_alts += 1
+                    alt_sections[alt_status].append(
+                        f"{self._status_icon(alt_status)} **{alt_username}** — <@{discord_id}>"
+                    )
+
+        order = [2, 1, 3, 0] if self.mode == "all" else ([2] if self.mode == "ingame" else [0])
+
+        parts: list[str] = []
+
+        if self.mode == "all":
+            for status in order:
+                self._append_section(
+                    parts,
+                    f"{self._status_label(status)} Members",
+                    main_sections[status]
+                )
+        else:
+            status = order[0]
+            self._append_section(
+                parts,
+                f"{self._status_label(status)} Members",
+                main_sections[status]
+            )
+
+        alt_has_content = any(alt_sections[s] for s in order)
+        if alt_has_content:
+            parts.append("**Alts**")
+            for status in order:
+                self._append_section(
+                    parts,
+                    f"{self._status_label(status)} Alts",
+                    alt_sections[status]
+                )
+            if parts and parts[-1] == "":
+                parts.pop()
+
+        description = "\n".join(parts).strip() or "None"
+        if len(description) > 3900:
+            description = description[:3890].rstrip() + "\n…"
+
+        embed = discord.Embed(
+            title=self._mode_title(),
+            description=description,
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text=f"{len(self.users)} tracked members • {shown_alts} alts shown")
+        return embed
+
+    @discord.ui.button(label="🎮 In Game", style=discord.ButtonStyle.success)
+    async def show_ingame(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.mode = "ingame"
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="📋 All", style=discord.ButtonStyle.primary)
+    async def show_all_members(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.mode = "all"
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="⚫ Offline", style=discord.ButtonStyle.secondary)
+    async def show_offline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.mode = "offline"
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
 # ---------------- CONFIG ----------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
@@ -870,6 +879,20 @@ def db_get_user_status(rid):
         print("db_get_user_status error:", e)
         return None
 
+def db_get_all_alts():
+    if not db_enabled():
+        return []
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT discord_id, roblox_id, username
+                FROM user_alts
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        print("db_get_all_alts error:", e)
+        return []
 # ---------------- STATUS ----------------
 status_cache = {}
 offline_since = {}  # roblox_id -> datetime (UTC) when they went offline
@@ -1049,24 +1072,33 @@ async def add(interaction: discord.Interaction, member: discord.Member, roblox_u
 @require_role()
 async def list_users(interaction: discord.Interaction):
     try:
-        users = db_get_all()
+        await interaction.response.defer(ephemeral=True)
 
+        users = db_get_all()
         if not users:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No users are being tracked.",
                 ephemeral=True
             )
 
-        view = ListView(users)
+        alts_rows = db_get_all_alts()
+        alts_by_discord = {}
 
-        await interaction.response.send_message(
+        for discord_id, roblox_id, username in alts_rows:
+            alts_by_discord.setdefault(int(discord_id), []).append(
+                (str(roblox_id).strip(), str(username))
+            )
+
+        view = ListView(users, alts_by_discord)
+
+        await interaction.followup.send(
             embed=view.build_embed(),
-            view=view
+            view=view,
+            ephemeral=True
         )
 
     except Exception as e:
         print("[LIST ERROR]", repr(e))
-
         if not interaction.response.is_done():
             await interaction.response.send_message(
                 "❌ List command failed.",
