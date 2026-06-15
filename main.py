@@ -376,8 +376,7 @@ async def generate_profile_card(
     discord_tag,
     points,
     rank,
-    top_points,
-    war_name,
+    top_points=1,
     animated=True
 ):
     WIDTH, HEIGHT = 1400, 600
@@ -388,109 +387,96 @@ async def generate_profile_card(
     big_font = fonts["big"]
     small_font = fonts["small"]
 
-    particles = generate_particles(20, WIDTH, HEIGHT)
+    particles = generate_particles(25, WIDTH, HEIGHT)
+
     avatar = await fetch_roblox_avatar(roblox_id)
 
     if avatar:
-        avatar = avatar.resize((280, 280), Image.Resampling.LANCZOS)
-        mask = Image.new("L", (280, 280), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, 280, 280), fill=255)
+        avatar = avatar.resize((220, 220))
+        mask = Image.new("L", (220, 220), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 220, 220), fill=255)
         avatar.putalpha(mask)
 
-    max_points = max(int(top_points or 0), 1)
-    progress = min(points / max_points, 1) if points > 0 else 0
+    for frame in range(8 if animated else 1):
 
-    for frame in range(6):
-        img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+        img = Image.new("RGBA", (WIDTH, HEIGHT))
         draw = ImageDraw.Draw(img)
 
-        # background
+        # background gradient
         for y in range(HEIGHT):
-            t = y / HEIGHT
-            r = int(10 + (18 * t))
-            g = int(12 + (22 * t))
-            b = int(25 + (60 * t))
+            r = int(10 + (45 - 10) * (y / HEIGHT))
+            g = int(15 + (30 - 15) * (y / HEIGHT))
+            b = int(40 + (120 - 40) * (y / HEIGHT))
             draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
 
         # particles
         for i, (x, y, size) in enumerate(particles):
-            offset = math.sin(frame * 0.5 + i) * 3 if animated else 0
+            offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
             draw.ellipse(
-                [x + offset, y + offset, x + size, y + size],
-                fill=(120, 160, 255, 60)
+                [x + offset, y + offset, x + size + offset, y + size + offset],
+                fill=(120, 160, 255, 120)
             )
 
         # main panel
-        panel = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        pd = ImageDraw.Draw(panel)
-        pd.rounded_rectangle(
-            [40, 40, WIDTH - 40, HEIGHT - 40],
-            radius=40,
-            fill=(20, 22, 32, 220)
-        )
-        panel = panel.filter(ImageFilter.GaussianBlur(2))
-        img.alpha_composite(panel)
+        draw.rounded_rectangle([40, 40, WIDTH-40, HEIGHT-40], radius=35, fill=(20,22,30))
 
-        # avatar glow
+        # avatar
         if avatar:
-            glow = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-            gd = ImageDraw.Draw(glow)
-            gd.ellipse([90, 90, 390, 390], fill=(80, 120, 255, 60))
-            glow = glow.filter(ImageFilter.GaussianBlur(25))
-            img.alpha_composite(glow)
-            img.paste(avatar, (100, 100), avatar)
+            img.paste(avatar, (80, 90), avatar)
 
         # name
-        x, y = 420, 85
-        draw.text((x + 3, y + 3), roblox_name, fill=(0, 0, 0, 160), font=title_font)
-        draw.text((x, y), roblox_name, fill=(240, 240, 255), font=title_font)
+        draw.text((350, 70), roblox_name, fill="white", font=title_font)
 
-        # status/info
-        draw.text((x, 180), f"Discord: {discord_tag}", fill=(180, 180, 180), font=small_font)
-        draw.text((x, 220), f"Roblox ID: {roblox_id}", fill=(140, 140, 140), font=small_font)
+        # glow effect
+        draw.text((352, 72), roblox_name, fill=(80,140,255), font=title_font)
 
-        rank_text = f"#{rank}" if rank else "Unranked"
-        draw.text((x, 260), f"Clan Placement: {rank_text}", fill=(180, 180, 180), font=small_font)
+        # info
+        draw.text((355, 175), f"{discord_tag}", fill=(200,200,200), font=small_font)
+        draw.text((355, 215), f"Roblox ID: {roblox_id}", fill=(160,160,160), font=small_font)
 
-        # current war
-        draw.text((x, 300), f"Current War: {war_name}", fill=(180, 180, 180), font=small_font)
+        # REAL RANK DISPLAY
+        if rank:
+            draw.text((355, 255), f"Rank: #{rank}", fill=(255, 220, 120), font=small_font)
+        else:
+            draw.text((355, 255), "Rank: Unranked", fill=(150,150,150), font=small_font)
 
-        # progress bar area
-        bar_x, bar_y = 420, 350
-        bar_w, bar_h = 850, 38
+        # -------- WAR BAR FIXED --------
+        bar_x, bar_y = 350, 340
+        bar_w, bar_h = 800, 45
 
+        # safe values
+        top_points = max(int(top_points or 1), 1)
+        points = max(int(points or 0), 0)
+
+        progress = min(points / top_points, 1.0)
+        filled = max(0, int(bar_w * progress))
+
+        # background bar
         draw.rounded_rectangle(
             [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
-            radius=20,
-            fill=(35, 38, 55)
+            radius=18,
+            fill=(40, 40, 55)
         )
 
-        fill_w = int(bar_w * progress)
-
-        if fill_w > 0:
+        # filled bar (SAFE)
+        if filled > 0:
             draw.rounded_rectangle(
-                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-                radius=20,
+                [bar_x, bar_y, bar_x + filled, bar_y + bar_h],
+                radius=18,
                 fill=(90, 140, 255)
             )
 
-            shimmer_x = (frame * 18) % max(fill_w, 1)
-            draw.rectangle(
-                [bar_x + shimmer_x, bar_y, bar_x + shimmer_x + 80, bar_y + bar_h],
-                fill=(180, 220, 255, 80)
-            )
+        # text
+        draw.text((350, 300), "WAR PROGRESS", fill=(180,180,180), font=small_font)
+        draw.text((1170, 340), f"{int(progress*100)}%", fill="white", font=small_font)
 
-        draw.text((bar_x, bar_y - 35), "WAR PROGRESS VS #1", fill=(170, 170, 170), font=small_font)
-        draw.text((bar_x + bar_w - 120, bar_y), f"{int(progress * 100)}%", fill="white", font=small_font)
-
-        draw.text((420, 435), f"{points:,} POINTS", fill="white", font=big_font)
-
-        if top_points > 0:
-            draw.text((420, 485), f"Leader: {top_points:,} POINTS", fill=(170, 170, 170), font=small_font)
+        draw.text((355, 410), f"{points:,} POINTS", fill="white", font=big_font)
 
         frames.append(img)
 
     buffer = BytesIO()
+
+    # ALWAYS GIF (even single frame)
     frames[0].save(
         buffer,
         format="GIF",
@@ -500,6 +486,7 @@ async def generate_profile_card(
         loop=0,
         disposal=2
     )
+
     buffer.seek(0)
     return buffer
     
@@ -1826,14 +1813,15 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                         rank = i
                         break
 
+        top_points = max([e.get("Points", 0) for e in contributions], default=1)
+
         image_buffer = await generate_profile_card(
             roblox_name=roblox_name,
             roblox_id=int(roblox_id),
             discord_tag=discord_display,
-            points=points,
-            rank=rank,
+            points=pts,
+            rank=rank if rank else 0,
             top_points=top_points,
-            war_name=battle_name,
             animated=True
         )
 
