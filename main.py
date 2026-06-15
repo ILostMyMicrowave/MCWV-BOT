@@ -36,6 +36,9 @@ Thread(target=run_web, daemon=True).start()
 status_cache = {}
 status_cache_time = {}
 offline_since = {}
+offline_ping_enabled = True
+reminder_interval = 30
+reminder_channel_id = None
 
 def get_current_war(war_data, clan_data):
     war_config = war_data.get("data", {}).get("configData", {})
@@ -816,7 +819,7 @@ async def setreminderinterval(interaction: discord.Interaction, minutes: int):
         f"⏱️ Offline reminders will now be sent every **{minutes} minute(s)**.", ephemeral=True
     )
 
-@bot.tree.command(name="setreminderchanel", description="Set the channel where offline reminders are sent", guild=guild_obj)
+@bot.tree.command(name="setreminderchannel", description="Set the channel where offline reminders are sent", guild=guild_obj)
 @require_role()
 async def setreminderchanel(interaction: discord.Interaction, channel: discord.TextChannel):
     global reminder_channel_id
@@ -1832,21 +1835,33 @@ async def kick(interaction: discord.Interaction, target: str, reason: str = "No 
 @bot.tree.command(name="settings", description="Show current bot settings", guild=guild_obj)
 @require_role()
 async def settings(interaction: discord.Interaction):
+
     ping_state = "ON ✅" if offline_ping_enabled else "OFF ❌"
 
-    if reminder_channel_id == CHANNEL_ID:
-        channel_display = f"<#{CHANNEL_ID}> (default)"
+    # ---------------- SAFE CHANNEL DISPLAY ----------------
+    if reminder_channel_id:
+        if reminder_channel_id == CHANNEL_ID:
+            channel_display = f"<#{CHANNEL_ID}> (default)"
+        else:
+            channel_display = f"<#{reminder_channel_id}>"
     else:
-        channel_display = f"<#{reminder_channel_id}>"
+        channel_display = "Not set"
 
     war_state = "⚔️ Active" if bot_enabled else "💤 Inactive"
-    embed = discord.Embed(title="⚙️ Bot Settings", color=discord.Color.blurple())
-    embed.add_field(name="⚔️ War Tracking",      value=war_state,              inline=True)
-    embed.add_field(name="🔔 Offline Alerts",    value=ping_state,             inline=True)
+
+    embed = discord.Embed(
+        title="⚙️ Bot Settings",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(name="⚔️ War Tracking", value=war_state, inline=True)
+    embed.add_field(name="🔔 Offline Alerts", value=ping_state, inline=True)
     embed.add_field(name="⏱️ Reminder Interval", value=f"{reminder_interval} min", inline=True)
-    embed.add_field(name="📢 Reminder Channel",  value=channel_display,        inline=True)
-    embed.add_field(name="🚨 Alert Channel",     value=f"<#{CHANNEL_ID}>",     inline=True)
+    embed.add_field(name="📢 Reminder Channel", value=channel_display, inline=True)
+    embed.add_field(name="🚨 Alert Channel", value=f"<#{CHANNEL_ID}>", inline=True)
+
     embed.set_footer(text="/toggleoffline • /setreminderinterval • /setreminderchanel")
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------- STATUS COMMAND ----------------
@@ -2023,10 +2038,9 @@ async def check_loop():
     except Exception as e:
         print("Loop processing error:", e)
 
-# ---------------- REMINDER LOOP (every 30 min — re-pings offline users) ----------------
+# ---------------- REMINDER LOOP ----------------
 @tasks.loop(minutes=30)
 async def reminder_loop():
-
     if not bot_enabled or not offline_ping_enabled:
         return
 
@@ -2035,31 +2049,37 @@ async def reminder_loop():
 
     try:
         channel = await bot.fetch_channel(reminder_channel_id)
-    except:
+    except Exception as e:
+        print("Reminder loop: could not fetch channel:", e)
         return
 
     users = db_get_all()
-    now = datetime.now(timezone.utc)
+    if not users:
+        return
 
     lines = []
 
     for rid, since in offline_since.items():
+        current = status_cache.get(str(rid).strip(), 0)
 
-        # ONLY skip IN GAME
-        if status_cache.get(rid) == 2:
+        # Only remind for users who are still offline
+        if current != 0:
             continue
 
-        info = next((x for x in users if x[0] == rid), None)
+        info = next((x for x in users if str(x[0]).strip() == str(rid).strip()), None)
         if not info:
             continue
 
         duration = format_duration(since)
-        lines.append(f"⚫ <@{info[1]}> **({info[2]})** is not in game - {duration}")
+        lines.append(f"⚫ <@{info[1]}> **({info[2]})** is offline - {duration}")
 
     if not lines:
         return
 
-    await channel.send("\n\n".join(lines))
+    try:
+        await channel.send("\n\n".join(lines))
+    except Exception as e:
+        print("Reminder loop send error:", e)
 
 # ---------------- PS99 WAR POLL (SAFE STATE MACHINE VERSION) ----------------
 @tasks.loop(minutes=2)
