@@ -1759,7 +1759,8 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         battle_name = "No active war"
         points = 0
         rank = 0
-        top_points = 0
+        top_points = 1
+        contributions = []
 
         try:
             async with session.get(CLAN_API, timeout=timeout) as clan_r:
@@ -1797,6 +1798,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         except Exception as e:
             print("[profile] war API error:", e)
 
+        # ---------------- STATS ----------------
         if battle:
             contributions = sorted(
                 battle.get("PointContributions", []),
@@ -1805,16 +1807,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             )
 
             if contributions:
-                top_points = contributions[0].get("Points", 0) or 0
+                top_points = max((e.get("Points", 0) for e in contributions), default=1)
 
                 for i, entry in enumerate(contributions, start=1):
                     if str(entry.get("UserID")) == roblox_id:
                         points = int(entry.get("Points", 0) or 0)
                         rank = i
                         break
-
-        top_points = max([e.get("Points", 0) for e in contributions], default=1)
-
+                
         image_buffer = await generate_profile_card(
             roblox_name=roblox_name,
             roblox_id=int(roblox_id),
