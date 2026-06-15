@@ -313,8 +313,10 @@ async def run_initial_presence_check(channel):
     except Exception as e:
         print("Initial sync error:", e)
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from io import BytesIO
+import random
+import math
 
 def load_fonts():
     try:
@@ -324,7 +326,6 @@ def load_fonts():
             "small": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24),
         }
     except:
-        # fallback (still works, just worse)
         return {
             "title": ImageFont.load_default(),
             "big": ImageFont.load_default(),
@@ -341,76 +342,11 @@ def generate_particles(count, width, height):
         for _ in range(count)
     ]
 
-
-def glass_panel(base, xy, radius=40, fill=(30, 35, 55, 180)):
-    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-
-    d.rounded_rectangle(xy, radius=radius, fill=fill)
-
-    layer = layer.filter(ImageFilter.GaussianBlur(10))
-    base.alpha_composite(layer)
-
-
-def glow_bar(base, x, y, width, height, progress):
-    glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(glow)
-
-    filled = int(width * progress)
-
-    d.rounded_rectangle(
-        [x, y, x + filled, y + height],
-        radius=25,
-        fill=(80, 120, 255, 180)
-    )
-
-    glow = glow.filter(ImageFilter.GaussianBlur(20))
-    base.alpha_composite(glow)
-
-    d2 = ImageDraw.Draw(base)
-    d2.rounded_rectangle(
-        [x, y, x + filled, y + height],
-        radius=25,
-        fill=(90, 140, 255)
-    )
-
-def draw_shimmer_bar(img, x, y, width, height, progress, frame):
-    base = ImageDraw.Draw(img)
-
-    filled = int(width * progress)
-
-    base.rounded_rectangle([x, y, x + width, y + height], radius=18, fill=(40, 40, 55))
-
-    if filled <= 0:
-        return
-
-    base.rounded_rectangle([x, y, x + filled, y + height], radius=18, fill=(90, 140, 255))
-
-    shimmer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    sdraw = ImageDraw.Draw(shimmer)
-
-    offset = (frame * 12) % (filled + 200)
-    band = 120
-
-    for i in range(-40, 40, 10):
-        sdraw.polygon(
-            [
-                (x + offset + i - 200, y),
-                (x + offset + i, y),
-                (x + offset + i + band, y + height),
-                (x + offset + i + band - 200, y + height),
-            ],
-            fill=(160, 200, 255, 60)
-        )
-
-    shimmer = shimmer.filter(ImageFilter.GaussianBlur(6))
-    img.alpha_composite(shimmer)
-
 async def fetch_roblox_avatar(user_id):
     try:
         url = (
             "https://thumbnails.roblox.com/v1/users/avatar-headshot"
-            f"?userIds={user_id}&size=420x420&format=Png&isCircular=false"
+            f"?userIds={user_id}&size=720x720&format=Png&isCircular=false"
         )
 
         async with session.get(url) as r:
@@ -422,6 +358,12 @@ async def fetch_roblox_avatar(user_id):
             avatar_bytes = await r.read()
 
         avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
+        avatar = avatar.resize((280, 280), Image.Resampling.LANCZOS)
+
+        mask = Image.new("L", (280, 280), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 280, 280), fill=255)
+        avatar.putalpha(mask)
+
         return avatar
 
     except Exception as e:
@@ -434,7 +376,9 @@ async def generate_profile_card(
     discord_tag,
     points,
     rank,
-    animated=False
+    top_points,
+    war_name,
+    animated=True
 ):
     WIDTH, HEIGHT = 1400, 600
     frames = []
@@ -445,22 +389,22 @@ async def generate_profile_card(
     small_font = fonts["small"]
 
     particles = generate_particles(20, WIDTH, HEIGHT)
-
     avatar = await fetch_roblox_avatar(roblox_id)
 
     if avatar:
         avatar = avatar.resize((280, 280), Image.Resampling.LANCZOS)
-
         mask = Image.new("L", (280, 280), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, 280, 280), fill=255)
         avatar.putalpha(mask)
 
-    for frame in range(6 if animated else 1):
+    max_points = max(int(top_points or 0), 1)
+    progress = min(points / max_points, 1) if points > 0 else 0
 
+    for frame in range(6):
         img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        # ---------------- BACKGROUND (dark gradient v2) ----------------
+        # background
         for y in range(HEIGHT):
             t = y / HEIGHT
             r = int(10 + (18 * t))
@@ -468,7 +412,7 @@ async def generate_profile_card(
             b = int(25 + (60 * t))
             draw.line([(0, y), (WIDTH, y)], fill=(r, g, b))
 
-        # ---------------- SOFT PARTICLES ----------------
+        # particles
         for i, (x, y, size) in enumerate(particles):
             offset = math.sin(frame * 0.5 + i) * 3 if animated else 0
             draw.ellipse(
@@ -476,96 +420,86 @@ async def generate_profile_card(
                 fill=(120, 160, 255, 60)
             )
 
-        # ---------------- MAIN GLASS PANEL ----------------
+        # main panel
         panel = Image.new("RGBA", img.size, (0, 0, 0, 0))
         pd = ImageDraw.Draw(panel)
-
         pd.rounded_rectangle(
             [40, 40, WIDTH - 40, HEIGHT - 40],
             radius=40,
             fill=(20, 22, 32, 220)
         )
-
         panel = panel.filter(ImageFilter.GaussianBlur(2))
         img.alpha_composite(panel)
 
-        # ---------------- AVATAR GLOW ----------------
+        # avatar glow
         if avatar:
             glow = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
             gd = ImageDraw.Draw(glow)
-
             gd.ellipse([90, 90, 390, 390], fill=(80, 120, 255, 60))
             glow = glow.filter(ImageFilter.GaussianBlur(25))
             img.alpha_composite(glow)
-
             img.paste(avatar, (100, 100), avatar)
 
-        # ---------------- NAME ----------------
-        x, y = 420, 90
-
+        # name
+        x, y = 420, 85
         draw.text((x + 3, y + 3), roblox_name, fill=(0, 0, 0, 160), font=title_font)
         draw.text((x, y), roblox_name, fill=(240, 240, 255), font=title_font)
 
-        # ---------------- INFO BLOCK ----------------
+        # status/info
         draw.text((x, 180), f"Discord: {discord_tag}", fill=(180, 180, 180), font=small_font)
         draw.text((x, 220), f"Roblox ID: {roblox_id}", fill=(140, 140, 140), font=small_font)
 
         rank_text = f"#{rank}" if rank else "Unranked"
-        draw.text((x, 260), f"Rank: {rank_text}", fill=(180, 180, 180), font=small_font)
+        draw.text((x, 260), f"Clan Placement: {rank_text}", fill=(180, 180, 180), font=small_font)
 
-        # ---------------- MODERN PROGRESS BAR ----------------
-        bar_x, bar_y = 420, 340
+        # current war
+        draw.text((x, 300), f"Current War: {war_name}", fill=(180, 180, 180), font=small_font)
+
+        # progress bar area
+        bar_x, bar_y = 420, 350
         bar_w, bar_h = 850, 38
 
-        # background pill
         draw.rounded_rectangle(
             [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
             radius=20,
             fill=(35, 38, 55)
         )
 
-        progress = min(points / 10_000_000, 1)
         fill_w = int(bar_w * progress)
 
-        # filled bar
-        draw.rounded_rectangle(
-            [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-            radius=20,
-            fill=(90, 140, 255)
-        )
+        if fill_w > 0:
+            draw.rounded_rectangle(
+                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
+                radius=20,
+                fill=(90, 140, 255)
+            )
 
-        # shimmer line
-        shimmer_x = (frame * 18) % max(fill_w, 1)
+            shimmer_x = (frame * 18) % max(fill_w, 1)
+            draw.rectangle(
+                [bar_x + shimmer_x, bar_y, bar_x + shimmer_x + 80, bar_y + bar_h],
+                fill=(180, 220, 255, 80)
+            )
 
-        draw.rectangle(
-            [bar_x + shimmer_x, bar_y, bar_x + shimmer_x + 80, bar_y + bar_h],
-            fill=(180, 220, 255, 80)
-        )
-
-        # labels
-        draw.text((bar_x, bar_y - 35), "WAR PROGRESS", fill=(170, 170, 170), font=small_font)
+        draw.text((bar_x, bar_y - 35), "WAR PROGRESS VS #1", fill=(170, 170, 170), font=small_font)
         draw.text((bar_x + bar_w - 120, bar_y), f"{int(progress * 100)}%", fill="white", font=small_font)
 
-        # ---------------- POINTS ----------------
-        draw.text((420, 420), f"{points:,} POINTS", fill="white", font=big_font)
+        draw.text((420, 435), f"{points:,} POINTS", fill="white", font=big_font)
+
+        if top_points > 0:
+            draw.text((420, 485), f"Leader: {top_points:,} POINTS", fill=(170, 170, 170), font=small_font)
 
         frames.append(img)
 
     buffer = BytesIO()
-
-    if animated:
-        frames[0].save(
-            buffer,
-            format="GIF",
-            save_all=True,
-            append_images=frames[1:],
-            duration=90,
-            loop=0,
-            disposal=2
-        )
-    else:
-        frames[0].save(buffer, format="PNG")
-
+    frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=90,
+        loop=0,
+        disposal=2
+    )
     buffer.seek(0)
     return buffer
     
@@ -1810,7 +1744,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
     try:
-        # ---------------- RESOLVE USER ----------------
         resolved = await resolve_roblox_username(roblox_username)
         if not resolved:
             return await interaction.followup.send(
@@ -1823,21 +1756,23 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         # ---------------- DB LOOKUP ----------------
         db_users = db_get_all()
-
         linked = next((u for u in db_users if str(u[0]) == roblox_id), None)
 
         discord_id = linked[1] if linked else None
         discord_display = f"<@{discord_id}>" if discord_id else "Not linked"
 
-        # ---------------- SESSION ----------------
         global session
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
         timeout = aiohttp.ClientTimeout(total=10)
 
-        # ---------------- WAR DATA (SAFE FALLBACK) ----------------
+        # ---------------- WAR DATA ----------------
         battle = None
+        battle_name = "No active war"
+        points = 0
+        rank = 0
+        top_points = 0
 
         try:
             async with session.get(CLAN_API, timeout=timeout) as clan_r:
@@ -1849,26 +1784,31 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
                     active = None
                     latest = None
+                    latest_start = -1
 
                     for b_id, b_data in battles.items():
-                        start = b_data.get("StartTime", 0)
-                        end = b_data.get("FinishTime", 0)
+                        start = b_data.get("StartTime", 0) or 0
+                        end = b_data.get("FinishTime", 0) or 0
 
-                        # keep latest fallback
-                        if not latest:
-                            latest = b_data
+                        if start > latest_start:
+                            latest_start = start
+                            latest = (b_id, b_data)
 
                         if start <= now <= end:
-                            active = b_data
+                            active = (b_id, b_data)
 
-                    battle = active or latest  # IMPORTANT FIX
+                    chosen = active or latest
+
+                    if chosen:
+                        battle_id, battle = chosen
+                        battle_name = re.sub(
+                            r'(\d+)',
+                            r' \1',
+                            re.sub(r'([A-Z])', r' \1', str(battle_id))
+                        ).strip()
 
         except Exception as e:
             print("[profile] war API error:", e)
-
-        # ---------------- STATS ----------------
-        pts = 0
-        rank = None
 
         if battle:
             contributions = sorted(
@@ -1877,27 +1817,28 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 reverse=True
             )
 
-            user_id_str = str(roblox_id)
+            if contributions:
+                top_points = contributions[0].get("Points", 0) or 0
 
-            for i, e in enumerate(contributions, start=1):
-                if str(e.get("UserID")) == user_id_str:
-                    pts = e.get("Points", 0)
-                    rank = i
-                    break
+                for i, entry in enumerate(contributions, start=1):
+                    if str(entry.get("UserID")) == roblox_id:
+                        points = int(entry.get("Points", 0) or 0)
+                        rank = i
+                        break
 
-        # ---------------- IMAGE ----------------
         image_buffer = await generate_profile_card(
             roblox_name=roblox_name,
             roblox_id=int(roblox_id),
             discord_tag=discord_display,
-            points=pts,
-            rank=rank or 0,
-            animated=False
+            points=points,
+            rank=rank,
+            top_points=top_points,
+            war_name=battle_name,
+            animated=True
         )
 
-        file = discord.File(fp=image_buffer, filename="profile.png")
+        file = discord.File(fp=image_buffer, filename="profile.gif")
 
-        # ---------------- EMBED ----------------
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             color=discord.Color.blurple()
@@ -1907,20 +1848,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="🆔 User ID", value=roblox_id, inline=True)
         embed.add_field(name="💬 Discord", value=discord_display, inline=True)
 
-        if battle:
-            embed.add_field(
-                name="⚔️ War Status",
-                value=f"Points: **{pts:,}**\nRank: **{rank or 'N/A'}**",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="⚔️ War Status",
-                value="No war data available",
-                inline=False
-            )
+        embed.add_field(name="⚔️ Current War", value=battle_name, inline=False)
+        embed.add_field(
+            name="📊 War Stats",
+            value=f"Points: **{points:,}**\nPlacement: **#{rank if rank else 'N/A'}**",
+            inline=False
+        )
 
-        embed.set_image(url="attachment://profile.png")
+        embed.set_image(url="attachment://profile.gif")
 
         await interaction.followup.send(embed=embed, file=file)
 
@@ -1930,7 +1865,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             f"❌ Profile failed: `{e}`",
             ephemeral=True
         )
-
+        
 @bot.tree.command(name="clanstats", description="Show MCWV clan overview — level, members, diamonds, and battle history", guild=guild_obj)
 async def clanstats(interaction: discord.Interaction):
     await interaction.response.defer()
