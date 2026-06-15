@@ -1715,115 +1715,245 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
         summary += "\n\n⚠️ **Some steps failed:**\n" + "\n".join(errors)
     await interaction.followup.send(f"**Accept complete!**\n{summary}", ephemeral=True)
 
-@bot.tree.command(
-    name="kick",
-    description="Remove a member (Discord or Roblox username)",
-    guild=guild_obj
-)
-@require_role()
-async def kick(interaction: discord.Interaction, target: str, reason: str = "No reason provided"):
 
-    await interaction.response.defer(ephemeral=True)
+# ---- CLEANUP COMMAND -------
+import re
+import discord
+from discord import app_commands
 
-    try:
-        guild = interaction.guild
+STAFF_CHAT_CHANNEL_ID = 1501639281750442114
+CLAN_MEMBER_ROLE_ID = 1501986780667314246
+
+
+def clear_tracking_for_roblox_id(roblox_id: str):
+    rid = str(roblox_id).strip()
+    status_cache.pop(rid, None)
+    status_cache_time.pop(rid, None)
+    offline_since.pop(rid, None)
+
+
+async def cleanup_autocomplete(interaction: discord.Interaction, current: str):
+    users = db_get_all()
+    results = []
+    current_lower = current.lower().strip()
+
+    for roblox_id, discord_id, username in users:
+        rid = str(roblox_id).strip()
+        did = str(discord_id).strip()
+        uname = str(username).strip()
+
+        if current_lower in uname.lower():
+            results.append(
+                app_commands.Choice(
+                    name=f"{uname} (Roblox)",
+                    value=uname
+                )
+            )
+
+        if current and current_lower in did:
+            results.append(
+                app_commands.Choice(
+                    name=f"{did} (Discord ID)",
+                    value=did
+                )
+            )
+
+        if current and current_lower in rid:
+            results.append(
+                app_commands.Choice(
+                    name=f"{rid} (Roblox ID)",
+                    value=rid
+                )
+            )
+
+        if len(results) >= 25:
+            break
+
+    return results[:25]
+
+
+async def resolve_cleanup_target(guild: discord.Guild, target: str, db_users: list):
+    target = target.strip()
+
+    member = None
+    linked_row = None
+    roblox_id = None
+    roblox_name = None
+
+    # Discord mention / ID
+    discord_id = None
+    m = re.fullmatch(r"<@!?(\d+)>", target)
+    if m:
+        discord_id = int(m.group(1))
+    elif target.isdigit():
+        discord_id = int(target)
+
+    if discord_id is not None:
+        member = guild.get_member(discord_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(discord_id)
+            except Exception:
+                member = None
+
+        linked_row = next((u for u in db_users if int(u[1]) == discord_id), None)
+        if linked_row:
+            roblox_id = str(linked_row[0]).strip()
+            roblox_name = linked_row[2]
+
+        return member, linked_row, roblox_id, roblox_name
+
+    # Roblox username / Roblox ID
+    lowered = target.lower()
+    linked_row = next(
+        (
+            u for u in db_users
+            if str(u[0]).strip() == target
+            or str(u[2]).strip().lower() == lowered
+        ),
+        None
+    )
+
+    if linked_row:
+        roblox_id = str(linked_row[0]).strip()
+        roblox_name = linked_row[2]
+
+        member = guild.get_member(int(linked_row[1]))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(linked_row[1]))
+            except Exception:
+                member = None
+
+    return member, linked_row, roblox_id, roblox_name
+
+
+class CleanupConfirmView(discord.ui.View):
+    def __init__(self, guild, target, reason, requestor):
+        super().__init__(timeout=86400)
+        self.guild = guild
+        self.target = target
+        self.reason = reason
+        self.requestor = requestor
+
+    async def run_cleanup(self, interaction: discord.Interaction):
         db_users = db_get_all()
 
-        member = None
-        roblox_name = None
-        roblox_id = None
-
-        # ---------------- Discord detection ----------------
-        import re
-        match = re.match(r"<@!?(\d+)>", target)
-
-        if match:
-            discord_id = int(match.group(1))
-        elif target.isdigit():
-            discord_id = int(target)
-        else:
-            discord_id = None
-
-        # ---------------- Resolve member ----------------
-        if discord_id:
-            member = guild.get_member(discord_id)
-            if not member:
-                try:
-                    member = await guild.fetch_member(discord_id)
-                except:
-                    member = None
-
-        # ---------------- Roblox fallback ----------------
-        if not member:
-            roblox_name = target.lower()
-            linked = next((u for u in db_users if u[2].lower() == roblox_name), None)
-
-            if not linked:
-                return await interaction.followup.send("❌ User not found.", ephemeral=True)
-
-            roblox_id = linked[0]
-            discord_id = linked[1]
-
-            member = guild.get_member(int(discord_id))
-            if not member:
-                try:
-                    member = await guild.fetch_member(int(discord_id))
-                except:
-                    member = None
-
-            roblox_name = linked[2]
-
-        if not member:
-            return await interaction.followup.send("❌ Member not found in server.", ephemeral=True)
-
-        # ---------------- Linked info ----------------
-        linked = next((u for u in db_users if u[1] == member.id), None)
-
-        if linked:
-            roblox_name = linked[2]
-            roblox_id = linked[0]
+        member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
+            self.guild, self.target, db_users
+        )
 
         actions = []
 
-        # ---------------- Role removal ----------------
-        clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
+        if member:
+            role = self.guild.get_role(CLAN_MEMBER_ROLE_ID)
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason=self.reason)
+                    actions.append("✅ Removed clan role")
+                except Exception as e:
+                    actions.append(f"⚠️ Role removal failed: {e}")
 
-        if clan_role and clan_role in member.roles:
-            await member.remove_roles(clan_role, reason=reason)
-            actions.append("✅ Removed clan role")
+        if linked_row:
+            try:
+                db_remove(member.id if member else int(linked_row[1]))
+                actions.append("✅ Unlinked database")
+            except Exception as e:
+                actions.append(f"⚠️ DB unlink failed: {e}")
 
-        # ---------------- DB unlink ----------------
-        if linked:
-            db_remove(member.id)
-            actions.append("✅ Unlinked account")
-
-        # ---------------- Cache cleanup ----------------
         if roblox_id:
-            offline_since.pop(str(roblox_id), None)
-            status_cache.pop(str(roblox_id), None)
+            clear_tracking_for_roblox_id(roblox_id)
+            actions.append("✅ Cleared caches")
 
-        # ---------------- RESPONSE (CRITICAL) ----------------
-        await interaction.followup.send(
-            f"❌ Kicked **{member.display_name}**\n" + "\n".join(actions),
+        embed = discord.Embed(
+            title="✅ Cleanup Completed",
+            description=(
+                f"**Target:** {self.target}\n"
+                f"**Roblox:** {roblox_name or 'Unknown'}\n"
+                f"**Requested by:** {self.requestor.mention}"
+            ),
+            color=discord.Color.green()
+        )
+
+        embed.add_field(
+            name="Actions",
+            value="\n".join(actions) if actions else "None",
+            inline=False
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.run_cleanup(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="❌ Cleanup Cancelled",
+            description=f"Target: {self.target}",
+            color=discord.Color.red()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+@bot.tree.command(
+    name="cleanup",
+    description="Remove clan role, unlink user, and clear tracking",
+    guild=guild_obj
+)
+@app_commands.describe(target="Discord mention/ID or Roblox username/ID", reason="Reason for cleanup")
+@app_commands.autocomplete(target=cleanup_autocomplete)
+@require_role()
+async def cleanup(interaction: discord.Interaction, target: str, reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+
+    db_users = db_get_all()
+    member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
+        interaction.guild, target, db_users
+    )
+
+    if not member and not linked_row:
+        return await interaction.followup.send(
+            "❌ User not found.",
             ephemeral=True
         )
 
-    except Exception as e:
-        await interaction.followup.send(f"❌ Kick failed: `{e}`", ephemeral=True)
-        print("Kick error:", e)
-
-    # ---------------- SEND CONFIRMATION ----------------
-    embed = discord.Embed(
-        title="⚠️ Confirm Kick",
-        description=f"Are you sure you want to kick **{member.display_name}**?",
+    preview = discord.Embed(
+        title="⚠️ Confirm Cleanup",
+        description=(
+            f"**Target:** {target}\n"
+            f"**Roblox:** {roblox_name or 'Unknown'}\n"
+            f"**Discord:** {member.mention if member else 'Not in server'}\n"
+            f"**Reason:** {reason}"
+        ),
         color=discord.Color.orange()
     )
 
-    embed.add_field(name="Roblox", value=roblox_name or "Unknown", inline=True)
-    embed.add_field(name="Reason", value=reason, inline=False)
+    staff_channel = interaction.guild.get_channel(STAFF_CHAT_CHANNEL_ID)
+    if not staff_channel:
+        try:
+            staff_channel = await interaction.guild.fetch_channel(STAFF_CHAT_CHANNEL_ID)
+        except Exception:
+            return await interaction.followup.send(
+                "❌ Staff channel not found.",
+                ephemeral=True
+            )
 
-    await interaction.followup.send(embed=embed, view=KickConfirmView(), ephemeral=True)
+    view = CleanupConfirmView(
+        guild=interaction.guild,
+        target=target,
+        reason=reason,
+        requestor=interaction.user
+    )
 
+    await staff_channel.send(embed=preview, view=view)
+
+    await interaction.followup.send(
+        f"✅ Sent confirmation to {staff_channel.mention}",
+        ephemeral=True
+    )
+    
 @bot.tree.command(name="settings", description="Show current bot settings", guild=guild_obj)
 @require_role()
 async def settings(interaction: discord.Interaction):
