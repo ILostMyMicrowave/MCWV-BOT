@@ -2067,74 +2067,75 @@ class CleanupConfirmView(discord.ui.View):
 
         actions = []
 
-    # ---------------- REMOVE ROLE ----------------
-    if member:
-        role = self.guild.get_role(CLAN_MEMBER_ROLE_ID)
-        if role and role in member.roles:
-            try:
-                await member.remove_roles(role, reason=self.reason)
-                actions.append("✅ Removed clan role")
-            except Exception as e:
-                actions.append(f"⚠️ Role removal failed: {e}")
-
-    # ---------------- REMOVE DB LINKS ----------------
-    try:
+        # ---------------- REMOVE ROLE ----------------
         if member:
-            db_remove_all_links_for_discord(member.id)
-            actions.append("✅ Removed main + alts from DB")
-        elif linked_row:
-            db_remove_all_links_for_discord(int(linked_row[1]))
-            actions.append("✅ Removed DB links (fallback)")
-    except Exception as e:
-        actions.append(f"⚠️ DB unlink failed: {e}")
+            role = self.guild.get_role(CLAN_MEMBER_ROLE_ID)
+            if role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason=self.reason)
+                    actions.append("✅ Removed clan role")
+                except Exception as e:
+                    actions.append(f"⚠️ Role removal failed: {e}")
 
-    # ---------------- CACHE CLEANUP ----------------
-    try:
-        if member:
-            discord_id = member.id
-            alts = db_get_alts(discord_id)
-            main = db_get_main_link(discord_id)
+        # ---------------- REMOVE DB LINKS ----------------
+        try:
+            if member:
+                db_remove_all_links_for_discord(member.id)
+                actions.append("✅ Removed main + alts from DB")
+            elif linked_row:
+                db_remove_all_links_for_discord(int(linked_row[1]))
+                actions.append("✅ Removed DB links (fallback)")
+        except Exception as e:
+            actions.append(f"⚠️ DB unlink failed: {e}")
 
-            all_ids = []
+        # ---------------- CACHE CLEANUP ----------------
+        try:
+            if member:
+                discord_id = member.id
+                alts = db_get_alts(discord_id)
+                main = db_get_main_link(discord_id)
 
-            if main:
-                all_ids.append(str(main[0]).strip())
+                all_ids = []
 
-            for rid, _ in alts:
-                all_ids.append(str(rid).strip())
+                if main:
+                    all_ids.append(str(main[0]).strip())
 
-            for rid in all_ids:
-                status_cache.pop(rid, None)
-                status_cache_time.pop(rid, None)
-                offline_since.pop(rid, None)
+                for rid, _ in alts:
+                    all_ids.append(str(rid).strip())
 
-            actions.append("✅ Cleared all caches (main + alts)")
+                for rid in all_ids:
+                    status_cache.pop(rid, None)
+                    status_cache_time.pop(rid, None)
+                    offline_since.pop(rid, None)
 
-        elif roblox_id:
-            clear_tracking_for_roblox_id(roblox_id)
-            actions.append("✅ Cleared caches")
+                actions.append("✅ Cleared all caches (main + alts)")
 
-    except Exception as e:
-        actions.append(f"⚠️ Cache cleanup failed: {e}")
+            elif roblox_id:
+                clear_tracking_for_roblox_id(roblox_id)
+                actions.append("✅ Cleared caches")
 
-    # ---------------- RESPONSE ----------------
-    embed = discord.Embed(
-        title="✅ Cleanup Completed",
-        description=(
-            f"**Target:** {self.target}\n"
-            f"**Roblox:** {roblox_name or 'Unknown'}\n"
-            f"**Requested by:** {self.requestor.mention}"
-        ),
-        color=discord.Color.green()
-    )
+        except Exception as e:
+            actions.append(f"⚠️ Cache cleanup failed: {e}")
 
-    embed.add_field(
-        name="Actions",
-        value="\n".join(actions) if actions else "None",
-        inline=False
-    )
+        embed = discord.Embed(
+            title="✅ Cleanup Completed",
+            description=(
+                f"**Target:** {self.target}\n"
+                f"**Roblox:** {roblox_name or 'Unknown'}\n"
+                f"**Requested by:** {self.requestor.mention}"
+            ),
+            color=discord.Color.green()
+        )
 
-    await interaction.response.edit_message(embed=embed, view=None)
+        embed.add_field(
+            name="Actions",
+            value="\n".join(actions) if actions else "None",
+            inline=False
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    # ---------------- BUTTONS (MUST BE OUTSIDE run_cleanup) ----------------
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2148,7 +2149,6 @@ class CleanupConfirmView(discord.ui.View):
             color=discord.Color.red()
         )
         await interaction.response.edit_message(embed=embed, view=None)
-
 
 @bot.tree.command(
     name="cleanup",
