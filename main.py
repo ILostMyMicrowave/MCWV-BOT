@@ -2058,13 +2058,13 @@ class CleanupConfirmView(discord.ui.View):
 
     async def run_cleanup(self, interaction: discord.Interaction):
 
-        users = db_get_all_tracked()
+    users = db_get_all_tracked()
 
-        member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
-            self.guild, self.target, users
-        )
+    member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
+        self.guild, self.target, users
+    )
 
-        actions = []
+    actions = []
 
     # ---------------- REMOVE ROLE ----------------
     if member:
@@ -2076,7 +2076,7 @@ class CleanupConfirmView(discord.ui.View):
             except Exception as e:
                 actions.append(f"⚠️ Role removal failed: {e}")
 
-    # ---------------- REMOVE DB LINKS (MAIN + ALTS) ----------------
+    # ---------------- REMOVE DB LINKS ----------------
     try:
         if member:
             db_remove_all_links_for_discord(member.id)
@@ -2087,7 +2087,7 @@ class CleanupConfirmView(discord.ui.View):
     except Exception as e:
         actions.append(f"⚠️ DB unlink failed: {e}")
 
-    # ---------------- CACHE CLEANUP (IMPORTANT FIX) ----------------
+    # ---------------- CACHE CLEANUP ----------------
     try:
         if member:
             discord_id = member.id
@@ -2108,9 +2108,11 @@ class CleanupConfirmView(discord.ui.View):
                 offline_since.pop(rid, None)
 
             actions.append("✅ Cleared all caches (main + alts)")
+
         elif roblox_id:
             clear_tracking_for_roblox_id(roblox_id)
             actions.append("✅ Cleared caches")
+
     except Exception as e:
         actions.append(f"⚠️ Cache cleanup failed: {e}")
 
