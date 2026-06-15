@@ -1864,6 +1864,75 @@ async def settings(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+@bot.tree.command(
+    name="testreminder",
+    description="Force-send an offline reminder immediately",
+    guild=guild_obj
+)
+@require_role()
+async def testreminder(interaction: discord.Interaction):
+
+    await interaction.response.defer(ephemeral=True)
+
+    if not offline_ping_enabled:
+        return await interaction.followup.send(
+            "❌ Offline reminders are currently disabled.",
+            ephemeral=True
+        )
+
+    if not offline_since:
+        return await interaction.followup.send(
+            "⚠️ No offline users found in memory.",
+            ephemeral=True
+        )
+
+    try:
+        channel = await bot.fetch_channel(reminder_channel_id)
+    except Exception as e:
+        return await interaction.followup.send(
+            f"❌ Could not fetch reminder channel: {e}",
+            ephemeral=True
+        )
+
+    users = db_get_all()
+    if not users:
+        return await interaction.followup.send(
+            "❌ No tracked users found.",
+            ephemeral=True
+        )
+
+    lines = []
+
+    for rid, since in offline_since.items():
+
+        current = status_cache.get(str(rid).strip(), 0)
+
+        # only true offline users
+        if current != 0:
+            continue
+
+        info = next((x for x in users if str(x[0]).strip() == str(rid).strip()), None)
+        if not info:
+            continue
+
+        duration = format_duration(since)
+        lines.append(
+            f"⚫ <@{info[1]}> **({info[2]})** is offline - {duration}"
+        )
+
+    if not lines:
+        return await interaction.followup.send(
+            "⚠️ No valid offline reminders to send.",
+            ephemeral=True
+        )
+
+    await channel.send("\n".join(lines))
+
+    await interaction.followup.send(
+        "✅ Test reminder sent successfully.",
+        ephemeral=True
+    )
 # ---------------- STATUS COMMAND ----------------
 @bot.tree.command(name="status", description="Check Roblox status", guild=guild_obj)
 async def status(interaction: discord.Interaction, member: discord.Member):
