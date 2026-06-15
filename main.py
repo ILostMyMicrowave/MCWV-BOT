@@ -1831,19 +1831,29 @@ async def check_loop():
         print("Loop error (API fetch):", e)
         return
 
+    # ---------------- DEBUG (IMPORTANT) ----------------
+    print("RAW KEYS:", data.keys())
+    print("PRESENCE COUNT:", len(data.get("userPresences", [])))
+
     try:
-        now = datetime.now(timezone.utc)  # ✅ FIXED (must be early)
+        now = datetime.now(timezone.utc)
 
-        for u in data.get("userPresences", []):
+        presences = data.get("userPresences", [])
+        if not presences:
+            print("❌ NO PRESENCE DATA RETURNED")
+            return
 
-            rid = str(u["userId"]).strip()          # ✅ string everywhere
-            current = u["userPresenceType"]
+        for u in presences:
+
+            rid = str(u.get("userId")).strip()
+            current = u.get("userPresenceType", 0)
 
             old = status_cache.get(rid)
-            status_cache[rid] = current
-            status_cache_time[rid] = now    # ✅ FIXED
 
-            # ---------------- DB SAVE ----------------
+            status_cache[rid] = current
+            status_cache_time[rid] = now
+
+            # DB SAVE
             try:
                 cur.execute("""
                     INSERT INTO user_status (roblox_id, status, updated_at)
@@ -1854,9 +1864,8 @@ async def check_loop():
                 conn.commit()
 
             except Exception as db_error:
-                print("Loop error (DB write):", db_error)
+                print("Loop DB error:", db_error)
 
-            # no change → skip
             if old == current:
                 continue
 
@@ -1864,25 +1873,19 @@ async def check_loop():
             if not info:
                 continue
 
-            # IN GAME → reset offline tracking
             if current == 2:
                 offline_since.pop(rid, None)
                 continue
 
-            # first time seen offline
             if rid not in offline_since:
                 offline_since[rid] = now
 
-            # ping only when leaving game
-            try:
-                if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
-                    channel = await bot.fetch_channel(CHANNEL_ID)
-                    await channel.send(
-                        f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-                        allowed_mentions=discord.AllowedMentions(users=True)
-                    )
-            except Exception as e:
-                print("Loop ping error:", e)
+            if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
+                channel = await bot.fetch_channel(CHANNEL_ID)
+                await channel.send(
+                    f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+                    allowed_mentions=discord.AllowedMentions(users=True)
+                )
 
     except Exception as e:
         print("Loop processing error:", e)
