@@ -2855,20 +2855,82 @@ async def status(interaction: discord.Interaction, member: discord.Member):
     except Exception as e:
         print("[status error]", e)
         await interaction.followup.send("❌ Error", ephemeral=True)
-        
-# ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
+        import asyncio
+from datetime import datetime, timezone
+import discord
+from discord.ext import tasks
+
+# ---------------- LOOP SAFETY ----------------
+api_semaphore = asyncio.Semaphore(3)
+pending_clan_removals = {}
 
 def _chunks(items, size=50):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
+async def _get_channel(channel_id: int):
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except Exception:
+            ch = None
+    return ch
 
+async def _roblox_presence_request(user_ids: list[int]):
+    async with api_semaphore:
+        async with session.post(
+            "https://presence.roblox.com/v1/presence/users",
+            json={"userIds": user_ids}
+        ) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+
+# ---------------- INITIAL PRESENCE SYNC ----------------
+async def run_initial_presence_check():
+    try:
+        users = db_get_all_tracked()
+        if not users:
+            return
+
+        now_dt = datetime.now(timezone.utc)
+
+        for chunk in _chunks([int(u[0]) for u in users], 50):
+            data = await _roblox_presence_request(chunk)
+            if not data:
+                continue
+
+            for p in data.get("userPresences", []):
+                rid = str(p.get("userId", "")).strip()
+                if not rid:
+                    continue
+
+                status = int(p.get("userPresenceType", 0) or 0)
+
+                status_cache[rid] = status
+                status_cache_time[rid] = now_dt
+
+                if status == 0:
+                    offline_since[rid] = now_dt
+                else:
+                    offline_since.pop(rid, None)
+
+            await asyncio.sleep(1)
+
+    except Exception as e:
+        print("Initial sync error:", e)
+
+# ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
 @tasks.loop(minutes=2)
 async def check_loop():
     print("🔄 CHECK_LOOP HIT")
 
+    if not bot_enabled:
+        return
+
     users = db_get_all_tracked()
-    if not users or not bot_enabled:
+    if not users:
         return
 
     print("Loop running, users:", len(users))
@@ -2882,22 +2944,17 @@ async def check_loop():
         user_ids = [int(u[0]) for u in users]
         all_presences = []
 
-        # ---------------- ROBLOX API (chunked) ----------------
         for chunk in _chunks(user_ids, 50):
-            async with session.post(
-                "https://presence.roblox.com/v1/presence/users",
-                json={"userIds": chunk}
-            ) as r:
+            data = await _roblox_presence_request(chunk)
+            if not data:
+                print("Presence API returned non-200 or no data")
+                continue
 
-                if r.status != 200:
-                    print("Presence API returned:", r.status)
-                    continue
+            presences = data.get("userPresences", [])
+            if isinstance(presences, list):
+                all_presences.extend(presences)
 
-                data = await r.json()
-                presences = data.get("userPresences", [])
-
-                if isinstance(presences, list):
-                    all_presences.extend(presences)
+            await asyncio.sleep(1)
 
     except Exception as e:
         print("Loop error (API fetch):", e)
@@ -2914,7 +2971,6 @@ async def check_loop():
 
     try:
         for u in all_presences:
-
             try:
                 rid = str(u.get("userId", "")).strip()
                 if not rid:
@@ -2930,11 +2986,9 @@ async def check_loop():
 
                 old = status_cache.get(rid)
 
-                # ---------------- CACHE UPDATE ----------------
                 status_cache[rid] = current
                 status_cache_time[rid] = now
 
-                # ---------------- DB UPDATE (NO COMMIT HERE) ----------------
                 try:
                     with conn.cursor() as cur:
                         cur.execute("""
@@ -2947,7 +3001,6 @@ async def check_loop():
                 except Exception as db_error:
                     print("Loop DB error:", db_error)
 
-                # no change
                 if old == current:
                     continue
 
@@ -2955,30 +3008,27 @@ async def check_loop():
                 if not info:
                     continue
 
-                # ---------------- IN GAME ----------------
                 if current == 2:
                     offline_since.pop(rid, None)
                     continue
 
-                # ---------------- OFFLINE TRACKING ----------------
                 if rid not in offline_since:
                     offline_since[rid] = now
 
-                # ---------------- LEAVE GAME PING ----------------
                 try:
-                    if old == 2 and str(db_get_setting("offline_tracking")).lower() == "true":
-                        channel = await bot.fetch_channel(CHANNEL_ID)
-                        await channel.send(
-                            f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
-                            allowed_mentions=discord.AllowedMentions(users=True)
-                        )
+                    if str(db_get_setting("offline_tracking", "false")).lower() == "true":
+                        channel = await _get_channel(CHANNEL_ID)
+                        if channel:
+                            await channel.send(
+                                f"⚫ <@{info[1]}> **({info[2]})** is no longer in game — {discord.utils.format_dt(now, 'R')}",
+                                allowed_mentions=discord.AllowedMentions(users=True)
+                            )
                 except Exception as e:
                     print("Ping error:", e)
 
             except Exception as inner:
                 print("Loop user error:", inner)
 
-        # ---------------- SINGLE COMMIT (IMPORTANT) ----------------
         try:
             conn.commit()
         except Exception as e:
@@ -2990,63 +3040,69 @@ async def check_loop():
 # ---------------- REMINDER LOOP ----------------
 @tasks.loop(minutes=30)
 async def reminder_loop():
-    if not bot_enabled or not offline_ping_enabled:
-        return
-
-    if not offline_since:
-        return
-
     try:
-        channel = await bot.fetch_channel(reminder_channel_id)
-    except Exception as e:
-        print("Reminder loop: could not fetch channel:", e)
-        return
+        if not bot_enabled or not offline_ping_enabled:
+            return
 
-    users = db_get_all()
-    if not users:
-        return
+        if not offline_since:
+            return
 
-    lines = []
+        channel = await _get_channel(reminder_channel_id)
+        if not channel:
+            print("Reminder loop: could not fetch channel")
+            return
 
-    for rid, since in offline_since.items():
-        current = status_cache.get(str(rid).strip(), 0)
+        users = db_get_all_tracked()
+        if not users:
+            return
 
-        # Only remind for users who are still offline
-        if current != 0:
-            continue
+        users_map = {str(u[0]).strip(): u for u in users}
+        lines = []
 
-        info = next((x for x in users if str(x[0]).strip() == str(rid).strip()), None)
-        if not info:
-            continue
+        for rid, since in list(offline_since.items()):
+            current = status_cache.get(str(rid).strip(), 0)
 
-        duration = format_duration(since)
-        lines.append(f"⚫ <@{info[1]}> **({info[2]})** is offline - {duration}")
+            if current != 0:
+                continue
 
-    if not lines:
-        return
+            info = users_map.get(str(rid).strip())
+            if not info:
+                continue
 
-    try:
+            duration = format_duration(since)
+            lines.append(f"⚫ <@{info[1]}> **({info[2]})** is offline - {duration}")
+
+        if not lines:
+            return
+
         await channel.send("\n\n".join(lines))
-    except Exception as e:
-        print("Reminder loop send error:", e)
 
-# ---------------- PS99 WAR POLL (SAFE STATE MACHINE VERSION) ----------------
+    except Exception as e:
+        print("Reminder loop error:", e)
+
+# ---------------- PS99 WAR POLL ----------------
+ps99_first_check = True
+ps99_war_active = False
+
 @tasks.loop(minutes=20)
 async def war_poll_loop():
-    global bot_enabled, ps99_war_active, ps99_first_check
+    global bot_enabled, ps99_war_active, ps99_first_check, session
 
     try:
-        async with session.get(PS99_API) as r:
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with session.get(PS99_API, timeout=timeout) as r:
             api_ok = r.status == 200
             data = await r.json() if api_ok else {}
 
         config = data.get("data", {}).get("configData", {})
         start = config.get("StartTime")
         finish = config.get("FinishTime")
-
         now = datetime.now(timezone.utc).timestamp()
 
-        # SAFE CALCULATION
         currently_active = (
             api_ok and
             isinstance(start, (int, float)) and
@@ -3054,7 +3110,6 @@ async def war_poll_loop():
             start <= now <= finish
         )
 
-        # FIRST RUN INITIALISATION
         if ps99_first_check:
             ps99_first_check = False
             ps99_war_active = currently_active
@@ -3062,134 +3117,159 @@ async def war_poll_loop():
             print(f"[INIT] War state set to {currently_active}")
             return
 
-        # ALWAYS SYNC WAR STATE (no missed transitions)
         if ps99_war_active != currently_active:
             ps99_war_active = currently_active
             bot_enabled = currently_active
 
-            channel = await bot.fetch_channel(CHANNEL_ID)
+            channel = await _get_channel(CHANNEL_ID)
+            if not channel:
+                return
 
             if currently_active:
                 await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
                 print("War started (state synced)")
-
-                await run_initial_presence_check(channel)
-
+                await run_initial_presence_check()
             else:
                 offline_since.clear()
                 status_cache.clear()
-
                 await channel.send("🛑 CLAN WAR OVER. GG EVERYONE!!")
                 print("War ended (state synced)")
 
     except Exception as e:
         print("War poll error:", e)
+
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
-
-pending_clan_removals = {}
-
 @tasks.loop(minutes=10)
 async def clan_leave_loop():
-    users = db_get_all()
-    if not users:
-        return
-
     try:
-        async with session.get(CLAN_API) as r:
+        users = db_get_all_tracked()
+        if not users:
+            return
+
+        if session is None or session.closed:
+            return
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with session.get(CLAN_API, timeout=timeout) as r:
             if r.status != 200:
                 return
             data = (await r.json()).get("data", {})
-    except Exception as e:
-        print("Clan leave loop error:", e)
-        return
 
-    clan_member_ids = {
-        int(m["UserID"])
-        for m in data.get("Members", [])
-        if "UserID" in m
-    }
-
-    if not clan_member_ids:
-        return
-
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-
-    staff_channel = guild.get_channel(1501639281750442114)
-
-    for roblox_id, discord_id, roblox_name in users:
-
-        if int(roblox_id) in clan_member_ids:
-            continue
-
-        if roblox_id in pending_clan_removals:
-            continue
-
-        pending_clan_removals[roblox_id] = {
-            "discord_id": discord_id,
-            "roblox_name": roblox_name
+        clan_member_ids = {
+            int(m["UserID"])
+            for m in data.get("Members", [])
+            if "UserID" in m
         }
 
-        embed = discord.Embed(
-            title="🚨 Clan Leave Detected",
-            description=f"**{roblox_name}** is no longer in the clan.",
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc)
-        )
+        if not clan_member_ids:
+            return
 
-        embed.add_field(name="Discord User", value=f"<@{discord_id}>", inline=True)
-        embed.add_field(name="Roblox", value=roblox_name, inline=True)
-        embed.add_field(name="Action Required", value="Approve or ignore this removal.", inline=False)
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
 
-        await staff_channel.send(
-            embed=embed,
-            view=ClanReviewView(roblox_id)
-        )
+        staff_channel = await _get_channel(1501639281750442114)
+        if not staff_channel:
+            return
 
-@discord.ui.button(label="Approve Removal", style=discord.ButtonStyle.danger)
-async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-    try:
-        if self.roblox_id not in pending_clan_removals:
-            return await interaction.response.send_message("Already handled.", ephemeral=True)
-
-        data = pending_clan_removals.pop(self.roblox_id)
-
-        guild = interaction.guild
-        member = guild.get_member(int(data["discord_id"]))
-
-        if member is None:
+        for roblox_id, discord_id, roblox_name in users:
             try:
-                member = await guild.fetch_member(int(data["discord_id"]))
-            except:
-                member = None
+                if int(roblox_id) in clan_member_ids:
+                    continue
 
-        role = guild.get_role(CLAN_MEMBER_ROLE_ID)
+                if roblox_id in pending_clan_removals:
+                    continue
 
-        if member and role and role in member.roles:
-            await member.remove_roles(role, reason="Staff approved clan removal")
+                pending_clan_removals[roblox_id] = {
+                    "discord_id": discord_id,
+                    "roblox_name": roblox_name
+                }
 
-        try:
-            db_remove(data["discord_id"])
-        except Exception as e:
-            print("DB remove error:", e)
+                embed = discord.Embed(
+                    title="🚨 Clan Leave Detected",
+                    description=f"**{roblox_name}** is no longer in the clan.",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.now(timezone.utc)
+                )
 
-        await interaction.response.edit_message(
-            content="✅ Member removed and processed.",
-            embed=interaction.message.embeds[0],
-            view=None
-        )
+                embed.add_field(name="Discord User", value=f"<@{discord_id}>", inline=True)
+                embed.add_field(name="Roblox", value=roblox_name, inline=True)
+                embed.add_field(name="Action Required", value="Approve or ignore this removal.", inline=False)
+
+                await staff_channel.send(
+                    embed=embed,
+                    view=ClanReviewView(roblox_id)
+                )
+
+            except Exception as e:
+                print("Clan leave row error:", e)
 
     except Exception as e:
-        print("Approve button error:", e)
+        print("Clan leave loop error:", e)
+
+# ---------------- CLAN REVIEW VIEW ----------------
+class ClanReviewView(discord.ui.View):
+    def __init__(self, roblox_id):
+        super().__init__(timeout=86400)
+        self.roblox_id = roblox_id
+
+    @discord.ui.button(label="Approve Removal", style=discord.ButtonStyle.danger)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            await interaction.response.send_message(
-                "❌ Something went wrong while processing this.",
-                ephemeral=True
+            if self.roblox_id not in pending_clan_removals:
+                return await interaction.response.send_message("Already handled.", ephemeral=True)
+
+            data = pending_clan_removals.pop(self.roblox_id)
+
+            guild = interaction.guild
+            member = guild.get_member(int(data["discord_id"])) if guild else None
+
+            if member is None and guild:
+                try:
+                    member = await guild.fetch_member(int(data["discord_id"]))
+                except Exception:
+                    member = None
+
+            role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
+
+            if member and role and role in member.roles:
+                await member.remove_roles(role, reason="Staff approved clan removal")
+
+            try:
+                db_remove(data["discord_id"])
+            except Exception as e:
+                print("DB remove error:", e)
+
+            await interaction.response.edit_message(
+                content="✅ Member removed and processed.",
+                embed=interaction.message.embeds[0] if interaction.message.embeds else None,
+                view=None
             )
-        except:
-            pass
+
+        except Exception as e:
+            print("Approve button error:", e)
+            try:
+                await interaction.response.send_message(
+                    "❌ Something went wrong while processing this.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+
+# ---------------- LOOP STARTER ----------------
+def start_bot_loops():
+    if not check_loop.is_running():
+        check_loop.start()
+
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+
+    if not war_poll_loop.is_running():
+        war_poll_loop.start()
+
+    if not clan_leave_loop.is_running():
+        clan_leave_loop.start()
 
 # ---------------- READY ----------------
 @bot.event
@@ -3209,25 +3289,14 @@ async def on_ready():
 
     print(f"🤖 Logged in as {bot.user} ({bot.user.id})")
 
-    loops = [
-        ("war_poll_loop", war_poll_loop),
-        ("check_loop", check_loop),
-        ("reminder_loop", reminder_loop),
-    ]
+    try:
+        start_bot_loops()
+        print("✅ Bot loops started")
+    except Exception as e:
+        print(f"❌ Failed to start loops: {e}")
 
-    for name, loop in loops:
-        try:
-            if not loop.is_running():
-                loop.start()
-                print(f"✅ {name} started")
-            else:
-                print(f"ℹ️ {name} already running")
-        except Exception as e:
-            print(f"❌ Failed to start {name}: {e}")
-
-    print(f"👥 Tracking {len(db_get_all())} users")
+    print(f"👥 Tracking {len(db_get_all_tracked())} users")
     print("✅ ON_READY DONE")
-
 
 # ---------------- CLEANUP ----------------
 @bot.event
