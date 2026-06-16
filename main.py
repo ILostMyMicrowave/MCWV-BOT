@@ -2863,7 +2863,7 @@ def _chunks(items, size=50):
         yield items[i:i + size]
 
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=2)
 async def check_loop():
     print("🔄 CHECK_LOOP HIT")
 
