@@ -2103,7 +2103,7 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
     roblox_input = None
     for _ in range(3):
         try:
-            username_msg = await bot.wait_for("message", check=from_creator, timeout=1200)
+            username_msg = await bot.wait_for("message", check=from_creator, timeout=120)
         except asyncio.TimeoutError:
             return await interaction.followup.send(
                 "❌ Timed out waiting for Roblox username. Run `/accept` again to retry.",
@@ -2137,7 +2137,7 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
     alts = []
     for _ in range(3):
         try:
-            alts_msg = await bot.wait_for("message", check=from_creator, timeout=1200)
+            alts_msg = await bot.wait_for("message", check=from_creator, timeout=90)
         except asyncio.TimeoutError:
             alts = []
             break
