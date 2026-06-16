@@ -2863,7 +2863,7 @@ def _chunks(items, size=50):
         yield items[i:i + size]
 
 
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=5)
 async def check_loop():
     print("🔄 CHECK_LOOP HIT")
 
@@ -3031,7 +3031,7 @@ async def reminder_loop():
         print("Reminder loop send error:", e)
 
 # ---------------- PS99 WAR POLL (SAFE STATE MACHINE VERSION) ----------------
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=20)
 async def war_poll_loop():
     global bot_enabled, ps99_war_active, ps99_first_check
 
