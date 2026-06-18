@@ -284,6 +284,23 @@ def get_current_war(war_data, clan_data):
 
     return battle_id, battles.get(battle_id)
 
+def db_add_alt(discord_id, roblox_id, roblox_name):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO alts (
+                discord_id,
+                roblox_id,
+                roblox_name
+            )
+            VALUES (%s, %s, %s)
+            ON CONFLICT (roblox_id)
+            DO UPDATE SET
+                discord_id = EXCLUDED.discord_id,
+                roblox_name = EXCLUDED.roblox_name
+        """, (discord_id, roblox_id, roblox_name))
+
+    conn.commit()
+
 async def run_initial_presence_check(channel):
     try:
         users = db_get_all()
@@ -2812,6 +2829,186 @@ async def removealt(interaction: discord.Interaction, member: discord.Member, al
     except Exception as e:
         print("removealt error:", e)
         await interaction.followup.send("❌ Failed to remove alt.", ephemeral=True)
+
+@bot.tree.command(
+    name="memberedit",
+    description="Fix a member's Roblox username or alts",
+    guild=guild_obj
+)
+@require_role()
+@app_commands.describe(
+    member="Discord member to update",
+    roblox_username="Correct Roblox username",
+    alts="Comma-separated alt usernames or 'none'"
+)
+async def memberedit(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    roblox_username: str,
+    alts: str = "none"
+):
+    await interaction.response.defer(ephemeral=True)
+
+    global session
+
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    try:
+        # ---------------- VALIDATE MAIN ACCOUNT ----------------
+
+        async with session.post(
+            "https://users.roblox.com/v1/usernames/users",
+            json={
+                "usernames": [roblox_username.strip()],
+                "excludeBannedUsers": False
+            }
+        ) as r:
+
+            data = await r.json()
+
+        results = data.get("data", [])
+
+        if not results:
+            return await interaction.followup.send(
+                f"❌ Roblox user `{roblox_username}` not found.",
+                ephemeral=True
+            )
+
+        roblox_id = str(results[0]["id"])
+        roblox_name = results[0]["name"]
+
+        # ---------------- UPDATE MAIN LINK ----------------
+
+        db_remove_all_links_for_discord(member.id)
+        db_add(roblox_id, member.id, roblox_name)
+
+        # ---------------- VALIDATE ALTS ----------------
+
+        validated_alts = []
+
+        if alts.lower().strip() != "none":
+
+            alt_names = [
+                a.strip()
+                for a in alts.split(",")
+                if a.strip()
+            ]
+
+            async with session.post(
+                "https://users.roblox.com/v1/usernames/users",
+                json={
+                    "usernames": alt_names,
+                    "excludeBannedUsers": False
+                }
+            ) as r:
+
+                alt_data = await r.json()
+
+            found = {
+                u["name"].lower(): u
+                for u in alt_data.get("data", [])
+            }
+
+            missing = [
+                a for a in alt_names
+                if a.lower() not in found
+            ]
+
+            if missing:
+                return await interaction.followup.send(
+                    f"❌ Invalid alt usernames: `{', '.join(missing)}`",
+                    ephemeral=True
+                )
+
+            for alt in alt_data.get("data", []):
+                db_add_alt(
+                    member.id,
+                    str(alt["id"]),
+                    alt["name"]
+                )
+
+                validated_alts.append(alt["name"])
+
+        # ---------------- UPDATE MEMBERS CHANNEL RECORD ----------------
+
+        members_channel = interaction.guild.get_channel(
+            MEMBERS_CHANNEL_ID
+        )
+
+        if members_channel:
+
+            async for msg in members_channel.history(limit=500):
+
+                if f"<@{member.id}>" in msg.content:
+
+                    alt_text = (
+                        ", ".join(validated_alts)
+                        if validated_alts else "none"
+                    )
+
+                    new_content = (
+                        f"<#{msg.channel.id}> {member.mention}\n"
+                        f"user:{roblox_name}\n"
+                        f"alt:{alt_text}"
+                    )
+
+                    await msg.edit(content=new_content)
+                    break
+
+        # ---------------- CLEAR CACHE ----------------
+
+        clear_tracking_for_roblox_id(roblox_id)
+
+        # ---------------- LOG ----------------
+
+        log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
+
+        if log_channel:
+
+            embed = discord.Embed(
+                title="🛠️ Member Record Updated",
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(timezone.utc)
+            )
+
+            embed.add_field(
+                name="Staff",
+                value=interaction.user.mention
+            )
+
+            embed.add_field(
+                name="Member",
+                value=member.mention
+            )
+
+            embed.add_field(
+                name="Roblox",
+                value=roblox_name
+            )
+
+            embed.add_field(
+                name="Alts",
+                value=", ".join(validated_alts) or "none",
+                inline=False
+            )
+
+            await log_channel.send(embed=embed)
+
+        await interaction.followup.send(
+            f"✅ Updated {member.mention}\n"
+            f"**Main:** {roblox_name}\n"
+            f"**Alts:** {', '.join(validated_alts) or 'none'}",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print("[memberedit]", repr(e))
+
+        await interaction.followup.send(
+            f"❌ Update failed.\n```{e}```",
+            ephemeral=True
+        )
         
 # ---------------- STATUS COMMAND ----------------
 @bot.tree.command(name="status", description="Check Roblox status", guild=guild_obj)
