@@ -144,18 +144,6 @@ def db_find_roblox_link(roblox_id):
 
     return None
 
-def db_get_all_tracked():
-    if not db_enabled():
-        return []
-
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT roblox_id, discord_id, username FROM users
-            UNION ALL
-            SELECT roblox_id, discord_id, username FROM user_alts
-        """)
-        return cur.fetchall()
-
 def db_add_alt(discord_id, roblox_id, username):
     if not db_enabled():
         return False, "Database is not available."
