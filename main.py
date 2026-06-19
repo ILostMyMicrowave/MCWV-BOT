@@ -154,7 +154,6 @@ def db_add_alt(discord_id, roblox_id, username):
 
     try:
         with conn.cursor() as cur:
-            # prevent the same Roblox account from being linked elsewhere
             cur.execute("""
                 SELECT discord_id
                 FROM users
@@ -180,17 +179,18 @@ def db_add_alt(discord_id, roblox_id, username):
             cur.execute("""
                 INSERT INTO user_alts (discord_id, roblox_id, username)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (discord_id, roblox_id)
-                DO UPDATE SET username = EXCLUDED.username
             """, (did, rid, uname))
 
         conn.commit()
         return True, f"Added **{uname}** as an alt."
 
     except Exception as e:
-        conn.rollback()
-        print("db_add_alt error:", e)
-        return False, "Failed to add alt."
+        print("db_add_alt error:", repr(e))
+        try:
+            conn.rollback()
+        except Exception as rollback_error:
+            print("rollback failed:", repr(rollback_error))
+        return False, f"Database error: {e}"
 
 
 def db_remove_alt(discord_id, alt_value):
