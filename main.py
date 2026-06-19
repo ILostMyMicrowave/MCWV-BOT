@@ -2703,21 +2703,128 @@ from discord import app_commands
 async def addalt(interaction: discord.Interaction, member: discord.Member, roblox_username: str):
     await interaction.response.defer(ephemeral=True)
 
-    try:
-        resolved = await resolve_roblox_username(roblox_username)
+    global session, conn
 
-        if not resolved:
+    if not db_enabled():
+        return await interaction.followup.send(
+            "❌ Database is not available.",
+            ephemeral=True
+        )
+
+    try:
+        # Clear any previous failed transaction first
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        roblox_username = roblox_username.strip()
+
+        if not re.fullmatch(r"^[A-Za-z0-9_]{3,20}$", roblox_username):
             return await interaction.followup.send(
-                "❌ Roblox username not found.",
+                "❌ Invalid Roblox username. Use one username only, with no extra words.",
                 ephemeral=True
             )
 
-        roblox_id = str(resolved["id"]).strip()
-        username = str(resolved["name"]).strip()
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
 
-        ok, msg = db_add_alt(member.id, roblox_id, username)
-        if not ok:
-            return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+        # Resolve Roblox username
+        async with session.post(
+            "https://users.roblox.com/v1/usernames/users",
+            json={"usernames": [roblox_username], "excludeBannedUsers": False}
+        ) as r:
+            if r.status != 200:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return await interaction.followup.send(
+                    f"❌ Roblox API error (HTTP {r.status}).",
+                    ephemeral=True
+                )
+
+            data = await r.json()
+
+        results = data.get("data", [])
+        if not results:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return await interaction.followup.send(
+                f"❌ Roblox user `{roblox_username}` not found.",
+                ephemeral=True
+            )
+
+        roblox_id = str(results[0]["id"]).strip()
+        username = str(results[0]["name"]).strip()
+
+        # Insert only into user_alts
+        with conn.cursor() as cur:
+            # Check if already linked as a main account
+            cur.execute("""
+                SELECT discord_id
+                FROM users
+                WHERE roblox_id = %s
+            """, (roblox_id,))
+            row = cur.fetchone()
+            if row:
+                if int(row[0]) == member.id:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    return await interaction.followup.send(
+                        "❌ That Roblox account is already their main account.",
+                        ephemeral=True
+                    )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return await interaction.followup.send(
+                    f"❌ That Roblox account is already linked to <@{row[0]}>.",
+                    ephemeral=True
+                )
+
+            # Check if already linked as an alt
+            cur.execute("""
+                SELECT discord_id
+                FROM user_alts
+                WHERE roblox_id = %s
+            """, (roblox_id,))
+            row = cur.fetchone()
+            if row:
+                if int(row[0]) == member.id:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    return await interaction.followup.send(
+                        "❌ That Roblox account is already added as an alt for this member.",
+                        ephemeral=True
+                    )
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return await interaction.followup.send(
+                    f"❌ That Roblox account is already linked as an alt to <@{row[0]}>.",
+                    ephemeral=True
+                )
+
+            cur.execute("""
+                INSERT INTO user_alts (discord_id, roblox_id, username)
+                VALUES (%s, %s, %s)
+            """, (int(member.id), roblox_id, username))
+
+        conn.commit()
+
+        # Clear caches for this alt in case it was already seen before
+        status_cache.pop(roblox_id, None)
+        status_cache_time.pop(roblox_id, None)
+        offline_since.pop(roblox_id, None)
 
         await interaction.followup.send(
             f"✅ Added **{username}** as an alt for {member.mention}.",
@@ -2725,8 +2832,15 @@ async def addalt(interaction: discord.Interaction, member: discord.Member, roblo
         )
 
     except Exception as e:
-        print("addalt error:", e)
-        await interaction.followup.send("❌ Failed to add alt.", ephemeral=True)
+        print("[addalt] error:", repr(e))
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        await interaction.followup.send(
+            f"❌ Failed to add alt.\n```{type(e).__name__}: {e}```",
+            ephemeral=True
+        )
 
 @bot.tree.command(
     name="listalts",
