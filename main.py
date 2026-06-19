@@ -747,7 +747,7 @@ guild_obj = discord.Object(id=GUILD_ID)
 # ---------------- BOT ----------------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!!", intents=intents)
 cooldowns = commands.CooldownMapping.from_cooldown(
     1, 10, commands.BucketType.user
 )
