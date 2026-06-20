@@ -32,6 +32,24 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+def ensure_db_connection():
+    global conn
+
+    try:
+        if conn is None or conn.closed:
+            print("🔄 Reconnecting to database...")
+
+            conn = psycopg2.connect(
+                DATABASE_URL,
+                sslmode="require"
+            )
+
+            conn.autocommit = False
+
+    except Exception as e:
+        print("Database reconnect failed:", repr(e))
+        raise
+
 def db_get_all_alts():
     if not db_enabled():
         return []
@@ -818,11 +836,19 @@ else:
     print("DATABASE_URL not set - running without DB")
 
 
-def db_add(rid, did, name):
+def db_add(roblox_id, discord_id, username):
     if not db_enabled():
-        return
+        return False, "Database is not available."
+
+    global conn
 
     try:
+        ensure_db_connection()
+
+        rid = str(roblox_id).strip()
+        did = int(discord_id)
+        uname = str(username).strip()
+
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO users (roblox_id, discord_id, username)
@@ -831,12 +857,21 @@ def db_add(rid, did, name):
                 DO UPDATE SET
                     discord_id = EXCLUDED.discord_id,
                     username = EXCLUDED.username
-            """, (str(rid).strip(), int(did), str(name).strip()))
-        conn.commit()
-    except Exception as e:
-        print("db_add error:", e)
-        conn.rollback()
+            """, (rid, did, uname))
 
+        conn.commit()
+        return True, f"Linked {uname}"
+
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        error = f"{type(e).__name__}: {e}"
+        print("db_add error:", error)
+
+        return False, error
 
 def db_remove(did):
     if not db_enabled():
@@ -1087,7 +1122,11 @@ async def ping(interaction: discord.Interaction):
 @bot.tree.command(name="add", description="Link Roblox user", guild=guild_obj)
 @require_role()
 async def add(interaction: discord.Interaction, member: discord.Member, roblox_username: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
 
     url = "https://users.roblox.com/v1/usernames/users"
 
@@ -1095,40 +1134,49 @@ async def add(interaction: discord.Interaction, member: discord.Member, roblox_u
         async with session.post(
             url,
             json={
-                "usernames": [roblox_username],
+                "usernames": [roblox_username.strip()],
                 "excludeBannedUsers": False
             }
         ) as r:
+            if r.status != 200:
+                return await interaction.followup.send(
+                    f"❌ Roblox API error (HTTP {r.status}).",
+                    ephemeral=True
+                )
+
             data = await r.json()
 
         results = data.get("data", [])
-
         if not results:
             return await interaction.followup.send(
                 "❌ Roblox user not found.",
                 ephemeral=True
             )
 
-        rid = str(results[0]["id"])
-        name = results[0]["name"]
+        rid = str(results[0]["id"]).strip()
+        name = str(results[0]["name"]).strip()
 
-        try:
-            db_add(rid, member.id, name)
-        except Exception as db_error:
-            print("DB ERROR:", db_error)
+        ok, msg = db_add(rid, member.id, name)
+        if not ok:
             return await interaction.followup.send(
-                "❌ Database error occurred.",
+                f"❌ {msg}",
                 ephemeral=True
             )
 
         await interaction.followup.send(
-            f"✅ Linked {member.mention} → **{name}**"
+            f"✅ Linked {member.mention} → **{name}**",
+            ephemeral=True
         )
 
     except Exception as e:
-        print("Roblox API error:", e)
+        print("Roblox API error:", repr(e))
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
         await interaction.followup.send(
-            "❌ Roblox API error.",
+            f"❌ Roblox API error: `{type(e).__name__}: {e}`",
             ephemeral=True
         )
 
