@@ -44,6 +44,7 @@ def db_get_all_alts():
             """)
             return cur.fetchall()
     except Exception as e:
+        conn.rollback()
         print("db_get_all_alts error:", e)
         return []
 
@@ -60,6 +61,7 @@ def db_get_main_link(discord_id):
             """, (int(discord_id),))
             return cur.fetchone()
     except Exception as e:
+        conn.rollback()
         print("db_get_main_link error:", e)
         return None
 
@@ -78,6 +80,7 @@ def db_get_alts(discord_id):
             """, (int(discord_id),))
             return cur.fetchall()
     except Exception as e:
+        conn.rollback()
         print("db_get_alts error:", e)
         return []
 
@@ -99,6 +102,7 @@ def db_get_all_tracked():
             """)
             return cur.fetchall()
     except Exception as e:
+        conn.rollback()
         print("db_get_all_tracked error:", e)
         return []
 
@@ -140,6 +144,7 @@ def db_find_roblox_link(roblox_id):
                 }
 
     except Exception as e:
+        conn.rollback()
         print("db_find_roblox_link error:", e)
 
     return None
@@ -271,23 +276,6 @@ def get_current_war(war_data, clan_data):
         battle_id = list(battles.keys())[-1]
 
     return battle_id, battles.get(battle_id)
-
-def db_add_alt(discord_id, roblox_id, roblox_name):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO alts (
-                discord_id,
-                roblox_id,
-                roblox_name
-            )
-            VALUES (%s, %s, %s)
-            ON CONFLICT (roblox_id)
-            DO UPDATE SET
-                discord_id = EXCLUDED.discord_id,
-                roblox_name = EXCLUDED.roblox_name
-        """, (discord_id, roblox_id, roblox_name))
-
-    conn.commit()
 
 async def run_initial_presence_check(channel):
     try:
