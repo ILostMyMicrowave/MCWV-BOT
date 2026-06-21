@@ -763,10 +763,11 @@ CLAN_MEMBER_ROLE_ID       = 1501986780667314246  # given on accept
 CLAN_MEMBERS_CATEGORY_ID  = 1503109089931034785  # ticket moved here on accept
 MEMBERS_CHANNEL_ID        = 1509276380674789617  # membership record posted here
 LOG_CHANNEL_ID            = 1502001938705682622  # accept/action log
-PS99_API                  = "https://ps99.biggamesapi.io/api/activeClanBattle"
+PS99_API                  = "https://ps99.biggamesapi.io"
 CLAN_NAME                 = "MCWV"
 CLAN_API                  = f"https://ps99.biggamesapi.io/api/clan/{CLAN_NAME}"
 ROBLOX_USERS_API          = "https://users.roblox.com/v1/users"
+
 
 if not TOKEN:
     raise ValueError("Missing DISCORD_TOKEN")
