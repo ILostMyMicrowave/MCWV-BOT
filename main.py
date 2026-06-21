@@ -1963,7 +1963,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         roblox_id = str(resolved["id"])
         roblox_name = resolved["name"]
 
-# ---------------- DB LOOKUP ----------------
+        # ---------------- DB LOOKUP ----------------
         db_users = db_get_all()
         linked = next((u for u in db_users if str(u[0]).strip() == roblox_id.strip()), None)
 
@@ -1972,7 +1972,10 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         discord_member = None
         if discord_id and interaction.guild:
-            discord_member = await interaction.guild.fetch_member(int(discord_id))
+            try:
+                discord_member = await interaction.guild.fetch_member(int(discord_id))
+            except Exception:
+                discord_member = None
 
         discord_display = (
             discord_member.mention if discord_member else
@@ -1993,18 +1996,12 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             if OWNER_ROLE_ID in role_ids:
                 role = guild.get_role(OWNER_ROLE_ID)
                 clan_role = role.mention if role else "Owner"
-
             elif OFFICER_ROLE_ID in role_ids:
                 role = guild.get_role(OFFICER_ROLE_ID)
                 clan_role = role.mention if role else "Officer"
-
             elif MEMBER_ROLE_ID in role_ids:
                 role = guild.get_role(MEMBER_ROLE_ID)
                 clan_role = role.mention if role else "Member"
-
-        # ---------------- PLACEHOLDERS ----------------
-        last_online = "Unknown"
-        game_rank = "Unknown"
 
         global session
         if session is None or session.closed:
@@ -2076,56 +2073,55 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                         rank = i
                         break
 
-            wins = int(battle.get("Wins", 0) or 0)
-
+        # ---------------- PS99 DATA ----------------
         extended_data, profile_data, inventory_data = await get_profile_bundle(session, roblox_id)
 
         view = ProfileView(extended_data, inventory_data, profile_data, roblox_name)
-
-        embed = discord.Embed(
-            title=f"📇 Player Profile — {roblox_name}",
-            description=(
-                f"**Linked Status:** {linked_status}"
-            ),
-            color=discord.Color.blurple()
-        )
 
         avatar_url = (
             discord_member.display_avatar.url
             if discord_member
             else interaction.user.display_avatar.url
         )
+
+        is_linked = linked_status == "Linked"
+
+        embed = discord.Embed(
+            title=f"📇 Player Profile — {roblox_name}",
+            color=discord.Color.blurple()
+        )
+
         embed.set_thumbnail(url=avatar_url)
 
-        embed.add_field(name="🎮 Roblox Username", value=roblox_name, inline=True)
-        embed.add_field(name="💬 Discord Tag", value=discord_display, inline=True)
+        embed.add_field(name="🎮 Username", value=roblox_name, inline=True)
+        embed.add_field(name="💬 Discord", value=discord_display, inline=True)
         embed.add_field(name="🆔 Roblox ID", value=roblox_id, inline=True)
 
-        embed.add_field(name="🏷️ Clan Role", value=clan_role, inline=True)
-        embed.add_field(name="🔗 Linked", value=linked_status, inline=True)
-        
+        embed.add_field(
+            name="🔗 Account Status",
+            value="Linked" if is_linked else "Not Linked",
+            inline=True
+        )
+
+        if clan_role and clan_role != "None":
+            embed.add_field(name="🏷️ Clan Role", value=clan_role, inline=True)
+
         if battle:
             embed.add_field(
-                name="📊 War Stats",
+                name="⚔️ War Activity",
                 value=(
                     f"Points: **{points:,}**\n"
-                    f"Placement: **#{rank if rank else 'N/A'}**\n"
-                    f"Wars Participated: **{war_count}**"
+                    f"Rank: **#{rank if rank else 'N/A'}**\n"
+                    f"Wars: **{war_count}**"
                 ),
                 inline=False
             )
         else:
             embed.add_field(
-                name="📊 War Stats",
-                value=(
-                    f"Points: **0**\n"
-                    f"Placement: **N/A**\n"
-                    f"Wars Participated: **{war_count}**"
-                ),
+                name="⚔️ War Activity",
+                value="No active war participation",
                 inline=False
             )
-
-        embed.add_field(name="🎖️ Player Rank", value=game_rank, inline=True)
 
         embed.set_footer(
             text=f"MCWV Profile Dashboard • Requested by {interaction.user.display_name}"
