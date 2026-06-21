@@ -32,6 +32,46 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+PROFILE_CACHE = {}
+CACHE_TTL = 300  # 5 minutes
+
+async def get_profile_bundle(session, roblox_id):
+    import time
+
+    now = time.time()
+
+    # return cached if valid
+    if roblox_id in PROFILE_CACHE:
+        data, expiry = PROFILE_CACHE[roblox_id]
+        if now < expiry:
+            return data
+
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with session.get(
+        f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=extendedProfile",
+        timeout=timeout
+    ) as r:
+        extended_data = await r.json()
+
+    async with session.get(
+        f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=profile",
+        timeout=timeout
+    ) as r:
+        profile_data = await r.json()
+
+    async with session.get(
+        f"{PS99_API}/api/v1/account/inventory?userId={roblox_id}",
+        timeout=timeout
+    ) as r:
+        inventory_data = await r.json()
+
+    bundle = (extended_data, profile_data, inventory_data)
+
+    PROFILE_CACHE[roblox_id] = (bundle, now + CACHE_TTL)
+
+    return bundle
+
 def ensure_db_connection():
     global conn
 
@@ -1844,6 +1884,65 @@ class ProfileView(discord.ui.View):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# ---------------- GAME STATS BUTTON ----------------
+    @discord.ui.button(label="🎖 Game Stats", style=discord.ButtonStyle.gray)
+    async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        profile = self.profile.get("views", {}).get("profile", {}).get("data", {})
+        stats = profile.get("Statistics", {})
+        mastery = profile.get("Mastery", {})
+        enchants = self.inventory.get("equipped", {}).get("enchants", {}).get("list", [])
+
+        rank = profile.get("Rank", "Unknown")
+        rebirths = profile.get("Rebirths", "Unknown")
+
+        eggs_opened = stats.get("Eggs Opened", 0)
+        playtime = stats.get("Playtime", 0)
+        huge_pets = stats.get("Huge Pets Opened", 0)
+
+        def fmt(n):
+            return f"{n:,}" if isinstance(n, int) else str(n)
+
+        enchant_text = "\n".join(
+            f"✨ {e.get('displayName', 'Unknown')}  (Lvl {e.get('level', 0)})"
+            for e in enchants
+        ) or "None"
+
+        mastery_text = "\n".join(
+            f"• {k}: {v}"
+            for k, v in list(mastery.items())[:8]
+        ) or "None"
+
+        embed = discord.Embed(
+            title=f"🎖 Game Stats — {self.roblox_name}",
+            description="📊 Player Progress Overview",
+            color=discord.Color.gold()
+        )
+
+        embed.add_field(name="🏆 Rank", value=f"**{rank}**", inline=True)
+        embed.add_field(name="🔁 Rebirths", value=f"**{rebirths}**", inline=True)
+        embed.add_field(name="💀 Huge Pets", value=f"**{fmt(huge_pets)}**", inline=True)
+
+        embed.add_field(name="🥚 Eggs Opened", value=f"**{fmt(eggs_opened)}**", inline=True)
+        embed.add_field(name="⏱ Playtime", value=f"**{fmt(playtime)}**", inline=True)
+        embed.add_field(name=" ", value=" ", inline=True)
+
+        embed.add_field(
+            name="🧪 Mastery",
+            value=mastery_text,
+            inline=False
+        )
+
+        embed.add_field(
+            name="⚡ Enchants",
+            value=enchant_text,
+            inline=False
+        )
+
+        embed.set_footer(text="PS99 Player Stats • MCWV Dashboard")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(
     name="profile",
     description="View a Roblox-linked user profile dashboard",
@@ -2003,19 +2102,9 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
             wins = int(battle.get("Wins", 0) or 0)
 
-        async with session.get(
-            f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=extendedProfile",
-            timeout=timeout
-        ) as r:
-            extended_data = await r.json()
+        extended_data, profile_data, inventory_data = await get_profile_bundle(session, roblox_id)
 
-        async with session.get(
-            f"{PS99_API}/api/v1/account/profile?userId={roblox_id}",
-            timeout=timeout
-        ) as r:
-            inventory_data = await r.json()
-
-        view = ProfileView(extended_data, inventory_data, roblox_name)
+        view = ProfileView(extended_data, inventory_data, profile_data, roblox_name)
 
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
