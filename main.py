@@ -1920,9 +1920,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             description=(
-                f"**Clan Role:** {clan_role}\n"
                 f"**Linked Status:** {linked_status}\n"
-                f"**Game Rank:** {game_rank}"
             ),
             color=discord.Color.blurple()
         )
