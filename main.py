@@ -1814,8 +1814,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         discord_member = None
         if discord_id and interaction.guild:
-            discord_member = interaction.guild.get_member(int(discord_id))
-
+            discord_member = await interaction.guild.fetch_member(int(discord_id))
         discord_display = (
             discord_member.mention if discord_member else
             (f"<@{discord_id}>" if discord_id else "Not linked")
