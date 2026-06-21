@@ -382,6 +382,7 @@ async def fetch_roblox_avatar(session, user_id):
         return None
 
 async def generate_profile_card(
+    *,
     session,
     roblox_name,
     roblox_id,
@@ -1895,7 +1896,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                         rank = i
                         break
 
-            # If your API has a wins field, keep it. Otherwise it stays 0.
             wins = int(battle.get("Wins", 0) or 0)
 
         # Animated bar progress: useful contribution percent
@@ -1904,6 +1904,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             bar_progress = min(points / top_points, 1.0)
 
         image_buffer = await generate_profile_card(
+            session=session,
             roblox_name=roblox_name,
             roblox_id=int(roblox_id),
             discord_tag=discord_display,
@@ -1911,7 +1912,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             rank=rank if rank else 0,
             top_points=top_points,
             animated=True,
-            bar_progress=bar_progress,   # make the bar actually mean something
+            bar_progress=bar_progress
         )
 
         file = discord.File(fp=image_buffer, filename="profile.gif")
