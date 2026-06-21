@@ -389,7 +389,8 @@ async def generate_profile_card(
     points,
     rank,
     top_points=1,
-    animated=True
+    animated=True,
+    bar_progress=0.0
 ):
     WIDTH, HEIGHT = 1400, 600
     frames = []
@@ -483,7 +484,7 @@ async def generate_profile_card(
         top_points = max(int(top_points or 1), 1)
         points = max(int(points or 0), 0)
 
-        progress = min(points / top_points, 1.0)
+        progress = max(0.0, min(bar_progress, 1.0))
 
         filled = int(bar_w * progress)
 
