@@ -1916,22 +1916,22 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         try:
             async with session.get(
-                f"https://groups.roblox.com/v1/users/{roblox_id}/groups/roles",
+                f"{PS99_API}/api/v1/account/profile?userId={roblox_id}",
                 timeout=timeout
             ) as r:
-                group_data = await r.json()
+                profile_data = await r.json()
 
-            groups = group_data.get("data", [])
+            data = profile_data.get("data", profile_data)
 
-            if groups:
-                top_group = max(
-                    groups,
-                    key=lambda g: g.get("role", {}).get("rank", 0)
-                )
-                current_clan = top_group.get("group", {}).get("name") or "None"
+            current_clan = (
+                data.get("Clan")
+                or data.get("ClanName")
+                or data.get("Guild")
+                or "None"
+            )
 
         except Exception as e:
-            print("[profile] group API error:", e)
+            print("[profile] clan lookup error:", e)
 
         # ---------------- WAR DATA ----------------
         battle = None
