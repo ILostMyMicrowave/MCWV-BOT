@@ -1911,9 +1911,30 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         timeout = aiohttp.ClientTimeout(total=10)
 
+# ---------------- CLAN DATA ----------------
+        current_clan = "None"
+
+        try:
+            async with session.get(
+                f"https://groups.roblox.com/v1/users/{roblox_id}/groups/roles",
+                timeout=timeout
+            ) as r:
+                group_data = await r.json()
+
+            groups = group_data.get("data", [])
+
+            if groups:
+                top_group = max(
+                    groups,
+                    key=lambda g: g.get("role", {}).get("rank", 0)
+                )
+                current_clan = top_group.get("group", {}).get("name") or "None"
+
+        except Exception as e:
+            print("[profile] group API error:", e)
+
         # ---------------- WAR DATA ----------------
         battle = None
-        battle_name = "No war active"
         points = 0
         rank = None
         top_points = 0
@@ -1937,11 +1958,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
                         if start <= now <= end:
                             battle = b_data
-                            battle_name = re.sub(
-                                r'(\d+)',
-                                r' \1',
-                                re.sub(r'([A-Z])', r' \1', str(b_id))
-                            ).strip()
 
                             contributions = sorted(
                                 battle.get("PointContributions", []),
@@ -2018,8 +2034,8 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         embed.add_field(name="🏷️ Clan Role", value=clan_role, inline=True)
         embed.add_field(name="🔗 Linked", value=linked_status, inline=True)
-        embed.add_field(name="⚔️ War Status", value=battle_name, inline=True)
-
+        embed.add_field(name="🏷️ Current Clan", value=current_clan, inline=True)
+        
         if battle:
             embed.add_field(
                 name="📊 War Stats",
