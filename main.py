@@ -2029,6 +2029,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
 
     try:
+        # ---------------- RESOLVE USER ----------------
         resolved = await resolve_roblox_username(roblox_username)
         if not resolved:
             return await interaction.followup.send(
@@ -2058,6 +2059,29 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             (f"<@{discord_id}>" if discord_id else "Not linked")
         )
 
+        # ---------------- ROLE CHECK ----------------
+        OWNER_ROLE_ID = 1501985344843813038
+        OFFICER_ROLE_ID = 1501986357516701827
+        MEMBER_ROLE_ID = 1501986780667314246
+
+        clan_role = None
+
+        if discord_member:
+            role_ids = {r.id for r in discord_member.roles}
+
+            if OWNER_ROLE_ID in role_ids:
+                role = discord_member.guild.get_role(OWNER_ROLE_ID)
+                clan_role = role.mention if role else "Owner"
+
+            elif OFFICER_ROLE_ID in role_ids:
+                role = discord_member.guild.get_role(OFFICER_ROLE_ID)
+                clan_role = role.mention if role else "Officer"
+
+            elif MEMBER_ROLE_ID in role_ids:
+                role = discord_member.guild.get_role(MEMBER_ROLE_ID)
+                clan_role = role.mention if role else "Member"
+
+        # ---------------- SESSION ----------------
         global session
         if session is None or session.closed:
             session = aiohttp.ClientSession()
@@ -2105,19 +2129,19 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         except Exception as e:
             print("[profile] war API error:", e)
 
-        # ---------------- PS99 DATA ----------------
+        # ---------------- PS99 API ----------------
         extended_data, profile_data, inventory_data = await get_profile_bundle(session, roblox_id)
 
         view = ProfileView(extended_data, inventory_data, profile_data, roblox_name)
 
-        profile_payload = profile_data.get("data", profile_data) if isinstance(profile_data, dict) else {}
-
+        # ---------------- AVATAR ----------------
         avatar_url = (
             discord_member.display_avatar.url
             if discord_member
             else interaction.user.display_avatar.url
         )
 
+        # ---------------- EMBED (IDENTICAL STYLE) ----------------
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             color=discord.Color.blurple()
@@ -2125,36 +2149,34 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         embed.set_thumbnail(url=avatar_url)
 
-        embed.add_field(name="🎮 Roblox Username", value=roblox_name, inline=True)
-        embed.add_field(name="💬 Discord Tag", value=discord_display, inline=True)
-        embed.add_field(name="🆔 Roblox ID", value=roblox_id, inline=True)
+        embed.add_field(name="🎮 Username", value=roblox_name, inline=False)
+        embed.add_field(name="💬 Discord", value=discord_display, inline=False)
+        embed.add_field(name="🆔 Roblox ID", value=roblox_id, inline=False)
 
-        embed.add_field(name="🔗 Linked", value=linked_status, inline=True)
+        embed.add_field(name="🔗 Account Status", value=linked_status, inline=False)
+
+        embed.add_field(
+            name="🏷️ Clan Role",
+            value=clan_role or "None",
+            inline=False
+        )
 
         if battle:
             embed.add_field(
-                name="📊 War Stats",
+                name="⚔️ War Activity",
                 value=(
                     f"Points: **{points:,}**\n"
-                    f"Placement: **#{rank if rank else 'N/A'}**\n"
-                    f"Wars Participated: **{war_count}**"
+                    f"Rank: **#{rank if rank else 'N/A'}**\n"
+                    f"Wars: **{war_count}**"
                 ),
                 inline=False
             )
         else:
             embed.add_field(
-                name="📊 War Stats",
-                value=(
-                    f"Points: **0**\n"
-                    f"Placement: **N/A**\n"
-                    f"Wars Participated: **{war_count}**"
-                ),
+                name="⚔️ War Activity",
+                value="No active war participation",
                 inline=False
             )
-
-        if isinstance(profile_payload, dict):
-            embed.add_field(name="🎖️ Player Rank", value=profile_payload.get("Rank", "Unknown"), inline=True)
-            embed.add_field(name="🔁 Rebirths", value=profile_payload.get("Rebirths", "Unknown"), inline=True)
 
         embed.set_footer(
             text=f"MCWV Profile Dashboard • Requested by {interaction.user.display_name}"
