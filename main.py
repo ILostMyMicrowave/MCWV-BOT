@@ -1805,9 +1805,9 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         roblox_id = str(resolved["id"])
         roblox_name = resolved["name"]
 
-        # ---------------- DB LOOKUP ----------------
+# ---------------- DB LOOKUP ----------------
         db_users = db_get_all()
-        linked = next((u for u in db_users if str(u[0]) == roblox_id), None)
+        linked = next((u for u in db_users if str(u[0]).strip() == roblox_id.strip()), None)
 
         discord_id = str(linked[1]) if linked and linked[1] else None
         linked_status = "Linked" if discord_id else "Not linked"
@@ -1815,6 +1815,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         discord_member = None
         if discord_id and interaction.guild:
             discord_member = await interaction.guild.fetch_member(int(discord_id))
+
         discord_display = (
             discord_member.mention if discord_member else
             (f"<@{discord_id}>" if discord_id else "Not linked")
@@ -1855,11 +1856,11 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         # ---------------- WAR DATA ----------------
         battle = None
-        battle_name = "No active war"
+        battle_name = "No war active"
         points = 0
         rank = None
-        wins = 0
         top_points = 0
+        war_count = 0
 
         try:
             async with session.get(CLAN_API, timeout=timeout) as clan_r:
@@ -1869,29 +1870,40 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
                     now = datetime.now(timezone.utc).timestamp()
 
-                    active = None
-                    latest = None
-                    latest_start = -1
-
                     for b_id, b_data in battles.items():
                         start = b_data.get("StartTime", 0) or 0
                         end = b_data.get("FinishTime", 0) or 0
+                        contributions = b_data.get("PointContributions", [])
 
-                        if start > latest_start:
-                            latest_start = start
-                            latest = (b_id, b_data)
+                        if any(str(e.get("UserID")) == roblox_id for e in contributions):
+                            war_count += 1
 
                         if start <= now <= end:
-                            active = (b_id, b_data)
+                            battle = b_data
+                            battle_name = re.sub(
+                                r'(\d+)',
+                                r' \1',
+                                re.sub(r'([A-Z])', r' \1', str(b_id))
+                            ).strip()
 
-                    chosen = active or latest
-                    if chosen:
-                        battle_id, battle = chosen
-                        battle_name = re.sub(
-                            r'(\d+)',
-                            r' \1',
-                            re.sub(r'([A-Z])', r' \1', str(battle_id))
-                        ).strip()
+                            contributions = sorted(
+                                battle.get("PointContributions", []),
+                                key=lambda x: x.get("Points", 0),
+                                reverse=True
+                            )
+
+                            if contributions:
+                                top_points = max(
+                                    (e.get("Points", 0) for e in contributions),
+                                    default=0
+                                )
+
+                                for i, entry in enumerate(contributions, start=1):
+                                    if str(entry.get("UserID")) == roblox_id:
+                                        points = int(entry.get("Points", 0) or 0)
+                                        rank = i
+                                        break
+                            break
 
         except Exception as e:
             print("[profile] war API error:", e)
@@ -1936,7 +1948,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             description=(
-                f"**Linked Status:** {linked_status}\n"
+                f"**Linked Status:** {linked_status}"
             ),
             color=discord.Color.blurple()
         )
@@ -1952,26 +1964,28 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         embed.add_field(name="💬 Discord Tag", value=discord_display, inline=True)
         embed.add_field(name="🆔 Roblox ID", value=roblox_id, inline=True)
 
-        embed.add_field(name="⏱️ Last Online / Activity", value=last_online, inline=True)
         embed.add_field(name="🏷️ Clan Role", value=clan_role, inline=True)
         embed.add_field(name="🔗 Linked", value=linked_status, inline=True)
-
-        embed.add_field(name="⚔️ War Status", value=battle_name, inline=False)
+        embed.add_field(name="⚔️ War Status", value=battle_name, inline=True)
 
         if battle:
             embed.add_field(
                 name="📊 War Stats",
                 value=(
                     f"Points: **{points:,}**\n"
-                    f"Wins: **{wins:,}**\n"
-                    f"Placement: **#{rank if rank else 'N/A'}**"
+                    f"Placement: **#{rank if rank else 'N/A'}**\n"
+                    f"Wars Participated: **{war_count}**"
                 ),
                 inline=False
             )
         else:
             embed.add_field(
                 name="📊 War Stats",
-                value="No active war.",
+                value=(
+                    f"Points: **0**\n"
+                    f"Placement: **N/A**\n"
+                    f"Wars Participated: **{war_count}**"
+                ),
                 inline=False
             )
 
