@@ -1796,7 +1796,7 @@ class ProfileView(discord.ui.View):
     # ---------------- STATS BUTTON ----------------
     @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
     async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        extended = self.extended.get("extendedProfile", {})
+        extended = self.extended
 
         robux_spent = extended.get("RobuxSpent", 0)
         gamepasses = extended.get("Gamepasses", {})
@@ -1818,9 +1818,8 @@ class ProfileView(discord.ui.View):
     # ---------------- INVENTORY BUTTON ----------------
     @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.blurple)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        inv = self.inventory.get("inventory", {})
-        equipped = inv.get("equipped", {})
-        pets = equipped.get("pets", {}).get("list", [])
+        inv = self.inventory.get("equipped", {})
+        pets = inv.get("pets", {}).get("list", [])
 
         if not pets:
             pet_text = "No pets equipped."
@@ -1830,8 +1829,8 @@ class ProfileView(discord.ui.View):
                 for p in pets
             )
 
-        hoverboard = equipped.get("hoverboard", {}).get("displayName", "None")
-        ultimate = equipped.get("ultimate", {}).get("displayName", "None")
+        hoverboard = inv.get("hoverboard", {}).get("displayName", "None")
+        ultimate = inv.get("ultimate", {}).get("displayName", "None")
 
         embed = discord.Embed(
             title=f"🎒 Inventory — {self.roblox_name}",
@@ -2007,7 +2006,13 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         ) as r:
             extended_data = await r.json()
 
-        view = ProfileView(extended_data, roblox_name)
+        async with session.get(
+            f"{PS99_API}/api/v1/account/profile?userId={roblox_id}",
+            timeout=timeout
+        ) as r:
+            inventory_data = await r.json()
+
+        view = ProfileView(extended_data, inventory_data, roblox_name)
 
         file = discord.File(fp=image_buffer, filename="profile.gif")
 
