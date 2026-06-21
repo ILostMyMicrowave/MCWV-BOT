@@ -1828,10 +1828,11 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         )
 
 class ProfileView(discord.ui.View):
-    def __init__(self, extended_data, inventory_data, roblox_name):
+    def __init__(self, extended_data, inventory_data, profile_data, roblox_name):
         super().__init__(timeout=120)
         self.extended = extended_data
         self.inventory = inventory_data
+        self.profile = profile_data
         self.roblox_name = roblox_name
 
     # ---------------- STATS BUTTON ----------------
