@@ -1917,19 +1917,22 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         try:
             async with session.get(
-                f"{PS99_API}/api/v1/account/profile?userId={roblox_id}",
+                "https://ps99.biggamesapi.io/api/clans",
                 timeout=timeout
             ) as r:
-                profile_data = await r.json()
+                data = await r.json()
 
-            data = profile_data.get("data", profile_data)
+            clans = data.get("data") or data.get("clans") or []
 
-            current_clan = (
-                data.get("Clan")
-                or data.get("ClanName")
-                or data.get("Guild")
-                or "None"
-            )
+            for clan in clans:
+                members = clan.get("Members") or clan.get("members") or []
+
+                if any(
+                    str(m.get("UserID") or m.get("userId")) == roblox_id
+                    for m in members
+                ):
+                    current_clan = clan.get("Name") or clan.get("name") or "None"
+                    break
 
         except Exception as e:
             print("[profile] clan lookup error:", e)
