@@ -1786,6 +1786,64 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
             ephemeral=True
         )
 
+class ProfileView(discord.ui.View):
+    def __init__(self, extended_data, inventory_data, roblox_name):
+        super().__init__(timeout=120)
+        self.extended = extended_data
+        self.inventory = inventory_data
+        self.roblox_name = roblox_name
+
+    # ---------------- STATS BUTTON ----------------
+    @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
+    async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        extended = self.extended.get("extendedProfile", {})
+
+        robux_spent = extended.get("RobuxSpent", 0)
+        gamepasses = extended.get("Gamepasses", {})
+
+        gamepasses_text = "\n".join(
+            f"✔ {name}" for name, owned in gamepasses.items() if owned
+        ) or "None"
+
+        embed = discord.Embed(
+            title=f"💰 Extended Stats — {self.roblox_name}",
+            color=discord.Color.gold()
+        )
+
+        embed.add_field(name="💸 Robux Spent", value=f"**{robux_spent:,}**", inline=True)
+        embed.add_field(name="🎟️ Gamepasses", value=gamepasses_text, inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ---------------- INVENTORY BUTTON ----------------
+    @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.blurple)
+    async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        inv = self.inventory.get("inventory", {})
+        equipped = inv.get("equipped", {})
+        pets = equipped.get("pets", {}).get("list", [])
+
+        if not pets:
+            pet_text = "No pets equipped."
+        else:
+            pet_text = "\n".join(
+                f"🐾 {p.get('displayName', 'Unknown')}"
+                for p in pets
+            )
+
+        hoverboard = equipped.get("hoverboard", {}).get("displayName", "None")
+        ultimate = equipped.get("ultimate", {}).get("displayName", "None")
+
+        embed = discord.Embed(
+            title=f"🎒 Inventory — {self.roblox_name}",
+            color=discord.Color.blue()
+        )
+
+        embed.add_field(name="🐾 Equipped Pets", value=pet_text, inline=False)
+        embed.add_field(name="🛹 Hoverboard", value=hoverboard, inline=True)
+        embed.add_field(name="⚡ Ultimate", value=ultimate, inline=True)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(
     name="profile",
     description="View a Roblox-linked user profile dashboard",
@@ -1943,6 +2001,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             bar_progress=bar_progress
         )
 
+        async with session.get(
+            f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=extendedProfile",
+            timeout=timeout
+        ) as r:
+            extended_data = await r.json()
+
+        view = ProfileView(extended_data, roblox_name)
+
         file = discord.File(fp=image_buffer, filename="profile.gif")
 
         embed = discord.Embed(
@@ -1996,7 +2062,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             text=f"MCWV Profile Dashboard • Requested by {interaction.user.display_name}"
         )
 
-        await interaction.followup.send(embed=embed, file=file)
+        await interaction.followup.send(embed=embed, file=file, view=view)
 
     except Exception as e:
         print("[profile] error:", repr(e))
