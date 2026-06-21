@@ -1983,23 +1983,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
             wins = int(battle.get("Wins", 0) or 0)
 
-        # Animated bar progress: useful contribution percent
-        bar_progress = 0.0
-        if top_points > 0:
-            bar_progress = min(points / top_points, 1.0)
-
-        image_buffer = await generate_profile_card(
-            session=session,
-            roblox_name=roblox_name,
-            roblox_id=int(roblox_id),
-            discord_tag=discord_display,
-            points=points,
-            rank=rank if rank else 0,
-            top_points=top_points,
-            animated=True,
-            bar_progress=bar_progress
-        )
-
         async with session.get(
             f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=extendedProfile",
             timeout=timeout
@@ -2013,8 +1996,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             inventory_data = await r.json()
 
         view = ProfileView(extended_data, inventory_data, roblox_name)
-
-        file = discord.File(fp=image_buffer, filename="profile.gif")
 
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
@@ -2062,12 +2043,11 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         embed.add_field(name="🎖️ Player Rank", value=game_rank, inline=True)
 
-        embed.set_image(url="attachment://profile.gif")
         embed.set_footer(
             text=f"MCWV Profile Dashboard • Requested by {interaction.user.display_name}"
         )
 
-        await interaction.followup.send(embed=embed, file=file, view=view)
+        await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
         print("[profile] error:", repr(e))
