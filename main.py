@@ -408,51 +408,50 @@ async def generate_profile_card(
 
     for frame in range(8 if animated else 1):
 
-    img = Image.new("RGBA", (WIDTH, HEIGHT))
-    draw = ImageDraw.Draw(img)
+        img = Image.new("RGBA", (WIDTH, HEIGHT))
+        draw = ImageDraw.Draw(img)
 
-    # -------- FAST ANIMATED GRADIENT --------
-    shift = math.sin(frame * 0.35) * 80
-    shift2 = math.cos(frame * 0.25) * 60
+        # -------- FAST ANIMATED GRADIENT --------
+        shift = math.sin(frame * 0.35) * 80
+        shift2 = math.cos(frame * 0.25) * 60
 
-    step = 10  # bigger = faster, slightly less smooth
+        step = 10  # bigger = faster, slightly less smooth
 
-    for y in range(0, HEIGHT, step):
+        for y in range(0, HEIGHT, step):
+            ny = (y + shift2) / HEIGHT
 
-        ny = (y + shift2) / HEIGHT
+            r_base = 20 + 60 * abs(math.sin(ny * 3.14 + frame * 0.2))
+            g_base = 25 + 50 * abs(math.sin(ny * 3.14 + frame * 0.15))
+            b_base = 60 + 120 * abs(math.sin(ny * 3.14 + frame * 0.25))
 
-        r_base = 20 + 60 * abs(math.sin(ny * 3.14 + frame * 0.2))
-        g_base = 25 + 50 * abs(math.sin(ny * 3.14 + frame * 0.15))
-        b_base = 60 + 120 * abs(math.sin(ny * 3.14 + frame * 0.25))
+            color = (
+                int(r_base),
+                int(g_base),
+                int(b_base)
+            )
 
-        color = (
-            int(r_base),
-            int(g_base),
-            int(b_base)
-        )
+            draw.rectangle(
+                [0, y, WIDTH, y + step],
+                fill=color
+            )
 
-        draw.rectangle(
-            [0, y, WIDTH, y + step],
-            fill=color
-        )
+        # -------- PARTICLES --------
+        for i, (px, py, size) in enumerate(particles):
+            offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
 
-    # -------- PARTICLES --------
-    for i, (px, py, size) in enumerate(particles):
-        offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
-
-        draw.ellipse(
-            [
-                px + offset,
-                py + offset,
-                px + size + offset,
-                py + size + offset
-            ],
-            fill=(120, 160, 255, 120)
-        )
+            draw.ellipse(
+                [
+                    px + offset,
+                    py + offset,
+                    px + size + offset,
+                    py + size + offset
+                ],
+                fill=(120, 160, 255, 120)
+            )
 
         # panel
         draw.rounded_rectangle(
-            [40, 40, WIDTH-40, HEIGHT-40],
+            [40, 40, WIDTH - 40, HEIGHT - 40],
             radius=35,
             fill=(20, 22, 30)
         )
@@ -461,19 +460,19 @@ async def generate_profile_card(
         if avatar:
             img.paste(avatar, (80, 90), avatar)
 
-        # NAME (clean layered glow)
-        draw.text((352, 72), roblox_name, fill=(80,140,255), font=title_font)
+        # NAME
+        draw.text((352, 72), roblox_name, fill=(80, 140, 255), font=title_font)
         draw.text((350, 70), roblox_name, fill="white", font=title_font)
 
         # info block
-        draw.text((355, 175), discord_tag, fill=(200,200,200), font=small_font)
-        draw.text((355, 215), f"Roblox ID: {roblox_id}", fill=(160,160,160), font=small_font)
+        draw.text((355, 175), discord_tag, fill=(200, 200, 200), font=small_font)
+        draw.text((355, 215), f"Roblox ID: {roblox_id}", fill=(160, 160, 160), font=small_font)
 
         # rank
         draw.text(
             (355, 255),
             f"Rank: #{rank}" if rank else "Rank: Unranked",
-            fill=(255,220,120) if rank else (150,150,150),
+            fill=(255, 220, 120) if rank else (150, 150, 150),
             font=small_font
         )
 
@@ -485,7 +484,6 @@ async def generate_profile_card(
         points = max(int(points or 0), 0)
 
         progress = max(0.0, min(bar_progress, 1.0))
-
         filled = int(bar_w * progress)
 
         # background
@@ -504,9 +502,8 @@ async def generate_profile_card(
             )
 
         # labels
-        draw.text((350, 300), "WAR PROGRESS", fill=(180,180,180), font=small_font)
-        draw.text((bar_x + bar_w - 90, bar_y), f"{int(progress*100)}%", fill="white", font=small_font)
-
+        draw.text((350, 300), "WAR PROGRESS", fill=(180, 180, 180), font=small_font)
+        draw.text((bar_x + bar_w - 90, bar_y), f"{int(progress * 100)}%", fill="white", font=small_font)
         draw.text((355, 410), f"{points:,} POINTS", fill="white", font=big_font)
 
         frames.append(img)
