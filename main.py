@@ -1830,29 +1830,67 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
 class ProfileView(discord.ui.View):
     def __init__(self, extended_data, inventory_data, profile_data, roblox_name):
         super().__init__(timeout=120)
-        self.extended = extended_data
-        self.inventory = inventory_data
-        self.profile = profile_data
+        self.extended = extended_data or {}
+        self.inventory = inventory_data or {}
+        self.profile = profile_data or {}
         self.roblox_name = roblox_name
+
+    def _unwrap(self, data):
+        if not isinstance(data, dict):
+            return {}
+        return data.get("data", data)
+
+    def _extended_data(self):
+        data = self._unwrap(self.extended)
+        return data.get("extendedProfile", data)
+
+    def _profile_data(self):
+        data = self._unwrap(self.profile)
+        return data.get("profile", data)
+
+    def _inventory_data(self):
+        data = self._unwrap(self.inventory)
+        return data.get("inventory", data)
+
+    def _fmt(self, value):
+        if isinstance(value, int):
+            return f"{value:,}"
+        return str(value)
+
+    def _format_playtime(self, seconds):
+        try:
+            seconds = int(seconds or 0)
+        except Exception:
+            return "0h"
+
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+
+        if days > 0:
+            return f"{days}d {hours}h"
+        return f"{hours}h"
 
     # ---------------- STATS BUTTON ----------------
     @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
     async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        extended = self.extended
+        extended = self._extended_data()
 
         robux_spent = extended.get("RobuxSpent", 0)
         gamepasses = extended.get("Gamepasses", {})
 
-        gamepasses_text = "\n".join(
-            f"✔ {name}" for name, owned in gamepasses.items() if owned
-        ) or "None"
+        if isinstance(gamepasses, dict):
+            owned_passes = [name for name, owned in gamepasses.items() if owned]
+        else:
+            owned_passes = []
+
+        gamepasses_text = "\n".join(f"✔ {name}" for name in owned_passes) or "None"
 
         embed = discord.Embed(
             title=f"💰 Extended Stats — {self.roblox_name}",
             color=discord.Color.gold()
         )
 
-        embed.add_field(name="💸 Robux Spent", value=f"**{robux_spent:,}**", inline=True)
+        embed.add_field(name="💸 Robux Spent", value=f"**{self._fmt(robux_spent)}**", inline=True)
         embed.add_field(name="🎟️ Gamepasses", value=gamepasses_text, inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1860,39 +1898,68 @@ class ProfileView(discord.ui.View):
     # ---------------- INVENTORY BUTTON ----------------
     @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.blurple)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        inv = self.inventory.get("equipped", {})
-        pets = inv.get("pets", {}).get("list", [])
+        inv = self._inventory_data()
+
+        equipped = inv.get("equipped", inv)
+
+        pets = (
+            equipped.get("pets", {}).get("list", [])
+            if isinstance(equipped.get("pets"), dict)
+            else equipped.get("pets", [])
+        )
 
         if not pets:
             pet_text = "No pets equipped."
         else:
             pet_text = "\n".join(
-                f"🐾 {p.get('displayName', 'Unknown')}"
+                f"🐾 {p.get('displayName', p.get('id', 'Unknown'))}"
                 for p in pets
-            )
+                if isinstance(p, dict)
+            ) or "No pets equipped."
 
-        hoverboard = inv.get("hoverboard", {}).get("displayName", "None")
-        ultimate = inv.get("ultimate", {}).get("displayName", "None")
+        hoverboard = equipped.get("hoverboard", {})
+        ultimate = equipped.get("ultimate", {})
+
+        hoverboard_name = (
+            hoverboard.get("displayName")
+            if isinstance(hoverboard, dict)
+            else "None"
+        ) or "None"
+
+        ultimate_name = (
+            ultimate.get("displayName")
+            if isinstance(ultimate, dict)
+            else "None"
+        ) or "None"
 
         embed = discord.Embed(
             title=f"🎒 Inventory — {self.roblox_name}",
             color=discord.Color.blue()
         )
 
-        embed.add_field(name="🐾 Equipped Pets", value=pet_text, inline=False)
-        embed.add_field(name="🛹 Hoverboard", value=hoverboard, inline=True)
-        embed.add_field(name="⚡ Ultimate", value=ultimate, inline=True)
+        embed.add_field(name="🐾 Equipped Pets", value=pet_text[:1024], inline=False)
+        embed.add_field(name="🛹 Hoverboard", value=hoverboard_name, inline=True)
+        embed.add_field(name="⚡ Ultimate", value=ultimate_name, inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------- GAME STATS BUTTON ----------------
+    # ---------------- GAME STATS BUTTON ----------------
     @discord.ui.button(label="🎖 Game Stats", style=discord.ButtonStyle.gray)
     async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        profile = self._profile_data()
 
-        profile = self.profile.get("views", {}).get("profile", {}).get("data", {})
-        stats = profile.get("Statistics", {})
-        mastery = profile.get("Mastery", {})
-        enchants = self.inventory.get("equipped", {}).get("enchants", {}).get("list", [])
+        stats = (
+            profile.get("Statistics")
+            or profile.get("Stats")
+            or profile.get("stats")
+            or {}
+        )
+
+        mastery = (
+            profile.get("Mastery")
+            or profile.get("mastery")
+            or {}
+        )
 
         rank = profile.get("Rank", "Unknown")
         rebirths = profile.get("Rebirths", "Unknown")
@@ -1901,18 +1968,34 @@ class ProfileView(discord.ui.View):
         playtime = stats.get("Playtime", 0)
         huge_pets = stats.get("Huge Pets Opened", 0)
 
+        inv = self._inventory_data()
+        equipped = inv.get("equipped", inv)
+
+        enchants = (
+            equipped.get("enchants", {}).get("list", [])
+            if isinstance(equipped.get("enchants"), dict)
+            else equipped.get("enchants", [])
+        )
+
+        if not isinstance(enchants, list):
+            enchants = []
+
         def fmt(n):
             return f"{n:,}" if isinstance(n, int) else str(n)
 
-        enchant_text = "\n".join(
-            f"✨ {e.get('displayName', 'Unknown')}  (Lvl {e.get('level', 0)})"
-            for e in enchants
-        ) or "None"
+        mastery_lines = []
+        if isinstance(mastery, dict):
+            for k, v in list(mastery.items())[:8]:
+                mastery_lines.append(f"• **{k}**: {v}")
+        mastery_text = "\n".join(mastery_lines) or "None"
 
-        mastery_text = "\n".join(
-            f"• {k}: {v}"
-            for k, v in list(mastery.items())[:8]
-        ) or "None"
+        enchant_lines = []
+        for e in enchants:
+            if isinstance(e, dict):
+                name = e.get("displayName", e.get("id", "Unknown"))
+                lvl = e.get("level", 0)
+                enchant_lines.append(f"✨ **{name}**  `Lvl {lvl}`")
+        enchant_text = "\n".join(enchant_lines) or "None"
 
         embed = discord.Embed(
             title=f"🎖 Game Stats — {self.roblox_name}",
@@ -1925,20 +2008,11 @@ class ProfileView(discord.ui.View):
         embed.add_field(name="💀 Huge Pets", value=f"**{fmt(huge_pets)}**", inline=True)
 
         embed.add_field(name="🥚 Eggs Opened", value=f"**{fmt(eggs_opened)}**", inline=True)
-        embed.add_field(name="⏱ Playtime", value=f"**{fmt(playtime)}**", inline=True)
+        embed.add_field(name="⏱ Playtime", value=f"**{self._format_playtime(playtime)}**", inline=True)
         embed.add_field(name=" ", value=" ", inline=True)
 
-        embed.add_field(
-            name="🧪 Mastery",
-            value=mastery_text,
-            inline=False
-        )
-
-        embed.add_field(
-            name="⚡ Enchants",
-            value=enchant_text,
-            inline=False
-        )
+        embed.add_field(name="🧪 Mastery", value=mastery_text[:1024], inline=False)
+        embed.add_field(name="⚡ Enchants", value=enchant_text[:1024], inline=False)
 
         embed.set_footer(text="PS99 Player Stats • MCWV Dashboard")
 
