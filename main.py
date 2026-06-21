@@ -407,27 +407,47 @@ async def generate_profile_card(
 
     for frame in range(8 if animated else 1):
 
-        img = Image.new("RGBA", (WIDTH, HEIGHT))
-        draw = ImageDraw.Draw(img)
+    img = Image.new("RGBA", (WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(img)
 
-        # gradient background
-        for y in range(HEIGHT):
-            draw.line(
-                [(0, y), (WIDTH, y)],
-                fill=(
-                    int(10 + (45 - 10) * (y / HEIGHT)),
-                    int(15 + (30 - 15) * (y / HEIGHT)),
-                    int(40 + (120 - 40) * (y / HEIGHT)),
-                )
-            )
+    # -------- FAST ANIMATED GRADIENT --------
+    shift = math.sin(frame * 0.35) * 80
+    shift2 = math.cos(frame * 0.25) * 60
 
-        # particles
-        for i, (x, y, size) in enumerate(particles):
-            offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
-            draw.ellipse(
-                [x + offset, y + offset, x + size + offset, y + size + offset],
-                fill=(120, 160, 255, 120)
-            )
+    step = 10  # bigger = faster, slightly less smooth
+
+    for y in range(0, HEIGHT, step):
+
+        ny = (y + shift2) / HEIGHT
+
+        r_base = 20 + 60 * abs(math.sin(ny * 3.14 + frame * 0.2))
+        g_base = 25 + 50 * abs(math.sin(ny * 3.14 + frame * 0.15))
+        b_base = 60 + 120 * abs(math.sin(ny * 3.14 + frame * 0.25))
+
+        color = (
+            int(r_base),
+            int(g_base),
+            int(b_base)
+        )
+
+        draw.rectangle(
+            [0, y, WIDTH, y + step],
+            fill=color
+        )
+
+    # -------- PARTICLES --------
+    for i, (px, py, size) in enumerate(particles):
+        offset = math.sin(frame * 0.6 + i) * 2 if animated else 0
+
+        draw.ellipse(
+            [
+                px + offset,
+                py + offset,
+                px + size + offset,
+                py + size + offset
+            ],
+            fill=(120, 160, 255, 120)
+        )
 
         # panel
         draw.rounded_rectangle(
