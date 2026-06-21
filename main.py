@@ -1821,13 +1821,30 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             (f"<@{discord_id}>" if discord_id else "Not linked")
         )
 
-        clan_role = "Unknown"
-        if discord_member:
-            non_everyone_roles = [r.name for r in discord_member.roles if r.name != "@everyone"]
-            clan_role = non_everyone_roles[-1] if non_everyone_roles else "Member"
+        # ---------------- CLAN ROLE (DISCORD ROLE SYNC) ----------------
+        OWNER_ROLE_ID = 1501985344843813038
+        OFFICER_ROLE_ID = 1501986357516701827
+        MEMBER_ROLE_ID = 1501986780667314246
 
-        # Use whatever you store in your DB for this.
-        # If you do not have it yet, keep it as "Unknown" until you add it.
+        clan_role = "None"
+
+        if discord_member:
+            role_ids = {role.id for role in discord_member.roles}
+            guild = discord_member.guild
+
+            if OWNER_ROLE_ID in role_ids:
+                role = guild.get_role(OWNER_ROLE_ID)
+                clan_role = role.mention if role else "Owner"
+
+            elif OFFICER_ROLE_ID in role_ids:
+                role = guild.get_role(OFFICER_ROLE_ID)
+                clan_role = role.mention if role else "Officer"
+
+            elif MEMBER_ROLE_ID in role_ids:
+                role = guild.get_role(MEMBER_ROLE_ID)
+                clan_role = role.mention if role else "Member"
+
+        # ---------------- PLACEHOLDERS ----------------
         last_online = "Unknown"
         game_rank = "Unknown"
 
