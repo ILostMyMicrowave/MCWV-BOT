@@ -2018,7 +2018,7 @@ class ProfileView(discord.ui.View):
 
         embed.set_footer(text="PS99 Player Stats • MCWV Dashboard")
 
-        await interaction.response.send_message(embed=embed, ephemeral=True))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(
     name="profile",
