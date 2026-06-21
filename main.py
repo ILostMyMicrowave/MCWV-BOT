@@ -2011,31 +2011,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         timeout = aiohttp.ClientTimeout(total=10)
 
-# ---------------- CLAN DATA ----------------
-        current_clan = "None"
-
-        try:
-            async with session.get(
-                "https://ps99.biggamesapi.io/api/clans",
-                timeout=timeout
-            ) as r:
-                data = await r.json()
-
-            clans = data.get("data") or data.get("clans") or []
-
-            for clan in clans:
-                members = clan.get("Members") or clan.get("members") or []
-
-                if any(
-                    str(m.get("UserID") or m.get("userId")) == roblox_id
-                    for m in members
-                ):
-                    current_clan = clan.get("Name") or clan.get("name") or "None"
-                    break
-
-        except Exception as e:
-            print("[profile] clan lookup error:", e)
-
         # ---------------- WAR DATA ----------------
         battle = None
         points = 0
@@ -2127,7 +2102,6 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         embed.add_field(name="🏷️ Clan Role", value=clan_role, inline=True)
         embed.add_field(name="🔗 Linked", value=linked_status, inline=True)
-        embed.add_field(name="🏷️ Current Clan", value=current_clan, inline=True)
         
         if battle:
             embed.add_field(
