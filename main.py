@@ -3460,8 +3460,16 @@ async def memberedit(
                         if validated_alts else "none"
                     )
 
+                    lines = msg.content.splitlines()
+
+                    channel_line = (
+                        lines[0]
+                        if lines
+                        else member.mention
+                    )
+
                     new_content = (
-                        f"<#{msg.channel.id}> {member.mention}\n"
+                        f"{channel_line}\n"
                         f"user:{roblox_name}\n"
                         f"alt:{alt_text}"
                     )
