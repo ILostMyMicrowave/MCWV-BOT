@@ -51,19 +51,36 @@ async def get_profile_bundle(session, user_id):
     url = f"{PS99_API}/api/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
     async with session.get(url, timeout=timeout) as r:
-        response = await r.json()
+        data = await r.json()
 
-    payload = response.get("data", {}) if isinstance(response, dict) else {}
-    account = payload.get("account", {}) if isinstance(payload, dict) else {}
-    views = payload.get("views", {}) if isinstance(payload, dict) else {}
+    # ---------------- SAFE ROOT HANDLING ----------------
+    root = data.get("data", data)
 
-    public_views = account.get("publicViews", {}) if isinstance(account, dict) else {}
+    views = root.get("views", root)
 
-    profile_data = views.get("profile", {})
-    inventory_data = views.get("inventory", {})
-    extended_data = views.get("extendedProfile", {})
+    profile_data = (
+        views.get("profile")
+        or root.get("profile")
+        or {}
+    )
+
+    inventory_data = (
+        views.get("inventory")
+        or root.get("inventory")
+        or {}
+    )
+
+    extended_data = (
+        views.get("extendedProfile")
+        or root.get("extendedProfile")
+        or {}
+    )
+
+    account = root.get("account", {})
+    public_views = account.get("publicViews", account.get("public_views", {}))
 
     bundle = (extended_data, profile_data, inventory_data, public_views)
+
     PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
 
     return bundle
