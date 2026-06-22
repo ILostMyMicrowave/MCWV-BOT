@@ -34,9 +34,26 @@ def run_web():
 Thread(target=run_web, daemon=True).start()
 
 PROFILE_CACHE = {}
-CACHE_TTL = 60  # adjust if you want
+CACHE_TTL = 60
 
 PS99_API = "https://ps99.biggamesapi.io"
+
+# log channel ID here
+LOG_CHANNEL_ID = 1502001938705682622
+
+
+async def log_error(session, message):
+    print("[PS99 API ERROR]", message)
+
+    # If you want Discord logging
+    if LOG_CHANNEL_ID:
+        try:
+            channel = bot.get_channel(LOG_CHANNEL_ID)
+            if channel:
+                await channel.send(f"⚠️ PS99 API Error:\n```{message}```")
+        except:
+            pass
+
 
 async def get_profile_bundle(session, user_id):
     now = time.time()
@@ -50,34 +67,36 @@ async def get_profile_bundle(session, user_id):
 
     url = f"{PS99_API}/api/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
-    async with session.get(url, timeout=timeout) as r:
-        data = await r.json()
+    try:
+        async with session.get(url, timeout=timeout) as r:
+            data = await r.json()
 
-    # ---------------- SAFE ROOT HANDLING ----------------
+    except Exception as e:
+        await log_error(session, f"Request failed: {e}")
+        return {}, {}, {}, {}
+
+    # ---------------- DEBUG SAFETY ----------------
+    if not isinstance(data, dict):
+        await log_error(session, f"Non-dict response: {data}")
+        return {}, {}, {}, {}
+
     root = data.get("data", data)
 
-    views = root.get("views", root)
+    if not isinstance(root, dict):
+        await log_error(session, f"Bad root format: {root}")
+        return {}, {}, {}, {}
 
-    profile_data = (
-        views.get("profile")
-        or root.get("profile")
-        or {}
-    )
+    views = root.get("views", {})
 
-    inventory_data = (
-        views.get("inventory")
-        or root.get("inventory")
-        or {}
-    )
+    if not isinstance(views, dict):
+        await log_error(session, f"Missing views for user {user_id}: {views}")
 
-    extended_data = (
-        views.get("extendedProfile")
-        or root.get("extendedProfile")
-        or {}
-    )
+    profile_data = views.get("profile") or root.get("profile") or {}
+    inventory_data = views.get("inventory") or root.get("inventory") or {}
+    extended_data = views.get("extendedProfile") or root.get("extendedProfile") or {}
 
-    account = root.get("account", {})
-    public_views = account.get("publicViews", account.get("public_views", {}))
+    account = root.get("account", {}) if isinstance(root, dict) else {}
+    public_views = account.get("publicViews", account.get("public_views", {})) if isinstance(account, dict) else {}
 
     bundle = (extended_data, profile_data, inventory_data, public_views)
 
