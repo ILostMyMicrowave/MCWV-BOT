@@ -41,7 +41,6 @@ PS99_API = "https://ps99.biggamesapi.io"
 async def get_profile_bundle(session, user_id):
     now = time.time()
 
-    # ---------------- CACHE ----------------
     if user_id in PROFILE_CACHE:
         data, expiry = PROFILE_CACHE[user_id]
         if now < expiry:
@@ -49,23 +48,22 @@ async def get_profile_bundle(session, user_id):
 
     timeout = aiohttp.ClientTimeout(total=10)
 
-    # ---------------- MAIN PLAYER REQUEST ----------------
     url = f"{PS99_API}/api/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
     async with session.get(url, timeout=timeout) as r:
-        data = await r.json()
+        response = await r.json()
 
-    # ---------------- SAFE EXTRACTION ----------------
-    views = data.get("views", {})
-    account = data.get("account", {})
-    public_views = account.get("publicViews", {})
+    payload = response.get("data", {}) if isinstance(response, dict) else {}
+    account = payload.get("account", {}) if isinstance(payload, dict) else {}
+    views = payload.get("views", {}) if isinstance(payload, dict) else {}
 
-    profile_data = views.get("profile") or {}
-    inventory_data = views.get("inventory") or {}
-    extended_data = views.get("extendedProfile") or {}
+    public_views = account.get("publicViews", {}) if isinstance(account, dict) else {}
+
+    profile_data = views.get("profile", {})
+    inventory_data = views.get("inventory", {})
+    extended_data = views.get("extendedProfile", {})
 
     bundle = (extended_data, profile_data, inventory_data, public_views)
-
     PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
 
     return bundle
