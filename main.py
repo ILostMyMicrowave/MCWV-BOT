@@ -1860,13 +1860,14 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         )
 
 class ProfileView(discord.ui.View):
-    def __init__(self, extended_data, inventory_data, profile_data, roblox_name, public_views):
+    def __init__(self, extended_data, inventory_data, profile_data, roblox_name, public_views, roblox_id):
         super().__init__(timeout=120)
 
         self.extended = extended_data or {}
         self.inventory = inventory_data or {}
         self.profile = profile_data or {}
         self.roblox_name = roblox_name
+        self.roblox_id = roblox_id
         self.public_views = public_views or {}
 
     def _unwrap(self, data):
@@ -1893,6 +1894,9 @@ class ProfileView(discord.ui.View):
         if hours > 0:
             return f"{hours}h"
         return "0h"
+
+    def _split_text(self, text, size=1900):
+        return [text[i:i + size] for i in range(0, len(text), size)]
 
     # ---------------- PROFILE STATS BUTTON ----------------
     @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
@@ -2042,6 +2046,45 @@ class ProfileView(discord.ui.View):
         embed.set_footer(text="PS99 Player Stats • MCWV Dashboard")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ---------------- DEBUG BUTTON ----------------
+    @discord.ui.button(label="🔧 Debug", style=discord.ButtonStyle.red)
+    async def debug_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            import json
+
+            url = f"{PS99_API}/api/v1/players/{self.roblox_id}?include=profile,inventory,extendedProfile"
+
+            timeout = aiohttp.ClientTimeout(total=10)
+
+            async with session.get(url, timeout=timeout) as r:
+                data = await r.json()
+
+            pretty = json.dumps(data, indent=2, ensure_ascii=False)
+            chunks = self._split_text(pretty, 1800)
+
+            await interaction.response.send_message(
+                f"```json\n{chunks[0]}\n```",
+                ephemeral=True
+            )
+
+            for chunk in chunks[1:3]:
+                await interaction.followup.send(
+                    f"```json\n{chunk}\n```",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ Debug failed: `{e}`",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ Debug failed: `{e}`",
+                    ephemeral=True
+                )
         
 @bot.tree.command(
     name="profile",
@@ -2152,7 +2195,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         except Exception as e:
             print("[profile] war API error:", e)
 
-        # ---------------- PS99 API ----------------
+# ---------------- PS99 API ----------------
         extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(session, roblox_id)
 
         view = ProfileView(
@@ -2160,7 +2203,8 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             inventory_data,
             profile_data,
             roblox_name,
-            public_views
+            public_views,
+            roblox_id
         )
         
         # ---------------- AVATAR ----------------
