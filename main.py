@@ -9,6 +9,7 @@ from io import BytesIO
 import math
 import random
 from datetime import datetime, timezone
+import time
 
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -33,47 +34,39 @@ def run_web():
 Thread(target=run_web, daemon=True).start()
 
 PROFILE_CACHE = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 60  # adjust if you want
 
-async def get_profile_bundle(session, roblox_id):
-    import time
+PS99_API = "https://ps99.biggamesapi.io"
 
+async def get_profile_bundle(session, user_id):
     now = time.time()
 
-    if roblox_id in PROFILE_CACHE:
-        data, expiry = PROFILE_CACHE[roblox_id]
+    # ---------------- CACHE ----------------
+    if user_id in PROFILE_CACHE:
+        data, expiry = PROFILE_CACHE[user_id]
         if now < expiry:
             return data
 
     timeout = aiohttp.ClientTimeout(total=10)
 
-    async with session.get(
-        f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=extendedProfile",
-        timeout=timeout
-    ) as r:
-        print("EXTENDED STATUS:", r.status)
-        extended_data = await r.json()
-        print("EXTENDED:", extended_data)
+    # ---------------- MAIN PLAYER REQUEST ----------------
+    url = f"{PS99_API}/api/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
-    async with session.get(
-        f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=profile",
-        timeout=timeout
-    ) as r:
-        print("PROFILE STATUS:", r.status)
-        profile_data = await r.json()
-        print("PROFILE:", profile_data)
+    async with session.get(url, timeout=timeout) as r:
+        data = await r.json()
 
-    async with session.get(
-        f"{PS99_API}/api/v1/account/inventory?userId={roblox_id}",
-        timeout=timeout
-    ) as r:
-        print("INVENTORY STATUS:", r.status)
-        inventory_data = await r.json()
-        print("INVENTORY:", inventory_data)
+    # ---------------- SAFE EXTRACTION ----------------
+    views = data.get("views", {})
+    account = data.get("account", {})
+    public_views = account.get("publicViews", {})
 
-    bundle = (extended_data, profile_data, inventory_data)
+    profile_data = views.get("profile") or {}
+    inventory_data = views.get("inventory") or {}
+    extended_data = views.get("extendedProfile") or {}
 
-    PROFILE_CACHE[roblox_id] = (bundle, now + CACHE_TTL)
+    bundle = (extended_data, profile_data, inventory_data, public_views)
+
+    PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
 
     return bundle
 
@@ -1833,18 +1826,22 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         )
 
 class ProfileView(discord.ui.View):
-    def __init__(self, extended_data, inventory_data, profile_data, roblox_name):
+    def __init__(self, extended_data, inventory_data, profile_data, roblox_name, public_views):
         super().__init__(timeout=120)
+
         self.extended = extended_data or {}
         self.inventory = inventory_data or {}
         self.profile = profile_data or {}
         self.roblox_name = roblox_name
+        self.public_views = public_views or {}
 
+    # ---------------- SAFE UNWRAP ----------------
     def _unwrap(self, data):
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
             return data["data"]
         return data if isinstance(data, dict) else {}
 
+    # ---------------- FORMAT HELPERS ----------------
     def _fmt(self, value):
         if isinstance(value, int):
             return f"{value:,}"
@@ -1853,7 +1850,7 @@ class ProfileView(discord.ui.View):
     def _format_playtime(self, seconds):
         try:
             seconds = int(seconds or 0)
-        except Exception:
+        except:
             return "0h"
 
         days = seconds // 86400
@@ -1865,123 +1862,108 @@ class ProfileView(discord.ui.View):
             return f"{hours}h"
         return "0h"
 
-    # ---------------- PROFILE STATS BUTTON ----------------
+    # =========================================================
+    # 💰 EXTENDED PROFILE
+    # =========================================================
     @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
     async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        extended = self._unwrap(self.extended)
 
-        has_extended = any(
-            key in extended for key in ("RobuxSpent", "Gamepasses", "Products")
-        )
-
-        if not has_extended:
-            embed = discord.Embed(
-                title=f"💰 Extended Stats — {self.roblox_name}",
-                description=(
-                    "🔒 Extended profile is not enabled for this user.\n\n"
-                    "It needs to be public before these fields can be shown."
-                ),
-                color=discord.Color.red()
+        if not self.public_views.get("extendedProfile", False):
+            return await interaction.response.send_message(
+                "🔒 Extended profile is private for this user.",
+                ephemeral=True
             )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        extended = self._unwrap(self.extended)
 
         robux_spent = extended.get("RobuxSpent", 0)
         gamepasses = extended.get("Gamepasses", {})
         products = extended.get("Products", {})
 
         owned_passes = (
-            [name for name, owned in gamepasses.items() if owned]
+            [k for k, v in gamepasses.items() if v]
             if isinstance(gamepasses, dict)
             else []
         )
 
+        product_text = "None"
         if isinstance(products, dict):
-            product_lines = []
-            for name, info in list(products.items())[:10]:
-                if isinstance(info, dict):
-                    purchases = info.get("purchases", info.get("count", 0))
-                    product_lines.append(f"• {name} ×{purchases}")
+            lines = []
+            for k, v in list(products.items())[:10]:
+                if isinstance(v, dict):
+                    lines.append(f"• {k} ×{v.get('count', 0)}")
                 else:
-                    product_lines.append(f"• {name}")
-            product_text = "\n".join(product_lines) or "None"
-        else:
-            product_text = "None"
+                    lines.append(f"• {k}")
+            product_text = "\n".join(lines) or "None"
 
         embed = discord.Embed(
             title=f"💰 Extended Stats — {self.roblox_name}",
             color=discord.Color.gold()
         )
 
-        embed.add_field(name="💸 Robux Spent", value=f"**{self._fmt(robux_spent)}**", inline=True)
-        embed.add_field(
-            name="🎟️ Gamepasses",
-            value="\n".join(f"✔ {g}" for g in owned_passes) or "None",
-            inline=False
-        )
-        embed.add_field(
-            name="🧾 Products",
-            value=product_text[:1024],
-            inline=False
-        )
+        embed.add_field(name="💸 Robux Spent", value=self._fmt(robux_spent), inline=True)
+        embed.add_field(name="🎟️ Gamepasses", value="\n".join(owned_passes) or "None", inline=False)
+        embed.add_field(name="🧾 Products", value=product_text[:1024], inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---------------- INVENTORY BUTTON ----------------
+    # =========================================================
+    # 🎒 INVENTORY
+    # =========================================================
     @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.blurple)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        if not self.public_views.get("inventory", False):
+            return await interaction.response.send_message(
+                "🔒 Inventory is private for this user.",
+                ephemeral=True
+            )
+
         inv = self._unwrap(self.inventory)
         equipped = inv.get("equipped", {})
 
         pets = equipped.get("pets", {}).get("list", [])
         enchants = equipped.get("enchants", {}).get("list", [])
 
-        if not isinstance(pets, list):
-            pets = []
-        if not isinstance(enchants, list):
-            enchants = []
+        pets_text = "\n".join(
+            f"🐾 {p.get('displayName', p.get('id', 'Unknown'))}"
+            for p in pets if isinstance(p, dict)
+        ) or "No pets equipped."
 
-        if not pets:
-            pet_text = "No pets equipped."
-        else:
-            pet_text = "\n".join(
-                f"🐾 {p.get('displayName', p.get('id', 'Unknown'))}"
-                for p in pets
-                if isinstance(p, dict)
-            ) or "No pets equipped."
+        enchants_text = "\n".join(
+            f"✨ {e.get('displayName', e.get('id', 'Unknown'))} (Lvl {e.get('level', 0)})"
+            for e in enchants if isinstance(e, dict)
+        ) or "None"
 
-        if not enchants:
-            enchant_text = "None"
-        else:
-            enchant_text = "\n".join(
-                f"✨ {e.get('displayName', e.get('id', 'Unknown'))}  `Lvl {e.get('level', 0)}`"
-                for e in enchants
-                if isinstance(e, dict)
-            ) or "None"
-
-        hoverboard = equipped.get("hoverboard", {})
-        ultimate = equipped.get("ultimate", {})
-        booth = equipped.get("booth", {})
-
-        hoverboard_name = hoverboard.get("displayName", "None") if isinstance(hoverboard, dict) else "None"
-        ultimate_name = ultimate.get("displayName", "None") if isinstance(ultimate, dict) else "None"
-        booth_name = booth.get("displayName", "None") if isinstance(booth, dict) else "None"
+        hoverboard = equipped.get("hoverboard", {}).get("displayName", "None")
+        ultimate = equipped.get("ultimate", {}).get("displayName", "None")
+        booth = equipped.get("booth", {}).get("displayName", "None")
 
         embed = discord.Embed(
             title=f"🎒 Inventory — {self.roblox_name}",
             color=discord.Color.blue()
         )
 
-        embed.add_field(name="🐾 Equipped Pets", value=pet_text[:1024], inline=False)
-        embed.add_field(name="⚡ Equipped Enchants", value=enchant_text[:1024], inline=False)
-        embed.add_field(name="🛹 Hoverboard", value=hoverboard_name, inline=True)
-        embed.add_field(name="⚡ Ultimate", value=ultimate_name, inline=True)
-        embed.add_field(name="🏪 Booth", value=booth_name, inline=True)
+        embed.add_field(name="🐾 Pets", value=pets_text[:1024], inline=False)
+        embed.add_field(name="⚡ Enchants", value=enchants_text[:1024], inline=False)
+        embed.add_field(name="🛹 Hoverboard", value=hoverboard, inline=True)
+        embed.add_field(name="⚡ Ultimate", value=ultimate, inline=True)
+        embed.add_field(name="🏪 Booth", value=booth, inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---------------- GAME STATS BUTTON ----------------
+    # =========================================================
+    # 🎖 GAME STATS
+    # =========================================================
     @discord.ui.button(label="🎖 Game Stats", style=discord.ButtonStyle.gray)
     async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        if not self.public_views.get("profile", False):
+            return await interaction.response.send_message(
+                "🔒 Profile stats are private for this user.",
+                ephemeral=True
+            )
+
         profile = self._unwrap(self.profile)
 
         stats = profile.get("Statistics", {})
@@ -1990,41 +1972,35 @@ class ProfileView(discord.ui.View):
         rank = profile.get("Rank", "Unknown")
         rebirths = profile.get("Rebirths", "Unknown")
 
-        eggs_opened = stats.get("Eggs Opened", 0)
+        eggs = stats.get("Eggs Opened", 0)
         playtime = stats.get("Playtime", 0)
-        huge_pets = stats.get("Huge Pets Opened", 0)
-        login_count = stats.get("Login Count", 0)
+        huge = stats.get("Huge Pets Opened", 0)
+        login = stats.get("Login Count", 0)
 
-        mastery_lines = []
-        if isinstance(mastery, dict):
-            for k, v in list(mastery.items())[:8]:
-                mastery_lines.append(f"• **{k}**: {v}")
-        mastery_text = "\n".join(mastery_lines) or "None"
+        mastery_text = "\n".join(
+            f"• {k}: {v}"
+            for k, v in list(mastery.items())[:8]
+        ) or "None"
 
         embed = discord.Embed(
             title=f"🎖 Game Stats — {self.roblox_name}",
-            description="📊 Player Progress Overview",
             color=discord.Color.gold()
         )
 
-        embed.add_field(name="🏆 Rank", value=f"**{rank}**", inline=True)
-        embed.add_field(name="🔁 Rebirths", value=f"**{rebirths}**", inline=True)
-        embed.add_field(name="📈 Login Count", value=f"**{self._fmt(login_count)}**", inline=True)
+        embed.add_field(name="🏆 Rank", value=rank, inline=True)
+        embed.add_field(name="🔁 Rebirths", value=rebirths, inline=True)
+        embed.add_field(name="📈 Login Count", value=self._fmt(login), inline=True)
 
-        embed.add_field(name="🥚 Eggs Opened", value=f"**{self._fmt(eggs_opened)}**", inline=True)
-        embed.add_field(name="⏱ Playtime", value=f"**{self._format_playtime(playtime)}**", inline=True)
-        embed.add_field(name="💀 Huge Pets", value=f"**{self._fmt(huge_pets)}**", inline=True)
+        embed.add_field(name="🥚 Eggs", value=self._fmt(eggs), inline=True)
+        embed.add_field(name="⏱ Playtime", value=self._format_playtime(playtime), inline=True)
+        embed.add_field(name="💀 Huge Pets", value=self._fmt(huge), inline=True)
 
-        embed.add_field(
-            name="🧪 Mastery",
-            value=mastery_text[:1024],
-            inline=False
-        )
+        embed.add_field(name="🧪 Mastery", value=mastery_text[:1024], inline=False)
 
         embed.set_footer(text="PS99 Player Stats • MCWV Dashboard")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
+        
 @bot.tree.command(
     name="profile",
     description="View a Roblox-linked user profile dashboard",
@@ -2135,7 +2111,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             print("[profile] war API error:", e)
 
         # ---------------- PS99 API ----------------
-        extended_data, profile_data, inventory_data = await get_profile_bundle(session, roblox_id)
+        extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(session, roblox_id)
 
         view = ProfileView(extended_data, inventory_data, profile_data, roblox_name)
 
