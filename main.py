@@ -40,7 +40,6 @@ async def get_profile_bundle(session, roblox_id):
 
     now = time.time()
 
-    # return cached if valid
     if roblox_id in PROFILE_CACHE:
         data, expiry = PROFILE_CACHE[roblox_id]
         if now < expiry:
@@ -52,19 +51,25 @@ async def get_profile_bundle(session, roblox_id):
         f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=extendedProfile",
         timeout=timeout
     ) as r:
+        print("EXTENDED STATUS:", r.status)
         extended_data = await r.json()
+        print("EXTENDED:", extended_data)
 
     async with session.get(
         f"{PS99_API}/api/v1/account/profile?userId={roblox_id}&view=profile",
         timeout=timeout
     ) as r:
+        print("PROFILE STATUS:", r.status)
         profile_data = await r.json()
+        print("PROFILE:", profile_data)
 
     async with session.get(
         f"{PS99_API}/api/v1/account/inventory?userId={roblox_id}",
         timeout=timeout
     ) as r:
+        print("INVENTORY STATUS:", r.status)
         inventory_data = await r.json()
+        print("INVENTORY:", inventory_data)
 
     bundle = (extended_data, profile_data, inventory_data)
 
