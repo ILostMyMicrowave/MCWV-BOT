@@ -2119,8 +2119,14 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         # ---------------- PS99 API ----------------
         extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(session, roblox_id)
 
-        view = ProfileView(extended_data, inventory_data, profile_data, roblox_name)
-
+        view = ProfileView(
+            extended_data,
+            inventory_data,
+            profile_data,
+            roblox_name,
+            public_views
+        )
+        
         # ---------------- AVATAR ----------------
         avatar_url = (
             discord_member.display_avatar.url
