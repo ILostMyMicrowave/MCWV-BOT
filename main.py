@@ -1835,13 +1835,11 @@ class ProfileView(discord.ui.View):
         self.roblox_name = roblox_name
         self.public_views = public_views or {}
 
-    # ---------------- SAFE UNWRAP ----------------
     def _unwrap(self, data):
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
             return data["data"]
         return data if isinstance(data, dict) else {}
 
-    # ---------------- FORMAT HELPERS ----------------
     def _fmt(self, value):
         if isinstance(value, int):
             return f"{value:,}"
@@ -1850,7 +1848,7 @@ class ProfileView(discord.ui.View):
     def _format_playtime(self, seconds):
         try:
             seconds = int(seconds or 0)
-        except:
+        except Exception:
             return "0h"
 
         days = seconds // 86400
@@ -1862,12 +1860,9 @@ class ProfileView(discord.ui.View):
             return f"{hours}h"
         return "0h"
 
-    # =========================================================
-    # 💰 EXTENDED PROFILE
-    # =========================================================
+    # ---------------- PROFILE STATS BUTTON ----------------
     @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
     async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-
         if not self.public_views.get("extendedProfile", False):
             return await interaction.response.send_message(
                 "🔒 Extended profile is private for this user.",
@@ -1902,17 +1897,22 @@ class ProfileView(discord.ui.View):
         )
 
         embed.add_field(name="💸 Robux Spent", value=self._fmt(robux_spent), inline=True)
-        embed.add_field(name="🎟️ Gamepasses", value="\n".join(owned_passes) or "None", inline=False)
-        embed.add_field(name="🧾 Products", value=product_text[:1024], inline=False)
+        embed.add_field(
+            name="🎟️ Gamepasses",
+            value="\n".join(f"✔ {g}" for g in owned_passes) or "None",
+            inline=False
+        )
+        embed.add_field(
+            name="🧾 Products",
+            value=product_text[:1024],
+            inline=False
+        )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # =========================================================
-    # 🎒 INVENTORY
-    # =========================================================
+    # ---------------- INVENTORY BUTTON ----------------
     @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.blurple)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-
         if not self.public_views.get("inventory", False):
             return await interaction.response.send_message(
                 "🔒 Inventory is private for this user.",
@@ -1925,39 +1925,47 @@ class ProfileView(discord.ui.View):
         pets = equipped.get("pets", {}).get("list", [])
         enchants = equipped.get("enchants", {}).get("list", [])
 
+        if not isinstance(pets, list):
+            pets = []
+        if not isinstance(enchants, list):
+            enchants = []
+
         pets_text = "\n".join(
             f"🐾 {p.get('displayName', p.get('id', 'Unknown'))}"
-            for p in pets if isinstance(p, dict)
+            for p in pets
+            if isinstance(p, dict)
         ) or "No pets equipped."
 
         enchants_text = "\n".join(
             f"✨ {e.get('displayName', e.get('id', 'Unknown'))} (Lvl {e.get('level', 0)})"
-            for e in enchants if isinstance(e, dict)
+            for e in enchants
+            if isinstance(e, dict)
         ) or "None"
 
-        hoverboard = equipped.get("hoverboard", {}).get("displayName", "None")
-        ultimate = equipped.get("ultimate", {}).get("displayName", "None")
-        booth = equipped.get("booth", {}).get("displayName", "None")
+        hoverboard = equipped.get("hoverboard", {})
+        ultimate = equipped.get("ultimate", {})
+        booth = equipped.get("booth", {})
+
+        hoverboard_name = hoverboard.get("displayName", "None") if isinstance(hoverboard, dict) else "None"
+        ultimate_name = ultimate.get("displayName", "None") if isinstance(ultimate, dict) else "None"
+        booth_name = booth.get("displayName", "None") if isinstance(booth, dict) else "None"
 
         embed = discord.Embed(
             title=f"🎒 Inventory — {self.roblox_name}",
             color=discord.Color.blue()
         )
 
-        embed.add_field(name="🐾 Pets", value=pets_text[:1024], inline=False)
-        embed.add_field(name="⚡ Enchants", value=enchants_text[:1024], inline=False)
-        embed.add_field(name="🛹 Hoverboard", value=hoverboard, inline=True)
-        embed.add_field(name="⚡ Ultimate", value=ultimate, inline=True)
-        embed.add_field(name="🏪 Booth", value=booth, inline=True)
+        embed.add_field(name="🐾 Equipped Pets", value=pets_text[:1024], inline=False)
+        embed.add_field(name="⚡ Equipped Enchants", value=enchants_text[:1024], inline=False)
+        embed.add_field(name="🛹 Hoverboard", value=hoverboard_name, inline=True)
+        embed.add_field(name="⚡ Ultimate", value=ultimate_name, inline=True)
+        embed.add_field(name="🏪 Booth", value=booth_name, inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # =========================================================
-    # 🎖 GAME STATS
-    # =========================================================
+    # ---------------- GAME STATS BUTTON ----------------
     @discord.ui.button(label="🎖 Game Stats", style=discord.ButtonStyle.gray)
     async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-
         if not self.public_views.get("profile", False):
             return await interaction.response.send_message(
                 "🔒 Profile stats are private for this user.",
