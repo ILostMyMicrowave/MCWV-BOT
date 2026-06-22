@@ -34,73 +34,79 @@ def run_web():
 Thread(target=run_web, daemon=True).start()
 
 PROFILE_CACHE = {}
-CACHE_TTL = 60
+CACHE_TTL = 60  # adjust if you want
 
 PS99_API = "https://ps99.biggamesapi.io"
-
-# log channel ID here
-LOG_CHANNEL_ID = 1502001938705682622
-
-
-async def log_error(session, message):
-    print("[PS99 API ERROR]", message)
-
-    # If you want Discord logging
-    if LOG_CHANNEL_ID:
-        try:
-            channel = bot.get_channel(LOG_CHANNEL_ID)
-            if channel:
-                await channel.send(f"⚠️ PS99 API Error:\n```{message}```")
-        except:
-            pass
 
 
 async def get_profile_bundle(session, user_id):
     now = time.time()
 
+    # ---------------- CACHE ----------------
     if user_id in PROFILE_CACHE:
-        data, expiry = PROFILE_CACHE[user_id]
+        cached_data, expiry = PROFILE_CACHE[user_id]
         if now < expiry:
-            return data
+            return cached_data
 
     timeout = aiohttp.ClientTimeout(total=10)
 
-    url = f"{PS99_API}/api/v1/players/{user_id}?include=profile,inventory,extendedProfile"
+    # NOTE:
+    # /v1/players/:slug is the public endpoint.
+    # It accepts a Roblox user ID or username, and include= must use camelCase.
+    url = f"{PS99_API}/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
     try:
         async with session.get(url, timeout=timeout) as r:
             data = await r.json()
-
     except Exception as e:
-        await log_error(session, f"Request failed: {e}")
-        return {}, {}, {}, {}
+        print(f"[get_profile_bundle] request failed for {user_id}: {e}")
+        empty_bundle = ({}, {}, {}, {})
+        PROFILE_CACHE[user_id] = (empty_bundle, now + CACHE_TTL)
+        return empty_bundle
 
-    # ---------------- DEBUG SAFETY ----------------
-    if not isinstance(data, dict):
-        await log_error(session, f"Non-dict response: {data}")
-        return {}, {}, {}, {}
-
-    root = data.get("data", data)
+    # ---------------- SAFE ROOT HANDLING ----------------
+    root = data.get("data", {}) if isinstance(data, dict) else {}
 
     if not isinstance(root, dict):
-        await log_error(session, f"Bad root format: {root}")
-        return {}, {}, {}, {}
+        print(f"[get_profile_bundle] bad root for {user_id}: {root}")
+        empty_bundle = ({}, {}, {}, {})
+        PROFILE_CACHE[user_id] = (empty_bundle, now + CACHE_TTL)
+        return empty_bundle
 
-    views = root.get("views", {})
+    account = root.get("account", {}) if isinstance(root.get("account", {}), dict) else {}
+    views = root.get("views", {}) if isinstance(root.get("views", {}), dict) else {}
 
-    if not isinstance(views, dict):
-        await log_error(session, f"Missing views for user {user_id}: {views}")
+    public_views = account.get("publicViews", {}) if isinstance(account, dict) else {}
 
-    profile_data = views.get("profile") or root.get("profile") or {}
-    inventory_data = views.get("inventory") or root.get("inventory") or {}
-    extended_data = views.get("extendedProfile") or root.get("extendedProfile") or {}
+    def extract_view(view_name: str):
+        view = views.get(view_name, {})
+        if not isinstance(view, dict):
+            return {}
 
-    account = root.get("account", {}) if isinstance(root, dict) else {}
-    public_views = account.get("publicViews", account.get("public_views", {})) if isinstance(account, dict) else {}
+        # Public-player envelope can be:
+        # { available: true, data: {...} }
+        # or { available: false, reason: "not_public" }
+        if view.get("available") is True:
+            return view.get("data", {}) if isinstance(view.get("data", {}), dict) else {}
+
+        return {}
+
+    profile_data = extract_view("profile")
+    inventory_data = extract_view("inventory")
+    extended_data = extract_view("extendedProfile")
 
     bundle = (extended_data, profile_data, inventory_data, public_views)
-
     PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
+
+    # Helpful debug if something is missing
+    if not public_views:
+        print(f"[get_profile_bundle] no publicViews returned for {user_id}")
+    if not profile_data:
+        print(f"[get_profile_bundle] profile empty/private for {user_id}")
+    if not inventory_data:
+        print(f"[get_profile_bundle] inventory empty/private for {user_id}")
+    if not extended_data:
+        print(f"[get_profile_bundle] extendedProfile empty/private for {user_id}")
 
     return bundle
 
@@ -2053,7 +2059,7 @@ class ProfileView(discord.ui.View):
         try:
             import json
 
-            url = f"{PS99_API}/api/v1/players/{self.roblox_id}?include=profile,inventory,extendedProfile"
+            url = f"{PS99_API}/v1/players/{self.roblox_id}?include=profile,inventory,extendedProfile"
 
             timeout = aiohttp.ClientTimeout(total=10)
 
