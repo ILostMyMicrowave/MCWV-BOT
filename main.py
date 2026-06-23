@@ -2236,7 +2236,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         except Exception as e:
             print("[profile] war API error:", e)
 
-# ---------------- PS99 API ----------------
+        # ---------------- PS99 API ----------------
         extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(session, roblox_id)
 
         view = ProfileView(
@@ -2245,7 +2245,8 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             profile_data,
             roblox_name,
             public_views,
-            roblox_id
+            roblox_id,
+            session
         )
         
         # ---------------- AVATAR ----------------
