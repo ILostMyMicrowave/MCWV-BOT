@@ -60,20 +60,17 @@ CACHE_TTL = 60  # adjust if you want
 PS99_API = "https://ps99.biggamesapi.io"
 
 
-async def get_profile_bundle(session, user_id):
+async def get_profile_bundle(session, user_id, force=False):
     now = time.time()
 
     # ---------------- CACHE ----------------
-    if user_id in PROFILE_CACHE:
+    if not force and user_id in PROFILE_CACHE:
         cached_data, expiry = PROFILE_CACHE[user_id]
         if now < expiry:
             return cached_data
 
     timeout = aiohttp.ClientTimeout(total=10)
 
-    # NOTE:
-    # /v1/players/:slug is the public endpoint.
-    # It accepts a Roblox user ID or username, and include= must use camelCase.
     url = f"{PS99_API}/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
     try:
@@ -85,7 +82,6 @@ async def get_profile_bundle(session, user_id):
         PROFILE_CACHE[user_id] = (empty_bundle, now + CACHE_TTL)
         return empty_bundle
 
-    # ---------------- SAFE ROOT HANDLING ----------------
     root = data.get("data", {}) if isinstance(data, dict) else {}
 
     if not isinstance(root, dict):
@@ -104,9 +100,6 @@ async def get_profile_bundle(session, user_id):
         if not isinstance(view, dict):
             return {}
 
-        # Public-player envelope can be:
-        # { available: true, data: {...} }
-        # or { available: false, reason: "not_public" }
         if view.get("available") is True:
             return view.get("data", {}) if isinstance(view.get("data", {}), dict) else {}
 
@@ -119,18 +112,8 @@ async def get_profile_bundle(session, user_id):
     bundle = (extended_data, profile_data, inventory_data, public_views)
     PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
 
-    # Helpful debug if something is missing
-    if not public_views:
-        print(f"[get_profile_bundle] no publicViews returned for {user_id}")
-    if not profile_data:
-        print(f"[get_profile_bundle] profile empty/private for {user_id}")
-    if not inventory_data:
-        print(f"[get_profile_bundle] inventory empty/private for {user_id}")
-    if not extended_data:
-        print(f"[get_profile_bundle] extendedProfile empty/private for {user_id}")
-
     return bundle
-
+    
 def ensure_db_connection():
     global conn
 
@@ -1887,7 +1870,7 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         )
 
 class ProfileView(discord.ui.View):
-    def __init__(self, extended_data, inventory_data, profile_data, roblox_name, public_views, roblox_id):
+    def __init__(self, extended_data, inventory_data, profile_data, roblox_name, public_views, roblox_id, session):
         super().__init__(timeout=120)
 
         self.extended = extended_data or {}
@@ -1896,6 +1879,7 @@ class ProfileView(discord.ui.View):
         self.roblox_name = roblox_name
         self.roblox_id = roblox_id
         self.public_views = public_views or {}
+        self.session = session
 
     def _unwrap(self, data):
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
@@ -2118,7 +2102,31 @@ class ProfileView(discord.ui.View):
                     f"❌ Debug failed: `{e}`",
                     ephemeral=True
                 )
-        
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            bundle = await get_profile_bundle(
+                self.session,
+                self.roblox_id,
+                force=True
+            )
+
+            extended_data, profile_data, inventory_data, public_views = bundle
+
+            self.extended = extended_data or {}
+            self.profile = profile_data or {}
+            self.inventory = inventory_data or {}
+            self.public_views = public_views or {}
+
+            await interaction.followup.send("🔄 Profile refreshed.", ephemeral=True)
+
+        except Exception as e:
+            print(f"[refresh_button error] {e}")
+            await interaction.followup.send("❌ Failed to refresh profile.", ephemeral=True)
+
 @bot.tree.command(
     name="profile",
     description="View a Roblox-linked user profile dashboard",
