@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import discord
 import aiohttp
+import traceback
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from io import BytesIO
 import math
@@ -32,8 +33,6 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_web, daemon=True).start()
-
-import math
 
 def mastery_gap(level: int) -> int:
     xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
@@ -2327,83 +2326,156 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             ephemeral=True
         )
         
-@bot.tree.command(name="clanstats", description="Show MCWV clan overview — level, members, diamonds, and battle history", guild=guild_obj)
+@bot.tree.command(
+    name="clanstats",
+    description="Show MCWV clan overview — level, members, gems, and battle history",
+    guild=guild_obj
+)
 async def clanstats(interaction: discord.Interaction):
     await interaction.response.defer()
 
     try:
         async with session.get(CLAN_API) as r:
             if r.status != 200:
-                return await interaction.followup.send("❌ Could not reach the PS99 API.", ephemeral=True)
-            data = (await r.json()).get("data", {})
-    except Exception:
-        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
+                print(f"[clanstats] CLAN_API bad status: {r.status}")
+                return await interaction.followup.send(
+                    f"❌ Could not reach the PS99 API. (status {r.status})",
+                    ephemeral=True
+                )
 
-    name        = data.get("Name", CLAN_NAME)
-    level       = data.get("Level", "?")
-    members     = data.get("Members", [])
-    diamonds    = data.get("Diamonds", 0)
-    battles     = data.get("Battles", {})
+            raw = await r.json(content_type=None)
+            if not isinstance(raw, dict):
+                print(f"[clanstats] Invalid JSON root type: {type(raw)}")
+                return await interaction.followup.send(
+                    "❌ Invalid API response.",
+                    ephemeral=True
+                )
 
-    # --- battle history stats ---
+            data = raw.get("data", {})
+            if not isinstance(data, dict):
+                print(f"[clanstats] Missing/invalid data block: {raw}")
+                return await interaction.followup.send(
+                    "❌ Invalid API response data.",
+                    ephemeral=True
+                )
+
+    except Exception as e:
+        print(f"[clanstats] API request failed: {e}")
+        traceback.print_exc()
+        return await interaction.followup.send(
+            f"❌ API request failed: `{type(e).__name__}`",
+            ephemeral=True
+        )
+
+    name = data.get("Name", CLAN_NAME)
+    level = data.get("Level", "?")
+
+    members = data.get("Members", [])
+    if not isinstance(members, list):
+        print(f"[clanstats] Members not a list: {type(members)}")
+        members = []
+
+    battles = data.get("Battles", {})
+    if not isinstance(battles, dict):
+        print(f"[clanstats] Battles not a dict: {type(battles)}")
+        battles = {}
+
+    # Robust gem / clan bank detection
+    gems = (
+        data.get("Diamonds")
+        or data.get("diamonds")
+        or data.get("Bank")
+        or data.get("ClanBank")
+        or data.get("TotalDiamonds")
+        or data.get("Stats", {}).get("Diamonds")
+        or data.get("Economy", {}).get("Diamonds")
+        or 0
+    )
+
+    if gems == 0:
+        print(f"[clanstats] Gems resolved to 0. Top-level keys: {list(data.keys())}")
+        if isinstance(data.get("Stats"), dict):
+            print(f"[clanstats] Stats keys: {list(data['Stats'].keys())}")
+        if isinstance(data.get("Economy"), dict):
+            print(f"[clanstats] Economy keys: {list(data['Economy'].keys())}")
+
+    # Best placement tracking
     total_battles = len(battles)
-    best_pts = 0
     best_battle = ""
-    contributor_totals = {}
+    best_placement = None
 
     for bid, b in battles.items():
-        clan_pts = b.get("Points", 0)
-        if clan_pts > best_pts:
-            best_pts = clan_pts
+        if not isinstance(b, dict):
+            print(f"[clanstats] Battle entry not a dict for {bid}: {type(b)}")
+            continue
+
+        placement = (
+            b.get("Placement")
+            or b.get("Rank")
+            or b.get("Position")
+            or b.get("ClanPlacement")
+            or b.get("LeaderboardPosition")
+        )
+
+        if placement is None:
+            continue
+
+        try:
+            placement = int(placement)
+        except Exception:
+            print(f"[clanstats] Bad placement value for {bid}: {placement}")
+            continue
+
+        # Lower placement is better, e.g. Top 38 is better than Top 120
+        if best_placement is None or placement < best_placement:
+            best_placement = placement
             best_battle = bid
-        for entry in b.get("PointContributions", []):
-            uid = entry["UserID"]
-            contributor_totals[uid] = contributor_totals.get(uid, 0) + entry.get("Points", 0)
 
-    # resolve best overall contributor name
-    best_contributor_display = "—"
-    if contributor_totals:
-        top_uid = max(contributor_totals, key=lambda u: contributor_totals[u])
-        top_pts = contributor_totals[top_uid]
-        db_users = db_get_all()
-        db_match = next((u for u in db_users if int(u[0]) == top_uid), None)
-        if db_match:
-            rname = db_match[2]
-            discord_id = db_match[1]
-            best_contributor_display = f"<@{discord_id}>\n{rname}\n{format_points(top_pts)} pts"
-        else:
-            # fallback to Roblox API
-            try:
-                async with session.get(f"{ROBLOX_USERS_API}/{top_uid}") as ur:
-                    if ur.status == 200:
-                        rname = (await ur.json()).get("name", str(top_uid))
-                    else:
-                        rname = str(top_uid)
-            except Exception:
-                rname = str(top_uid)
-            best_contributor_display = f"{rname}\n{format_points(top_pts)} pts"
-
-    # friendly battle name
     def friendly_battle(bid):
         if not bid:
             return "—"
-        return re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', bid)).strip()
+        return re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', str(bid))).strip()
 
-    embed = discord.Embed(
-        title=f"🏰  {name}  —  Clan Overview",
-        color=discord.Color.blurple()
-    )
-    embed.add_field(name="👥  Members",  value=f"**{len(members)}**",            inline=True)
-    embed.add_field(name="💎  Diamonds", value=f"**{format_points(diamonds)}**", inline=True)
+    try:
+        embed = discord.Embed(
+            title=f"🏰 {name} — Clan Overview",
+            color=discord.Color.blurple()
+        )
 
-    embed.add_field(name="\u200b", value="─────────────────────── **Battle History** ───────────────────────", inline=False)
+        embed.add_field(name="👥 Members", value=f"**{len(members)}**", inline=True)
+        embed.add_field(name="💎 Gems", value=f"**{format_points(gems)}**", inline=True)
+        embed.add_field(name="🏅 Clan Level", value=f"**{level}**", inline=True)
 
-    embed.add_field(name="⚔️  Battles",  value=f"**{total_battles}**",           inline=True)
-    embed.add_field(name="🔥  Best War", value=f"**{friendly_battle(best_battle)}**\n{format_points(best_pts)} pts", inline=True)
-    embed.add_field(name="🌟  Best Overall Contributor", value=best_contributor_display, inline=False)
+        embed.add_field(
+            name="\u200b",
+            value="─────────────────────── **Battle History** ───────────────────────",
+            inline=False
+        )
 
-    embed.set_footer(text="ps99.biggamesapi.io")
-    await interaction.followup.send(embed=embed)
+        embed.add_field(name="⚔️ Battles", value=f"**{total_battles}**", inline=True)
+
+        embed.add_field(
+            name="🔥 Best War",
+            value=(
+                f"**{friendly_battle(best_battle)}**\n"
+                f"🥇 Top {best_placement if best_placement is not None else '—'}"
+            ),
+            inline=True
+        )
+
+        if best_placement is None:
+            print("[clanstats] No placement found in any battle entry.")
+
+        embed.set_footer(text="ps99.biggamesapi.io")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[clanstats] Embed build/send failed: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(
+            f"❌ Failed to build clan stats: `{type(e).__name__}`",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="compare", description="Compare two linked clan members head-to-head in the current war", guild=guild_obj)
 async def compare(interaction: discord.Interaction, member1: discord.Member, member2: discord.Member):
