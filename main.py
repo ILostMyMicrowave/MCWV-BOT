@@ -4129,24 +4129,44 @@ async def on_ready():
 
     print("🚀 ON_READY HIT")
 
-    if session is None or session.closed:
+    # ---------------- SESSION SAFETY ----------------
+    if session is None:
         session = aiohttp.ClientSession()
+        print("✅ aiohttp session created")
+    elif session.closed:
+        session = aiohttp.ClientSession()
+        print("🔄 aiohttp session re-created (was closed)")
 
+    # ---------------- PREVENT DOUBLE START ----------------
+    if getattr(bot, "_ready_done", False):
+        print("⚠️ on_ready already initialised, skipping setup")
+        return
+
+    bot._ready_done = True
+
+    # ---------------- SYNC COMMANDS ----------------
     try:
         synced = await bot.tree.sync(guild=guild_obj)
         print(f"✅ Synced {len(synced)} commands")
     except Exception as e:
-        print("❌ Sync error:", e)
+        print(f"❌ Sync error: {e}")
 
     print(f"🤖 Logged in as {bot.user} ({bot.user.id})")
 
+    # ---------------- START LOOPS ----------------
     try:
         start_bot_loops()
         print("✅ Bot loops started")
     except Exception as e:
         print(f"❌ Failed to start loops: {e}")
 
-    print(f"👥 Tracking {len(db_get_all_tracked())} users")
+    # ---------------- DB CHECK ----------------
+    try:
+        tracked = db_get_all_tracked()
+        print(f"👥 Tracking {len(tracked)} users")
+    except Exception as e:
+        print(f"❌ DB tracking error: {e}")
+
     print("✅ ON_READY DONE")
 
 # ---------------- CLEANUP ----------------
