@@ -1251,26 +1251,37 @@ async def statstest(interaction: discord.Interaction):
 @bot.tree.command(name="dbtest", guild=guild_obj)
 async def dbtest(interaction: discord.Interaction):
     try:
-        users = db_get_all()
+        users = db_get_all() or []
 
         valid = 0
+        missing_cache = 0
 
-        for user_id in users:
-            bundle = PROFILE_CACHE.get(user_id)
+        for row in users:
+            try:
+                roblox_id = int(row[0])
+            except Exception:
+                print(f"[dbtest] bad DB row: {row}")
+                continue
+
+            bundle = PROFILE_CACHE.get(roblox_id) or PROFILE_CACHE.get(str(roblox_id))
             if not bundle:
+                missing_cache += 1
                 continue
 
             extended, profile, inventory, public_views = bundle[0]
 
             if profile or inventory or extended:
                 valid += 1
+            else:
+                print(f"[dbtest] cached but empty for {roblox_id}")
 
         await interaction.response.send_message(
-            f"DB OK: {len(users)} users\nValid profiles: {valid}",
+            f"DB OK: {len(users)} users\nValid profiles: {valid}\nMissing cache: {missing_cache}",
             ephemeral=True
         )
 
     except Exception as e:
+        print(f"[dbtest] error: {e}")
         await interaction.response.send_message(f"DB ERROR: {e}", ephemeral=True)
 
 @bot.tree.command(name="ping", description="Test command", guild=guild_obj)
