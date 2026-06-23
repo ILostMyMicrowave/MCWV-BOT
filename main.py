@@ -1239,6 +1239,57 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
+@bot.tree.command(name="refreshprofile", guild=guild_obj)
+@require_role()
+@app_commands.describe(roblox_id="Roblox user ID to refresh")
+async def refreshprofile(interaction: discord.Interaction, roblox_id: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # basic anti-spam cooldown
+        now = time.time()
+        last = status_cooldown.get(f"refresh_{roblox_id}", 0)
+        if now - last < 15:
+            return await interaction.followup.send(
+                "⏳ Please wait a few seconds before refreshing again.",
+                ephemeral=True
+            )
+        status_cooldown[f"refresh_{roblox_id}"] = now
+
+        # clear cache keys
+        try:
+            rid_int = int(roblox_id)
+            PROFILE_CACHE.pop(rid_int, None)
+        except Exception:
+            pass
+
+        PROFILE_CACHE.pop(roblox_id, None)
+
+        # force fresh fetch
+        bundle = await get_profile_bundle(session, roblox_id, force=True)
+        extended_data, profile_data, inventory_data, public_views = bundle
+
+        # optional: count what came back
+        loaded_profile = bool(profile_data)
+        loaded_inventory = bool(inventory_data)
+        loaded_extended = bool(extended_data)
+
+        await interaction.followup.send(
+            "🔄 Refresh complete.\n"
+            f"Profile: {'loaded' if loaded_profile else 'empty'}\n"
+            f"Inventory: {'loaded' if loaded_inventory else 'empty'}\n"
+            f"Extended: {'loaded' if loaded_extended else 'empty'}",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"[refreshprofile] error for {roblox_id}: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(
+            f"❌ Refresh failed: `{type(e).__name__}`",
+            ephemeral=True
+        )
+        
 @bot.tree.command(name="statstest", guild=guild_obj)
 async def statstest(interaction: discord.Interaction):
     try:
