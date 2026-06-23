@@ -61,47 +61,75 @@ PS99_API = "https://ps99.biggamesapi.io"
 
 async def get_profile_bundle(session, user_id, force=False):
     now = time.time()
+    empty_bundle = ({}, {}, {}, {})
+
+    cached = PROFILE_CACHE.get(user_id)
+    cached_data = cached[0] if cached else empty_bundle
+    cached_expiry = cached[1] if cached else 0
 
     # ---------------- CACHE ----------------
-    if not force and user_id in PROFILE_CACHE:
-        cached_data, expiry = PROFILE_CACHE[user_id]
-        if now < expiry:
-            return cached_data
+    if not force and cached and now < cached_expiry:
+        return cached_data
+
+    # Safety: don't try to fetch if session isn't ready
+    if session is None or getattr(session, "closed", False):
+        print(f"[get_profile_bundle] session not ready for {user_id}")
+        return cached_data if cached else empty_bundle
 
     timeout = aiohttp.ClientTimeout(total=10)
-
     url = f"{PS99_API}/v1/players/{user_id}?include=profile,inventory,extendedProfile"
 
     try:
         async with session.get(url, timeout=timeout) as r:
-            data = await r.json()
+            if r.status != 200:
+                print(f"[get_profile_bundle] bad status for {user_id}: {r.status}")
+                return cached_data if cached else empty_bundle
+
+            data = await r.json(content_type=None)
 
     except Exception as e:
         print(f"[get_profile_bundle] request failed for {user_id}: {e}")
-        empty_bundle = ({}, {}, {}, {})
-        return empty_bundle
+        return cached_data if cached else empty_bundle
 
     # ---------------- SAFE ROOT HANDLING ----------------
     root = data.get("data", {}) if isinstance(data, dict) else {}
 
     if not isinstance(root, dict):
         print(f"[get_profile_bundle] bad root for {user_id}: {root}")
-        empty_bundle = ({}, {}, {}, {})
-        return empty_bundle
+        return cached_data if cached else empty_bundle
 
-    account = root.get("account", {}) if isinstance(root.get("account", {}), dict) else {}
-    views = root.get("views", {}) if isinstance(root.get("views", {}), dict) else {}
+    account = root.get("account", {})
+    if not isinstance(account, dict):
+        account = {}
 
-    public_views = account.get("publicViews", {}) if isinstance(account, dict) else {}
+    views = root.get("views", {})
+    if not isinstance(views, dict):
+        views = {}
+
+    public_views = account.get("publicViews", {})
+    if not isinstance(public_views, dict):
+        public_views = {}
 
     def extract_view(view_name: str):
         view = views.get(view_name, {})
         if not isinstance(view, dict):
+            print(f"[get_profile_bundle] {view_name} not a dict for {user_id}")
             return {}
 
+        data_block = view.get("data", {})
+        reason = view.get("reason")
+
+        # If real data exists, use it
+        if isinstance(data_block, dict) and data_block:
+            return data_block
+
+        # If the API says it is available, still allow an empty dict through safely
         if view.get("available") is True:
-            data_block = view.get("data", {})
             return data_block if isinstance(data_block, dict) else {}
+
+        # Log why it wasn't available
+        if reason:
+            print(f"[get_profile_bundle] {view_name} unavailable for {user_id}: {reason}")
 
         return {}
 
@@ -114,6 +142,11 @@ async def get_profile_bundle(session, user_id, force=False):
     # ---------------- CACHE ONLY VALID DATA ----------------
     if profile_data or inventory_data or extended_data:
         PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
+        return bundle
+
+    # If the API gives nothing useful, keep older cached data if we have it
+    if cached:
+        return cached_data
 
     return bundle
     
