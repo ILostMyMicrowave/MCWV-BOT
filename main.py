@@ -3352,13 +3352,15 @@ async def removealt(interaction: discord.Interaction, member: discord.Member, al
 @app_commands.describe(
     member="Discord member to update",
     roblox_username="Correct Roblox username",
-    alts="Comma-separated alt usernames or 'none'"
+    alts="Comma-separated alt usernames or 'none'",
+    channel="Ticket channel to store for this member"
 )
 async def memberedit(
     interaction: discord.Interaction,
     member: discord.Member,
     roblox_username: str,
-    alts: str = "none"
+    alts: str = "none",
+    channel: discord.TextChannel = None
 ):
     await interaction.response.defer(ephemeral=True)
 
@@ -3377,7 +3379,6 @@ async def memberedit(
                 "excludeBannedUsers": False
             }
         ) as r:
-
             data = await r.json()
 
         results = data.get("data", [])
@@ -3401,7 +3402,6 @@ async def memberedit(
         validated_alts = []
 
         if alts.lower().strip() != "none":
-
             alt_names = [
                 a.strip()
                 for a in alts.split(",")
@@ -3415,7 +3415,6 @@ async def memberedit(
                     "excludeBannedUsers": False
                 }
             ) as r:
-
                 alt_data = await r.json()
 
             found = {
@@ -3440,7 +3439,6 @@ async def memberedit(
                     str(alt["id"]),
                     alt["name"]
                 )
-
                 validated_alts.append(alt["name"])
 
         # ---------------- UPDATE MEMBERS CHANNEL RECORD ----------------
@@ -3450,9 +3448,7 @@ async def memberedit(
         )
 
         if members_channel:
-
             async for msg in members_channel.history(limit=500):
-
                 if f"<@{member.id}>" in msg.content:
 
                     alt_text = (
@@ -3460,13 +3456,15 @@ async def memberedit(
                         if validated_alts else "none"
                     )
 
-                    lines = msg.content.splitlines()
-
-                    channel_line = (
-                        lines[0]
-                        if lines
-                        else member.mention
-                    )
+                    if channel:
+                        channel_line = f"{channel.mention} {member.mention}"
+                    else:
+                        lines = msg.content.splitlines()
+                        channel_line = (
+                            lines[0]
+                            if lines
+                            else member.mention
+                        )
 
                     new_content = (
                         f"{channel_line}\n"
@@ -3486,7 +3484,6 @@ async def memberedit(
         log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
 
         if log_channel:
-
             embed = discord.Embed(
                 title="🛠️ Member Record Updated",
                 color=discord.Color.blurple(),
@@ -3513,6 +3510,13 @@ async def memberedit(
                 value=", ".join(validated_alts) or "none",
                 inline=False
             )
+
+            if channel:
+                embed.add_field(
+                    name="Ticket Channel",
+                    value=channel.mention,
+                    inline=False
+                )
 
             await log_channel.send(embed=embed)
 
