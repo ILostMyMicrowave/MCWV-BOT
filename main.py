@@ -76,18 +76,18 @@ async def get_profile_bundle(session, user_id, force=False):
     try:
         async with session.get(url, timeout=timeout) as r:
             data = await r.json()
+
     except Exception as e:
         print(f"[get_profile_bundle] request failed for {user_id}: {e}")
         empty_bundle = ({}, {}, {}, {})
-        PROFILE_CACHE[user_id] = (empty_bundle, now + CACHE_TTL)
         return empty_bundle
 
+    # ---------------- SAFE ROOT HANDLING ----------------
     root = data.get("data", {}) if isinstance(data, dict) else {}
 
     if not isinstance(root, dict):
         print(f"[get_profile_bundle] bad root for {user_id}: {root}")
         empty_bundle = ({}, {}, {}, {})
-        PROFILE_CACHE[user_id] = (empty_bundle, now + CACHE_TTL)
         return empty_bundle
 
     account = root.get("account", {}) if isinstance(root.get("account", {}), dict) else {}
@@ -101,7 +101,8 @@ async def get_profile_bundle(session, user_id, force=False):
             return {}
 
         if view.get("available") is True:
-            return view.get("data", {}) if isinstance(view.get("data", {}), dict) else {}
+            data_block = view.get("data", {})
+            return data_block if isinstance(data_block, dict) else {}
 
         return {}
 
@@ -110,7 +111,10 @@ async def get_profile_bundle(session, user_id, force=False):
     extended_data = extract_view("extendedProfile")
 
     bundle = (extended_data, profile_data, inventory_data, public_views)
-    PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
+
+    # ---------------- CACHE ONLY VALID DATA ----------------
+    if profile_data or inventory_data or extended_data:
+        PROFILE_CACHE[user_id] = (bundle, now + CACHE_TTL)
 
     return bundle
     
@@ -1216,7 +1220,24 @@ async def statstest(interaction: discord.Interaction):
 async def dbtest(interaction: discord.Interaction):
     try:
         users = db_get_all()
-        await interaction.response.send_message(f"DB OK: {len(users)} users", ephemeral=True)
+
+        valid = 0
+
+        for user_id in users:
+            bundle = PROFILE_CACHE.get(user_id)
+            if not bundle:
+                continue
+
+            extended, profile, inventory, public_views = bundle[0]
+
+            if profile or inventory or extended:
+                valid += 1
+
+        await interaction.response.send_message(
+            f"DB OK: {len(users)} users\nValid profiles: {valid}",
+            ephemeral=True
+        )
+
     except Exception as e:
         await interaction.response.send_message(f"DB ERROR: {e}", ephemeral=True)
 
