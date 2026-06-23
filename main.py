@@ -33,6 +33,27 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+import math
+
+def mastery_gap(level: int) -> int:
+    xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
+    if level == 98:
+        return 1228825
+    return xp
+
+def xp_to_level(total_xp: int) -> int:
+    level = 1
+    remaining = int(total_xp or 0)
+
+    while level < 99:
+        needed = mastery_gap(level)
+        if remaining < needed:
+            break
+        remaining -= needed
+        level += 1
+
+    return level
+
 PROFILE_CACHE = {}
 CACHE_TTL = 60  # adjust if you want
 
@@ -2029,10 +2050,16 @@ class ProfileView(discord.ui.View):
         huge = stats.get("Huge Pets Opened", 0)
         login = stats.get("Login Count", 0)
 
-        mastery_text = "\n".join(
-            f"• {k}: {v}"
-            for k, v in list(mastery.items())[:8]
-        ) or "None"
+        mastery_lines = []
+
+        for name, xp in list(mastery.items())[:8]:
+            try:
+                level = xp_to_level(int(xp))
+                mastery_lines.append(f"• {name}: Level {level}")
+            except Exception:
+                mastery_lines.append(f"• {name}: Unknown")
+
+        mastery_text = "\n".join(mastery_lines) or "None"
 
         embed = discord.Embed(
             title=f"🎖 Game Stats — {self.roblox_name}",
