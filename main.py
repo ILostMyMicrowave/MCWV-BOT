@@ -1973,7 +1973,6 @@ class ProfileView(discord.ui.View):
     def _split_text(self, text, size=1900):
         return [text[i:i + size] for i in range(0, len(text), size)]
 
-    # ---------------- PROFILE STATS BUTTON ----------------
     @discord.ui.button(label="💰 Profile Stats", style=discord.ButtonStyle.green)
     async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.public_views.get("extendedProfile", False):
@@ -2023,7 +2022,6 @@ class ProfileView(discord.ui.View):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---------------- INVENTORY BUTTON ----------------
     @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.blurple)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.public_views.get("inventory", False):
@@ -2076,7 +2074,6 @@ class ProfileView(discord.ui.View):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---------------- GAME STATS BUTTON ----------------
     @discord.ui.button(label="🎖 Game Stats", style=discord.ButtonStyle.gray)
     async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.public_views.get("profile", False):
@@ -2099,13 +2096,13 @@ class ProfileView(discord.ui.View):
         login = stats.get("Login Count", 0)
 
         mastery_lines = []
-
-        for name, xp in list(mastery.items())[:8]:
-            try:
-                level = xp_to_level(int(xp))
-                mastery_lines.append(f"• {name}: Level {level}")
-            except Exception:
-                mastery_lines.append(f"• {name}: Unknown")
+        if isinstance(mastery, dict):
+            for name, xp in list(mastery.items())[:8]:
+                try:
+                    level = xp_to_level(int(xp))
+                    mastery_lines.append(f"• {name}: Level {level}")
+                except Exception:
+                    mastery_lines.append(f"• {name}: Unknown")
 
         mastery_text = "\n".join(mastery_lines) or "None"
 
@@ -2128,18 +2125,16 @@ class ProfileView(discord.ui.View):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---------------- DEBUG BUTTON ----------------
     @discord.ui.button(label="🔧 Debug", style=discord.ButtonStyle.red)
     async def debug_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             import json
 
             url = f"{PS99_API}/v1/players/{self.roblox_id}?include=profile,inventory,extendedProfile"
-
             timeout = aiohttp.ClientTimeout(total=10)
 
-            async with session.get(url, timeout=timeout) as r:
-                data = await r.json()
+            async with self.session.get(url, timeout=timeout) as r:
+                data = await r.json(content_type=None)
 
             pretty = json.dumps(data, indent=2, ensure_ascii=False)
             chunks = self._split_text(pretty, 1800)
@@ -2172,6 +2167,8 @@ class ProfileView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
 
         try:
+            PROFILE_CACHE.pop(self.roblox_id, None)
+
             bundle = await get_profile_bundle(
                 self.session,
                 self.roblox_id,
@@ -2190,7 +2187,7 @@ class ProfileView(discord.ui.View):
         except Exception as e:
             print(f"[refresh_button error] {e}")
             await interaction.followup.send("❌ Failed to refresh profile.", ephemeral=True)
-
+            
 @bot.tree.command(
     name="profile",
     description="View a Roblox-linked user profile dashboard",
