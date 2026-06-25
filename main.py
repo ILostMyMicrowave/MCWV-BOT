@@ -27,12 +27,118 @@ app = Flask(__name__)
 def home():
     return "Bot is alive"
 
-
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_web, daemon=True).start()
+
+INVITE_SNAPSHOTS = {}
+INVITE_SYSTEM_READY = False
+
+DB_PATH = "bot.db"
+
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db_exec(query, params=()):
+    with db_connect() as conn:
+        conn.execute(query, params)
+        conn.commit()
+
+
+def db_fetchone(query, params=()):
+    with db_connect() as conn:
+        cur = conn.execute(query, params)
+        return cur.fetchone()
+
+
+def db_fetchall(query, params=()):
+    with db_connect() as conn:
+        cur = conn.execute(query, params)
+        return cur.fetchall()
+
+def init_invite_tables():
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS invite_events (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        active INTEGER DEFAULT 0,
+        start_time INTEGER DEFAULT 0,
+        end_time INTEGER DEFAULT 0,
+        channel_id INTEGER
+    )
+    """)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS invite_counts (
+        user_id INTEGER PRIMARY KEY,
+        invites INTEGER DEFAULT 0
+    )
+    """)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS invite_used_users (
+        user_id INTEGER PRIMARY KEY
+    )
+    """)
+
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS invite_cache (
+        invite_code TEXT PRIMARY KEY,
+        inviter_id INTEGER
+    )
+    """)
+
+
+init_invite_tables()
+
+def get_active_event():
+    return db_fetchone(
+        "SELECT * FROM invite_events WHERE id = 1"
+    )
+
+
+def increment_invite(user_id: int, amount: int = 1):
+    db_exec("""
+    INSERT INTO invite_counts (user_id, invites)
+    VALUES (?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET invites = invites + ?
+    """, (user_id, amount, amount))
+
+
+def get_invite_channel(guild, bot):
+    if not bot.user:
+        return None
+
+    me = guild.get_member(bot.user.id)
+    if not me:
+        return None
+
+    for ch in guild.text_channels:
+        perms = ch.permissions_for(me)
+        if perms.create_instant_invite and perms.send_messages:
+            return ch
+
+    return None
+
+
+async def load_snapshot(guild):
+    try:
+        invites = await guild.invites()
+    except Exception as e:
+        print(f"[invite system] snapshot error: {e}")
+        INVITE_SNAPSHOTS[guild.id] = {}
+        return
+
+    INVITE_SNAPSHOTS[guild.id] = {
+        i.code: int(i.uses or 0) for i in invites
+    }
+
+
 
 def mastery_gap(level: int) -> int:
     xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
@@ -1239,6 +1345,204 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
+
+class InviteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Get Invite Link",
+        style=discord.ButtonStyle.blurple,
+        custom_id="invite_event_button"
+    )
+    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        event = get_active_event()
+        if not event or not event["active"]:
+            return await interaction.response.send_message(
+                "❌ No active invite event.",
+                ephemeral=True
+            )
+
+        guild = interaction.guild
+        channel = get_invite_channel(guild, interaction.client)
+
+        if not channel:
+            return await interaction.response.send_message(
+                "❌ No valid channel for invites.",
+                ephemeral=True
+            )
+
+        try:
+            invite = await channel.create_invite(
+                unique=True,
+                max_uses=0
+            )
+        except Exception as e:
+            print(f"[invite system] create invite error: {e}")
+            return await interaction.response.send_message(
+                "❌ Failed to create invite.",
+                ephemeral=True
+            )
+
+        db_exec(
+            "INSERT OR REPLACE INTO invite_cache (invite_code, inviter_id) VALUES (?, ?)",
+            (invite.code, interaction.user.id)
+        )
+
+        await interaction.response.send_message(
+            f"Your invite link:\n{invite.url}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="host_invite_event", guild=guild_obj)
+@app_commands.describe(duration_hours="Event duration")
+async def host_invite_event(interaction: discord.Interaction, duration_hours: int):
+
+    if duration_hours <= 0:
+        return await interaction.response.send_message(
+            "❌ Must be at least 1 hour.",
+            ephemeral=True
+        )
+
+    start = int(time.time())
+    end = start + (duration_hours * 3600)
+
+    # reset tracking
+    db_exec("DELETE FROM invite_counts")
+    db_exec("DELETE FROM invite_used_users")
+    db_exec("DELETE FROM invite_cache")
+
+    db_exec("""
+    INSERT OR REPLACE INTO invite_events
+    (id, active, start_time, end_time, channel_id)
+    VALUES (1, 1, ?, ?, ?)
+    """, (start, end, interaction.channel_id))
+
+    if interaction.guild:
+        await load_snapshot(interaction.guild)
+
+    embed = discord.Embed(
+        title="🎉 Invite Event Started!",
+        description=f"Ends <t:{end}:R>\nFirst join only counts.",
+        color=discord.Color.green()
+    )
+
+    await interaction.response.send_message(embed=embed, view=InviteView())
+
+@bot.tree.command(name="end_invite_event", guild=guild_obj)
+async def end_invite_event(interaction: discord.Interaction):
+
+    event = get_active_event()
+    if not event or not event["active"]:
+        return await interaction.response.send_message(
+            "❌ No active event.",
+            ephemeral=True
+        )
+
+    db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+
+    await interaction.response.send_message("🏁 Event ended.", ephemeral=True)
+
+@bot.event
+async def on_member_join(member: discord.Member):
+
+    if member.bot:
+        return
+
+    event = get_active_event()
+    if not event or not event["active"]:
+        return
+
+    if int(time.time()) >= event["end_time"]:
+        return
+
+    # first join only
+    if db_fetchone("SELECT 1 FROM invite_used_users WHERE user_id = ?", (member.id,)):
+        return
+
+    db_exec("INSERT INTO invite_used_users (user_id) VALUES (?)", (member.id,))
+
+    try:
+        after = await member.guild.invites()
+    except Exception as e:
+        print(f"[invite system] join fetch error: {e}")
+        return
+
+    before = INVITE_SNAPSHOTS.get(member.guild.id)
+    if not before:
+        await load_snapshot(member.guild)
+        before = INVITE_SNAPSHOTS.get(member.guild.id, {})
+
+    used = None
+
+    for inv in after:
+        if int(inv.uses or 0) > int(before.get(inv.code, 0)):
+            used = inv.code
+            break
+
+    INVITE_SNAPSHOTS[member.guild.id] = {
+        i.code: int(i.uses or 0) for i in after
+    }
+
+    if not used:
+        return
+
+    row = db_fetchone(
+        "SELECT inviter_id FROM invite_cache WHERE invite_code = ?",
+        (used,)
+    )
+
+    if not row:
+        return
+
+    increment_invite(int(row["inviter_id"]))
+
+@bot.tree.command(name="inviteleaderboard", guild=guild_obj)
+async def inviteleaderboard(interaction: discord.Interaction):
+
+    rows = db_fetchall(
+        "SELECT user_id, invites FROM invite_counts ORDER BY invites DESC LIMIT 10"
+    )
+
+    if not rows:
+        return await interaction.response.send_message("No invites yet.")
+
+    text = "\n".join(
+        f"{i+1}. <@{r['user_id']}> — {r['invites']}"
+        for i, r in enumerate(rows)
+    )
+
+    await interaction.response.send_message(text)
+
+@tasks.loop(seconds=30)
+async def check_invite_event():
+
+    event = get_active_event()
+    if not event or not event["active"]:
+        return
+
+    if int(time.time()) >= event["end_time"]:
+        db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+        print("Invite event auto-ended")
+
+async def setup_invite_system():
+
+    global INVITE_SYSTEM_READY
+
+    if INVITE_SYSTEM_READY:
+        return
+
+    INVITE_SYSTEM_READY = True
+
+    if not check_invite_event.is_running():
+        check_invite_event.start()
+
+    for g in bot.guilds:
+        await load_snapshot(g)
+
+    bot.add_view(InviteView())
+
 @bot.tree.command(name="refreshprofile", guild=guild_obj)
 @require_role()
 @app_commands.describe(roblox_id="Roblox user ID to refresh")
@@ -4214,6 +4518,7 @@ def start_bot_loops():
     if not clan_leave_loop.is_running():
         clan_leave_loop.start()
 
+
 # ---------------- READY ----------------
 @bot.event
 async def on_ready():
@@ -4259,7 +4564,15 @@ async def on_ready():
     except Exception as e:
         print(f"❌ DB tracking error: {e}")
 
+    # ---------------- INVITE SYSTEM INIT ----------------
+    try:
+        await setup_invite_system()
+        print("🎟 Invite system started")
+    except Exception as e:
+        print(f"❌ Invite system failed: {e}")
+
     print("✅ ON_READY DONE")
+
 
 # ---------------- CLEANUP ----------------
 @bot.event
