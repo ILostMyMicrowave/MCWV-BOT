@@ -1396,6 +1396,7 @@ class InviteView(discord.ui.View):
         )
 
 @bot.tree.command(name="host_invite_event", guild=guild_obj)
+@require_role()
 @app_commands.describe(duration_hours="Event duration")
 async def host_invite_event(interaction: discord.Interaction, duration_hours: int):
 
@@ -1431,18 +1432,31 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
     await interaction.response.send_message(embed=embed, view=InviteView())
 
 @bot.tree.command(name="end_invite_event", guild=guild_obj)
+@require_role()
 async def end_invite_event(interaction: discord.Interaction):
 
-    event = get_active_event()
-    if not event or not event["active"]:
-        return await interaction.response.send_message(
-            "❌ No active event.",
+    try:
+        event = get_active_event()
+
+        if not event or not event["active"]:
+            return await interaction.response.send_message(
+                "❌ No active event.",
+                ephemeral=True
+            )
+
+        db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+
+        await interaction.response.send_message(
+            "🏁 Event ended.",
             ephemeral=True
         )
 
-    db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
-
-    await interaction.response.send_message("🏁 Event ended.", ephemeral=True)
+    except Exception as e:
+        print(f"[end_invite_event error] {e}")
+        await interaction.response.send_message(
+            "❌ Something went wrong ending the event.",
+            ephemeral=True
+        )
 
 @bot.event
 async def on_member_join(member: discord.Member):
