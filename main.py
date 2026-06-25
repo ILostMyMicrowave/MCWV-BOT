@@ -1018,7 +1018,8 @@ reminder_channel_id = CHANNEL_ID  # channel where reminders are sent
 ps99_war_active = False       # tracks last known PS99 war state
 ps99_first_check = True       # suppresses announcement on first poll (mid-war startup)
 
-# ---------------- DATABASE ----------------
+# DATABASE ------------------------------
+
 import psycopg2
 import os
 
@@ -1032,12 +1033,12 @@ def db_enabled():
 if DATABASE_URL:
     try:
         conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = False
+        conn.autocommit = True  # 🔥 important fix
+
         print("Database connected")
 
         with conn.cursor() as cur:
 
-            # ---------------- MAIN USERS ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     roblox_id TEXT PRIMARY KEY,
@@ -1046,7 +1047,6 @@ if DATABASE_URL:
                 )
             """)
 
-            # ---------------- SETTINGS ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -1054,7 +1054,6 @@ if DATABASE_URL:
                 )
             """)
 
-            # ---------------- STATUS CACHE ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_status (
                     roblox_id TEXT PRIMARY KEY,
@@ -1063,7 +1062,6 @@ if DATABASE_URL:
                 )
             """)
 
-            # ---------------- ALTS SYSTEM (NEW) ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_alts (
                     discord_id BIGINT NOT NULL,
@@ -1074,7 +1072,7 @@ if DATABASE_URL:
                 )
             """)
 
-        conn.commit()
+        print("DB tables ready")
 
     except Exception as e:
         print("DB connection failed:", e)
