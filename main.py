@@ -1507,37 +1507,61 @@ async def invite_full_test(interaction: discord.Interaction):
 @require_role()
 @app_commands.describe(duration_hours="Event duration")
 async def host_invite_event(interaction: discord.Interaction, duration_hours: int):
+    await interaction.response.defer(ephemeral=True)
 
-    if duration_hours <= 0:
-        return await interaction.response.send_message(
-            "❌ Must be at least 1 hour.",
-            ephemeral=True
+    try:
+        if duration_hours <= 0:
+            return await interaction.followup.send(
+                "❌ Must be at least 1 hour.",
+                ephemeral=True
+            )
+
+        start = int(time.time())
+        end = start + (duration_hours * 3600)
+
+        # reset tracking for this event
+        db_exec("DELETE FROM invite_counts")
+        db_exec("DELETE FROM invite_used_users")
+        db_exec("DELETE FROM invite_cache")
+
+        # PostgreSQL upsert
+        db_exec("""
+            INSERT INTO invite_events
+            (id, active, start_time, end_time, channel_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id)
+            DO UPDATE SET
+                active = EXCLUDED.active,
+                start_time = EXCLUDED.start_time,
+                end_time = EXCLUDED.end_time,
+                channel_id = EXCLUDED.channel_id
+        """, (1, 1, start, end, interaction.channel_id))
+
+        if interaction.guild:
+            await load_invite_snapshot(interaction.guild)
+
+        embed = discord.Embed(
+            title="🎉 Invite Event Started!",
+            description=(
+                f"**Duration:** {duration_hours} hour(s)\n"
+                f"**Ends:** <t:{end}:R>\n\n"
+                "Click the button below to get your personal invite link.\n"
+                "Only first-time joins count."
+            ),
+            color=discord.Color.green()
         )
 
-    start = int(time.time())
-    end = start + (duration_hours * 3600)
+        await interaction.followup.send(embed=embed, view=InviteView())
 
-    # reset tracking
-    db_exec("DELETE FROM invite_counts")
-    db_exec("DELETE FROM invite_used_users")
-    db_exec("DELETE FROM invite_cache")
+    except Exception as e:
+        import traceback
+        print("[host_invite_event error]")
+        print(traceback.format_exc())
 
-    db_exec("""
-    INSERT OR REPLACE INTO invite_events
-    (id, active, start_time, end_time, channel_id)
-    VALUES (1, 1, ?, ?, ?)
-    """, (start, end, interaction.channel_id))
-
-    if interaction.guild:
-        await load_snapshot(interaction.guild)
-
-    embed = discord.Embed(
-        title="🎉 Invite Event Started!",
-        description=f"Ends <t:{end}:R>\nFirst join only counts.",
-        color=discord.Color.green()
-    )
-
-    await interaction.response.send_message(embed=embed, view=InviteView())
+        await interaction.followup.send(
+            f"❌ {type(e).__name__}: {e}",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="end_invite_event", guild=guild_obj)
 @require_role()
