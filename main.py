@@ -1442,18 +1442,32 @@ async def invite_snapshot_refresh(interaction: discord.Interaction):
 @bot.tree.command(name="invite_simulate", guild=guild_obj)
 @require_role()
 async def invite_simulate(interaction: discord.Interaction, amount: int = 1):
-    if amount <= 0:
-        return await interaction.response.send_message(
-            "❌ Amount must be at least 1.",
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        if amount <= 0:
+            return await interaction.followup.send(
+                "❌ Amount must be at least 1.",
+                ephemeral=True
+            )
+
+        increment_invite_count(interaction.user.id, amount)
+
+        await interaction.followup.send(
+            f"🧪 Simulated +{amount} invite(s) for you.",
             ephemeral=True
         )
 
-    increment_invite_count(interaction.user.id, amount)
+    except Exception as e:
+        import traceback
+        print("SIMULATE ERROR:")
+        print(traceback.format_exc())
 
-    await interaction.response.send_message(
-        f"🧪 Simulated +{amount} invite(s) for you.",
-        ephemeral=True
-    )
+        await interaction.followup.send(
+            f"❌ Error: `{type(e).__name__}: {e}`",
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name="invite_full_test", guild=guild_obj)
