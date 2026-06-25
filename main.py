@@ -1412,17 +1412,13 @@ async def invite_debug(interaction: discord.Interaction):
         ephemeral=True
     )
 
-
 @bot.tree.command(name="invite_snapshot_refresh", guild=guild_obj)
 @require_role()
 async def invite_snapshot_refresh(interaction: discord.Interaction):
     guild = interaction.guild
 
     if not guild:
-        return await interaction.response.send_message(
-            "No guild found.",
-            ephemeral=True
-        )
+        return await interaction.response.send_message("No guild found.", ephemeral=True)
 
     try:
         await load_invite_snapshot(guild)
@@ -1433,12 +1429,15 @@ async def invite_snapshot_refresh(interaction: discord.Interaction):
         )
 
     except Exception as e:
-        print(f"[invite_snapshot_refresh error] {e}")
+        import traceback
+
+        print("FULL SNAPSHOT ERROR:")
+        print(traceback.format_exc())
+
         await interaction.response.send_message(
-            "❌ Failed to refresh snapshot.",
+            f"❌ Failed to refresh snapshot:\n`{type(e).__name__}: {e}`",
             ephemeral=True
         )
-
 
 @bot.tree.command(name="invite_simulate", guild=guild_obj)
 @require_role()
