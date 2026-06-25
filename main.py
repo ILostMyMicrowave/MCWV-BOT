@@ -65,34 +65,33 @@ def db_fetchall(query, params=()):
 def init_invite_tables():
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_events (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
+        id INTEGER PRIMARY KEY DEFAULT 1,
         active INTEGER DEFAULT 0,
         start_time INTEGER DEFAULT 0,
         end_time INTEGER DEFAULT 0,
-        channel_id INTEGER
+        channel_id BIGINT
     )
     """)
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_counts (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         invites INTEGER DEFAULT 0
     )
     """)
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_used_users (
-        user_id INTEGER PRIMARY KEY
+        user_id BIGINT PRIMARY KEY
     )
     """)
 
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_cache (
         invite_code TEXT PRIMARY KEY,
-        inviter_id INTEGER
+        inviter_id BIGINT
     )
     """)
-
 
 init_invite_tables()
 
@@ -102,12 +101,16 @@ def get_active_event():
     )
 
 
-def increment_invite(user_id: int, amount: int = 1):
-    db_exec("""
-    INSERT INTO invite_counts (user_id, invites)
-    VALUES (?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET invites = invites + ?
-    """, (user_id, amount, amount))
+def increment_invite_count(user_id: int, amount: int = 1):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO invite_counts (user_id, invites)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET invites = invite_counts.invites + %s
+        """, (user_id, amount, amount))
+
+    conn.commit()
 
 
 def get_invite_channel(guild, bot):
