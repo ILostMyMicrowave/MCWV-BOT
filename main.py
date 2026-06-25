@@ -1393,6 +1393,100 @@ class InviteView(discord.ui.View):
             ephemeral=True
         )
 
+# ---------------- INVITE DEBUG TOOLKIT ----------------
+
+@bot.tree.command(name="invite_debug", guild=guild_obj)
+@require_role()
+async def invite_debug(interaction: discord.Interaction):
+    event = get_active_event()
+    guild = interaction.guild
+
+    snap = INVITE_SNAPSHOTS.get(guild.id, {}) if guild else {}
+
+    await interaction.response.send_message(
+        f"🧪 Invite System Debug\n\n"
+        f"Active Event: {bool(event and event['active'])}\n"
+        f"End Time: {event['end_time'] if event else 'None'}\n"
+        f"Channel ID: {event['channel_id'] if event else 'None'}\n\n"
+        f"Snapshot size: {len(snap)} invites tracked",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="invite_snapshot_refresh", guild=guild_obj)
+@require_role()
+async def invite_snapshot_refresh(interaction: discord.Interaction):
+    guild = interaction.guild
+
+    if not guild:
+        return await interaction.response.send_message(
+            "No guild found.",
+            ephemeral=True
+        )
+
+    try:
+        await load_invite_snapshot(guild)
+
+        await interaction.response.send_message(
+            "🔄 Invite snapshot refreshed successfully.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"[invite_snapshot_refresh error] {e}")
+        await interaction.response.send_message(
+            "❌ Failed to refresh snapshot.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="invite_simulate", guild=guild_obj)
+@require_role()
+async def invite_simulate(interaction: discord.Interaction, amount: int = 1):
+    if amount <= 0:
+        return await interaction.response.send_message(
+            "❌ Amount must be at least 1.",
+            ephemeral=True
+        )
+
+    increment_invite_count(interaction.user.id, amount)
+
+    await interaction.response.send_message(
+        f"🧪 Simulated +{amount} invite(s) for you.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="invite_full_test", guild=guild_obj)
+@require_role()
+async def invite_full_test(interaction: discord.Interaction):
+    try:
+        test_user = interaction.user.id
+
+        increment_invite_count(test_user, 1)
+
+        rows = db_fetchall(
+            "SELECT user_id, invites FROM invite_counts ORDER BY invites DESC LIMIT 5"
+        )
+
+        leaderboard = "\n".join(
+            f"{i+1}. <@{r['user_id']}> — {r['invites']}"
+            for i, r in enumerate(rows)
+        ) or "No data"
+
+        await interaction.response.send_message(
+            "🧪 Full Invite System Test Complete\n\n"
+            f"Leaderboard:\n{leaderboard}",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"[invite_full_test error] {e}")
+        await interaction.response.send_message(
+            "❌ Test failed (check console).",
+            ephemeral=True
+        )
+
 @bot.tree.command(name="host_invite_event", guild=guild_obj)
 @require_role()
 @app_commands.describe(duration_hours="Event duration")
