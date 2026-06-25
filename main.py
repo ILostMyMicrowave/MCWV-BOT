@@ -126,18 +126,18 @@ def get_invite_channel(guild, bot):
     return None
 
 
-async def load_snapshot(guild):
+async def load_invite_snapshot(guild: discord.Guild):
     try:
         invites = await guild.invites()
     except Exception as e:
-        print(f"[invite system] snapshot error: {e}")
+        print(f"[invite system] Failed to load invites for {guild.id}: {e}")
         INVITE_SNAPSHOTS[guild.id] = {}
         return
 
     INVITE_SNAPSHOTS[guild.id] = {
-        i.code: int(i.uses or 0) for i in invites
+        inv.code: int(inv.uses or 0)
+        for inv in invites
     }
-
 
 
 def mastery_gap(level: int) -> int:
