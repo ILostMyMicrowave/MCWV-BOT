@@ -1521,17 +1521,17 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
         db_exec("DELETE FROM invite_used_users")
         db_exec("DELETE FROM invite_cache")
 
-        # PostgreSQL upsert
+        # SQLite upsert
         db_exec("""
             INSERT INTO invite_events
             (id, active, start_time, end_time, channel_id)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (id)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id)
             DO UPDATE SET
-                active = EXCLUDED.active,
-                start_time = EXCLUDED.start_time,
-                end_time = EXCLUDED.end_time,
-                channel_id = EXCLUDED.channel_id
+                active = excluded.active,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                channel_id = excluded.channel_id
         """, (1, 1, start, end, interaction.channel_id))
 
         if interaction.guild:
