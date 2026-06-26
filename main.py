@@ -1391,12 +1391,19 @@ def init_giveaway_tables():
     )
     """)
 
-    # Required so leaves can invalidate joins live
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_member_links (
         member_id BIGINT PRIMARY KEY,
         inviter_id BIGINT NOT NULL
     )
+    """)
+
+    db_exec("""
+    INSERT OR IGNORE INTO giveaway_events (
+        id, active, prize, winners, invites_per_entry,
+        start_time, end_time, channel_id, message_id,
+        thumbnail, created_by
+    ) VALUES (1, 0, '', 1, 2, 0, 0, 0, 0, '', 0)
     """)
 
 
@@ -1410,7 +1417,7 @@ def has_edit_role(member: discord.Member) -> bool:
 def get_active_giveaway():
     return db_fetchone("""
         SELECT * FROM giveaway_events
-        WHERE id = 1 AND active = 1
+        WHERE id = 1
     """)
 
 
