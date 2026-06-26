@@ -1675,34 +1675,44 @@ async def on_member_join(member: discord.Member):
 
 @bot.tree.command(name="inviteleaderboard", guild=guild_obj)
 async def inviteleaderboard(interaction: discord.Interaction):
-
-    rows = db_fetchall(
-        "SELECT user_id, invites FROM invite_counts ORDER BY invites DESC LIMIT 10"
-    )
+    rows = db_fetchall("""
+        SELECT user_id, invites
+        FROM invite_counts
+        ORDER BY invites DESC, user_id ASC
+        LIMIT 10
+    """)
 
     if not rows:
-        return await interaction.response.send_message("No invites yet.")
+        return await interaction.response.send_message("No invite joins yet.", ephemeral=True)
 
     text = "\n".join(
-        f"{i+1}. <@{r['user_id']}> — {r['invites']}"
+        f"{i+1}. <@{r['user_id']}> — {r['invites']} joins"
         for i, r in enumerate(rows)
     )
 
-    await interaction.response.send_message(text)
+    embed = discord.Embed(
+        title="🏆 Invite Joins Leaderboard",
+        description=text,
+        color=discord.Color.blurple()
+    )
+
+    await interaction.response.send_message(embed=embed)
+
 
 @tasks.loop(seconds=30)
 async def check_invite_event():
-
     event = get_active_event()
     if not event or not event["active"]:
         return
 
-    if int(time.time()) >= event["end_time"]:
-        db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
-        print("Invite event auto-ended")
+    if int(time.time()) < event["end_time"]:
+        return
+
+    db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+    print("Invite event auto-ended")
+
 
 async def setup_invite_system():
-
     global INVITE_SYSTEM_READY
 
     if INVITE_SYSTEM_READY:
@@ -1714,10 +1724,10 @@ async def setup_invite_system():
         check_invite_event.start()
 
     for g in bot.guilds:
-        await load_snapshot(g)
+        await load_invite_snapshot(g)
 
     bot.add_view(InviteView())
-
+    
 @bot.tree.command(name="refreshprofile", guild=guild_obj)
 @require_role()
 @app_commands.describe(roblox_id="Roblox user ID to refresh")
