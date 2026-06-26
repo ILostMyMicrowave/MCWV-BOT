@@ -1397,7 +1397,10 @@ def has_edit_role(member: discord.Member) -> bool:
 
 
 def get_active_giveaway():
-    return db_fetchone("SELECT * FROM giveaway_events WHERE id = 1")
+    return db_fetchone("""
+        SELECT * FROM giveaway_events
+        WHERE id = 1 AND active = 1
+    """)
 
 
 def get_valid_invites(user_id: int) -> int:
@@ -1526,10 +1529,7 @@ async def finish_giveaway(reason: str = "ended"):
                 channel = await bot.fetch_channel(int(channel_id))
         except Exception as e:
             print("❌ Failed to fetch giveaway channel:", e)
-
-    # mark ended first so it can never get stuck active
-    db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
-    print("🏁 Giveaway marked inactive")
+            return
 
     if channel is None:
         print("❌ Giveaway channel not found after fetch")
@@ -1558,6 +1558,10 @@ async def finish_giveaway(reason: str = "ended"):
             await channel.send("🏁 Giveaway ended, but there were no valid entries.")
         except Exception as e:
             print("Send failed (no winners):", e)
+            return
+
+        db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+        print("🏁 Giveaway marked inactive")
         return
 
     mentions = "\n".join(f"<@{uid}>" for uid in chosen)
@@ -1579,6 +1583,10 @@ async def finish_giveaway(reason: str = "ended"):
         await channel.send(embed=embed)
     except Exception as e:
         print("❌ Failed to send giveaway embed:", e)
+        return
+
+    db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+    print("🏁 Giveaway marked inactive")
 
     log_channel = bot.get_channel(GIVEAWAY_LOG_CHANNEL_ID)
     if log_channel:
