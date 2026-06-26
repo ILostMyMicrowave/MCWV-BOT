@@ -1512,23 +1512,31 @@ async def log_giveaway_edit(action: str, before: Optional[dict], after: Optional
 async def finish_giveaway(reason: str = "ended"):
     giveaway = get_active_giveaway()
 
-    # 🔒 already ended / no giveaway
-    if not giveaway or not giveaway["active"]:
+    if not giveaway or int(giveaway["active"]) != 1:
         print("⚠️ finish_giveaway called but nothing active")
         return
 
-    channel_id = giveaway.get("channel_id")
-    channel = bot.get_channel(int(channel_id)) if channel_id else None
+    channel_id = giveaway["channel_id"]
+    channel = None
 
-    # 🧠 ALWAYS mark as ended first (prevents locking system)
+    if channel_id:
+        try:
+            channel = bot.get_channel(int(channel_id))
+            if channel is None:
+                channel = await bot.fetch_channel(int(channel_id))
+        except Exception as e:
+            print("❌ Failed to fetch giveaway channel:", e)
+
+    # mark ended first so it can never get stuck active
     db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+    print("🏁 Giveaway marked inactive")
 
-    if not channel:
-        print("❌ Giveaway channel not found, state still cleared")
+    if channel is None:
+        print("❌ Giveaway channel not found after fetch")
         return
 
-    invites_per_entry = max(1, int(giveaway.get("invites_per_entry") or 2))
-    winner_count = max(1, int(giveaway.get("winners") or 1))
+    invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
+    winner_count = max(1, int(giveaway["winners"] or 1))
 
     rows = db_fetchall("""
         SELECT user_id, invites
@@ -1545,7 +1553,6 @@ async def finish_giveaway(reason: str = "ended"):
 
     chosen = weighted_unique_winners(candidates, winner_count)
 
-    # ❌ no winners case
     if not chosen:
         try:
             await channel.send("🏁 Giveaway ended, but there were no valid entries.")
@@ -1558,12 +1565,15 @@ async def finish_giveaway(reason: str = "ended"):
     embed = discord.Embed(
         title="🏁 Giveaway Ended",
         description=(
-            f"**Prize:** {giveaway.get('prize')}\n\n"
+            f"**Prize:** {giveaway['prize']}\n\n"
             f"**Winners:**\n{mentions}"
         ),
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow()
     )
+
+    if giveaway.get("thumbnail"):
+        embed.set_thumbnail(url=giveaway["thumbnail"])
 
     try:
         await channel.send(embed=embed)
@@ -1850,34 +1860,20 @@ async def giveaway_end(interaction: discord.Interaction):
 
 @tasks.loop(seconds=30)
 async def check_giveaway_event():
-
-    # 🧠 ALWAYS repair broken state first
     force_sync_giveaway_state()
 
     giveaway = get_active_giveaway()
-
-    # 🔒 if nothing active, exit cleanly
     if not giveaway or int(giveaway["active"]) != 1:
         return
 
-    # ⏰ auto end check (source of truth = DB only)
     if int(time.time()) >= int(giveaway["end_time"]):
         await finish_giveaway("auto end")
         return
 
-    # 🧠 ALSO sync invite event safety
     invite_event = get_active_event()
-
     if not invite_event or not invite_event["active"]:
         await finish_giveaway("invite event ended")
         return
-
-
-async def setup_giveaway_system():
-    if not check_giveaway_event.is_running():
-        check_giveaway_event.start()
-
-    bot.add_view(GiveawayView())
 
 class InviteView(discord.ui.View):
     def __init__(self):
@@ -5272,6 +5268,10 @@ def start_bot_loops():
     if not clan_leave_loop.is_running():
         clan_leave_loop.start()
 
+    # ---------------- GIVEAWAY LOOP ----------------
+    if not check_giveaway_event.is_running():
+        check_giveaway_event.start()
+
 
 # ---------------- READY ----------------
 @bot.event
@@ -5325,7 +5325,11 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Invite system failed: {e}")
 
-    print("✅ ON_READY DONE")
+    # ---------------- STARTUP SAFETY DELAY ----------------
+    try:
+        await asyncio.sleep(1)
+    except Exception:
+        pass
 
     # ---------------- GIVEAWAY SELF-HEAL ----------------
     try:
@@ -5333,6 +5337,8 @@ async def on_ready():
         print("🎁 Giveaway state synced")
     except Exception as e:
         print(f"❌ Giveaway sync error: {e}")
+
+    print("✅ ON_READY DONE")
 # ---------------- CLEANUP ----------------
 @bot.event
 async def on_disconnect():
