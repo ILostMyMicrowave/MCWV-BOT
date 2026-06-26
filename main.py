@@ -1522,7 +1522,7 @@ async def finish_giveaway(reason: str = "ended"):
         return
 
     channel = None
-    channel_id = giveaway.get("channel_id")
+    channel_id = giveaway["channel_id"]
 
     # ---------------- CHANNEL SAFETY ----------------
     try:
@@ -1541,8 +1541,8 @@ async def finish_giveaway(reason: str = "ended"):
     print("📡 Channel resolved:", channel.id)
 
     # ---------------- ENTRY SETTINGS ----------------
-    invites_per_entry = max(1, int(giveaway.get("invites_per_entry") or 2))
-    winner_count = max(1, int(giveaway.get("winners") or 1))
+    invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
+    winner_count = max(1, int(giveaway["winners"] or 1))
 
     # ---------------- FETCH ENTRIES ----------------
     rows = db_fetchall("""
@@ -1581,14 +1581,14 @@ async def finish_giveaway(reason: str = "ended"):
     embed = discord.Embed(
         title="🏁 Giveaway Ended",
         description=(
-            f"**Prize:** {giveaway.get('prize', 'Unknown')}\n\n"
+            f"**Prize:** {giveaway['prize'] if giveaway['prize'] else 'Unknown'}\n\n"
             f"**Winners:**\n{mentions}"
         ),
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow()
     )
 
-    if giveaway.get("thumbnail"):
+    if giveaway["thumbnail"]:
         embed.set_thumbnail(url=giveaway["thumbnail"])
 
     # ---------------- SEND RESULT ----------------
