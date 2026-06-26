@@ -140,6 +140,18 @@ async def load_invite_snapshot(guild: discord.Guild):
         for inv in invites
     }
 
+def force_sync_giveaway_state():
+    giveaway = get_active_giveaway()
+    if not giveaway:
+        return
+
+    if int(giveaway["active"]) != 1:
+        return
+
+    if int(time.time()) >= int(giveaway["end_time"]):
+        db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+        print("🛠️ Auto-fixed expired giveaway state")
+
 def mastery_gap(level: int) -> int:
     xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
     if level == 98:
@@ -1499,18 +1511,24 @@ async def log_giveaway_edit(action: str, before: Optional[dict], after: Optional
 
 async def finish_giveaway(reason: str = "ended"):
     giveaway = get_active_giveaway()
+
+    # 🔒 already ended / no giveaway
     if not giveaway or not giveaway["active"]:
+        print("⚠️ finish_giveaway called but nothing active")
         return
 
-    invite_event = get_active_event()
-    channel = bot.get_channel(int(giveaway["channel_id"])) if giveaway["channel_id"] else None
+    channel_id = giveaway.get("channel_id")
+    channel = bot.get_channel(int(channel_id)) if channel_id else None
+
+    # 🧠 ALWAYS mark as ended first (prevents locking system)
+    db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
 
     if not channel:
-        db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+        print("❌ Giveaway channel not found, state still cleared")
         return
 
-    invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
-    winner_count = max(1, int(giveaway["winners"] or 1))
+    invites_per_entry = max(1, int(giveaway.get("invites_per_entry") or 2))
+    winner_count = max(1, int(giveaway.get("winners") or 1))
 
     rows = db_fetchall("""
         SELECT user_id, invites
@@ -1527,12 +1545,12 @@ async def finish_giveaway(reason: str = "ended"):
 
     chosen = weighted_unique_winners(candidates, winner_count)
 
-    db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
-
+    # ❌ no winners case
     if not chosen:
-        await channel.send(
-            "🏁 Giveaway ended, but there were no valid entries."
-        )
+        try:
+            await channel.send("🏁 Giveaway ended, but there were no valid entries.")
+        except Exception as e:
+            print("Send failed (no winners):", e)
         return
 
     mentions = "\n".join(f"<@{uid}>" for uid in chosen)
@@ -1540,20 +1558,26 @@ async def finish_giveaway(reason: str = "ended"):
     embed = discord.Embed(
         title="🏁 Giveaway Ended",
         description=(
-            f"**Prize:** {giveaway['prize']}\n"
+            f"**Prize:** {giveaway.get('prize')}\n\n"
             f"**Winners:**\n{mentions}"
         ),
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow()
     )
 
-    await channel.send(embed=embed)
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print("❌ Failed to send giveaway embed:", e)
 
     log_channel = bot.get_channel(GIVEAWAY_LOG_CHANNEL_ID)
     if log_channel:
-        await log_channel.send(
-            f"🎁 Giveaway ended ({reason}). Winners: {', '.join(str(uid) for uid in chosen)}"
-        )
+        try:
+            await log_channel.send(
+                f"🎁 Giveaway ended ({reason}). Winners: {', '.join(str(uid) for uid in chosen)}"
+            )
+        except Exception as e:
+            print("Log send failed:", e)
 
 
 class GiveawayView(discord.ui.View):
@@ -1826,17 +1850,27 @@ async def giveaway_end(interaction: discord.Interaction):
 
 @tasks.loop(seconds=30)
 async def check_giveaway_event():
+
+    # 🧠 ALWAYS repair broken state first
+    force_sync_giveaway_state()
+
     giveaway = get_active_giveaway()
-    if not giveaway or not giveaway["active"]:
+
+    # 🔒 if nothing active, exit cleanly
+    if not giveaway or int(giveaway["active"]) != 1:
         return
 
+    # ⏰ auto end check (source of truth = DB only)
+    if int(time.time()) >= int(giveaway["end_time"]):
+        await finish_giveaway("auto end")
+        return
+
+    # 🧠 ALSO sync invite event safety
     invite_event = get_active_event()
-    if not invite_event or not invite_event["active"]:
-        await finish_giveaway(reason="invite event ended")
-        return
 
-    if int(time.time()) >= int(invite_event["end_time"]):
-        await finish_giveaway(reason="auto end")
+    if not invite_event or not invite_event["active"]:
+        await finish_giveaway("invite event ended")
+        return
 
 
 async def setup_giveaway_system():
@@ -5293,7 +5327,12 @@ async def on_ready():
 
     print("✅ ON_READY DONE")
 
-
+    # ---------------- GIVEAWAY SELF-HEAL ----------------
+    try:
+        force_sync_giveaway_state()
+        print("🎁 Giveaway state synced")
+    except Exception as e:
+        print(f"❌ Giveaway sync error: {e}")
 # ---------------- CLEANUP ----------------
 @bot.event
 async def on_disconnect():
