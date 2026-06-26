@@ -1513,63 +1513,75 @@ async def log_giveaway_edit(action: str, before: Optional[dict], after: Optional
 
 
 async def finish_giveaway(reason: str = "ended"):
+    print("🔥 finish_giveaway TRIGGERED:", reason)
+
     giveaway = get_active_giveaway()
 
     if not giveaway or int(giveaway["active"]) != 1:
-        print("⚠️ finish_giveaway called but nothing active")
+        print("⚠️ No active giveaway found")
         return
 
-    channel_id = giveaway["channel_id"]
     channel = None
+    channel_id = giveaway.get("channel_id")
 
-    if channel_id:
-        try:
+    # ---------------- CHANNEL SAFETY ----------------
+    try:
+        if channel_id:
             channel = bot.get_channel(int(channel_id))
             if channel is None:
                 channel = await bot.fetch_channel(int(channel_id))
-        except Exception as e:
-            print("❌ Failed to fetch giveaway channel:", e)
-            return
-
-    if channel is None:
-        print("❌ Giveaway channel not found after fetch")
+    except Exception as e:
+        print("❌ Channel fetch failed:", repr(e))
         return
 
-    invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
-    winner_count = max(1, int(giveaway["winners"] or 1))
+    if channel is None:
+        print("❌ Giveaway channel is None (cannot send)")
+        return
 
+    print("📡 Channel resolved:", channel.id)
+
+    # ---------------- ENTRY SETTINGS ----------------
+    invites_per_entry = max(1, int(giveaway.get("invites_per_entry") or 2))
+    winner_count = max(1, int(giveaway.get("winners") or 1))
+
+    # ---------------- FETCH ENTRIES ----------------
     rows = db_fetchall("""
         SELECT user_id, invites
         FROM invite_counts
-        ORDER BY invites DESC, user_id ASC
+        ORDER BY invites DESC
     """)
 
     candidates = []
+
     for row in rows:
         invites = int(row["invites"] or 0)
         entries = invites // invites_per_entry
+
         if entries > 0:
             candidates.append((int(row["user_id"]), entries))
 
+    print(f"📊 Candidates found: {len(candidates)}")
+
     chosen = weighted_unique_winners(candidates, winner_count)
 
+    # ---------------- NO WINNERS ----------------
     if not chosen:
         try:
-            await channel.send("🏁 Giveaway ended, but there were no valid entries.")
+            await channel.send("🏁 Giveaway ended — no valid entries.")
         except Exception as e:
-            print("Send failed (no winners):", e)
-            return
+            print("❌ Failed to send no-winner message:", repr(e))
 
         db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
-        print("🏁 Giveaway marked inactive")
+        print("🏁 Giveaway closed (no winners)")
         return
 
+    # ---------------- WINNER MESSAGE ----------------
     mentions = "\n".join(f"<@{uid}>" for uid in chosen)
 
     embed = discord.Embed(
         title="🏁 Giveaway Ended",
         description=(
-            f"**Prize:** {giveaway['prize']}\n\n"
+            f"**Prize:** {giveaway.get('prize', 'Unknown')}\n\n"
             f"**Winners:**\n{mentions}"
         ),
         color=discord.Color.gold(),
@@ -1579,23 +1591,27 @@ async def finish_giveaway(reason: str = "ended"):
     if giveaway.get("thumbnail"):
         embed.set_thumbnail(url=giveaway["thumbnail"])
 
+    # ---------------- SEND RESULT ----------------
     try:
-        await channel.send(embed=embed)
+        msg = await channel.send(embed=embed)
+        print("✅ Giveaway sent:", msg.id)
     except Exception as e:
-        print("❌ Failed to send giveaway embed:", e)
+        print("❌ Failed to send giveaway embed:", repr(e))
         return
 
+    # ---------------- CLOSE GIVEAWAY ----------------
     db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
     print("🏁 Giveaway marked inactive")
 
-    log_channel = bot.get_channel(GIVEAWAY_LOG_CHANNEL_ID)
-    if log_channel:
-        try:
+    # ---------------- LOG ----------------
+    try:
+        log_channel = bot.get_channel(GIVEAWAY_LOG_CHANNEL_ID)
+        if log_channel:
             await log_channel.send(
-                f"🎁 Giveaway ended ({reason}). Winners: {', '.join(str(uid) for uid in chosen)}"
+                f"🎁 Giveaway ended ({reason}). Winners: {', '.join(map(str, chosen))}"
             )
-        except Exception as e:
-            print("Log send failed:", e)
+    except Exception as e:
+        print("❌ Log send failed:", repr(e))
 
 
 class GiveawayView(discord.ui.View):
