@@ -94,7 +94,6 @@ def init_invite_tables():
     )
     """)
 
-    # Make sure there is always a row to read/write
     db_exec("""
     INSERT OR IGNORE INTO invite_events (id, active, start_time, end_time, channel_id)
     VALUES (1, 0, 0, 0, 0)
@@ -104,12 +103,19 @@ def init_invite_tables():
 init_invite_tables()
 
 
-def get_active_event():
-    return db_fetchone("SELECT * FROM invite_events WHERE id = 1")
+def get_giveaway_row():
+    return db_fetchone("SELECT * FROM giveaway_events WHERE id = 1")
 
 
 def get_active_giveaway():
-    return db_fetchone("SELECT * FROM giveaway_events WHERE id = 1")
+    giveaway = get_giveaway_row()
+    if giveaway and int(giveaway["active"] or 0) == 1:
+        return giveaway
+    return None
+
+
+def get_active_event():
+    return db_fetchone("SELECT * FROM invite_events WHERE id = 1")
 
 
 def increment_invite_count(user_id: int, amount: int = 1):
@@ -152,16 +158,14 @@ async def load_invite_snapshot(guild: discord.Guild):
 
 
 def force_sync_giveaway_state():
-    giveaway = get_active_giveaway()
+    giveaway = get_giveaway_row()
     if not giveaway:
         return
 
-    if int(giveaway["active"]) != 1:
-        return
-
-    if int(time.time()) >= int(giveaway["end_time"]):
+    # only repair the row if needed, do NOT end it here
+    if int(giveaway["active"] or 0) not in (0, 1):
         db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
-        print("🛠️ Auto-fixed expired giveaway state")
+        print("🛠️ Fixed invalid giveaway active state")
 
 def mastery_gap(level: int) -> int:
     xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
@@ -1899,16 +1903,16 @@ async def giveaway_end(interaction: discord.Interaction):
             ephemeral=True
         )
 
-
 @tasks.loop(seconds=30)
 async def check_giveaway_event():
-    force_sync_giveaway_state()
-
-    giveaway = get_active_giveaway()
-    if not giveaway or int(giveaway["active"]) != 1:
+    giveaway = get_giveaway_row()
+    if not giveaway:
         return
 
-    if int(time.time()) >= int(giveaway["end_time"]):
+    if int(giveaway["active"] or 0) != 1:
+        return
+
+    if int(time.time()) >= int(giveaway["end_time"] or 0):
         await finish_giveaway("auto end")
         return
 
@@ -1916,7 +1920,7 @@ async def check_giveaway_event():
     if not invite_event or not invite_event["active"]:
         await finish_giveaway("invite event ended")
         return
-
+        
 class InviteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
