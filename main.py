@@ -62,6 +62,7 @@ def db_fetchall(query, params=()):
         cur = conn.execute(query, params)
         return cur.fetchall()
 
+
 def init_invite_tables():
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_events (
@@ -93,24 +94,21 @@ def init_invite_tables():
     )
     """)
 
+
 init_invite_tables()
 
+
 def get_active_event():
-    return db_fetchone(
-        "SELECT * FROM invite_events WHERE id = 1"
-    )
+    return db_fetchone("SELECT * FROM invite_events WHERE id = 1")
 
 
 def increment_invite_count(user_id: int, amount: int = 1):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO invite_counts (user_id, invites)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id)
-            DO UPDATE SET invites = invite_counts.invites + %s
-        """, (user_id, amount, amount))
-
-    conn.commit()
+    db_exec("""
+        INSERT INTO invite_counts (user_id, invites)
+        VALUES (?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET invites = invites + ?
+    """, (user_id, amount, amount))
 
 
 def get_invite_channel(guild, bot):
@@ -141,7 +139,6 @@ async def load_invite_snapshot(guild: discord.Guild):
         inv.code: int(inv.uses or 0)
         for inv in invites
     }
-
 
 def mastery_gap(level: int) -> int:
     xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
