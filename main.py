@@ -94,12 +94,22 @@ def init_invite_tables():
     )
     """)
 
+    # Make sure there is always a row to read/write
+    db_exec("""
+    INSERT OR IGNORE INTO invite_events (id, active, start_time, end_time, channel_id)
+    VALUES (1, 0, 0, 0, 0)
+    """)
+
 
 init_invite_tables()
 
 
 def get_active_event():
     return db_fetchone("SELECT * FROM invite_events WHERE id = 1")
+
+
+def get_active_giveaway():
+    return db_fetchone("SELECT * FROM giveaway_events WHERE id = 1")
 
 
 def increment_invite_count(user_id: int, amount: int = 1):
@@ -139,6 +149,7 @@ async def load_invite_snapshot(guild: discord.Guild):
         inv.code: int(inv.uses or 0)
         for inv in invites
     }
+
 
 def force_sync_giveaway_state():
     giveaway = get_active_giveaway()
