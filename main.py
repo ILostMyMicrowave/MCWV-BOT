@@ -1343,6 +1343,508 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
+import random
+import secrets
+from typing import Optional, List, Tuple
+
+GIVEAWAY_EDIT_ROLE_ID = 1501985889964789962
+GIVEAWAY_LOG_CHANNEL_ID = 1502001938705682622
+
+
+def init_giveaway_tables():
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS giveaway_events (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        active INTEGER DEFAULT 0,
+        prize TEXT,
+        winners INTEGER DEFAULT 1,
+        invites_per_entry INTEGER DEFAULT 2,
+        start_time INTEGER DEFAULT 0,
+        end_time INTEGER DEFAULT 0,
+        channel_id BIGINT,
+        message_id BIGINT,
+        thumbnail TEXT,
+        created_by BIGINT
+    )
+    """)
+
+    # Required so leaves can invalidate joins live
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS invite_member_links (
+        member_id BIGINT PRIMARY KEY,
+        inviter_id BIGINT NOT NULL
+    )
+    """)
+
+
+init_giveaway_tables()
+
+
+def has_edit_role(member: discord.Member) -> bool:
+    return any(role.id == GIVEAWAY_EDIT_ROLE_ID for role in member.roles)
+
+
+def get_active_giveaway():
+    return db_fetchone("SELECT * FROM giveaway_events WHERE id = 1")
+
+
+def get_valid_invites(user_id: int) -> int:
+    row = db_fetchone(
+        "SELECT invites FROM invite_counts WHERE user_id = ?",
+        (user_id,)
+    )
+    return int(row["invites"]) if row else 0
+
+
+def get_user_entries(user_id: int, invites_per_entry: int) -> int:
+    invites_per_entry = max(1, int(invites_per_entry))
+    return get_valid_invites(user_id) // invites_per_entry
+
+
+def build_giveaway_embed(giveaway_row):
+    prize = giveaway_row["prize"] or "Unknown prize"
+    winners = int(giveaway_row["winners"] or 1)
+    invites_per_entry = max(1, int(giveaway_row["invites_per_entry"] or 2))
+    end_time = int(giveaway_row["end_time"] or 0)
+
+    embed = discord.Embed(
+        title="🎁 Giveaway Event",
+        description=(
+            "This giveaway is running during the active invite event.\n\n"
+            f"🏆 **Prize:** {prize}\n"
+            f"👑 **Winners:** {winners}\n"
+            f"🔁 **Entry rate:** {invites_per_entry} invites = 1 entry\n"
+            f"⏳ **Ends:** <t:{end_time}:R>\n"
+        ),
+        color=discord.Color.blurple()
+    )
+
+    thumb = giveaway_row["thumbnail"]
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+
+    embed.set_footer(text="Entries update live from valid invites only")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+def weighted_unique_winners(candidates: List[Tuple[int, int]], winner_count: int) -> List[int]:
+    rng = secrets.SystemRandom()
+    pool = [(uid, weight) for uid, weight in candidates if weight > 0]
+    winners: List[int] = []
+
+    winner_count = min(max(1, int(winner_count)), len(pool))
+    for _ in range(winner_count):
+        total_weight = sum(weight for _, weight in pool)
+        if total_weight <= 0:
+            break
+
+        pick = rng.randrange(total_weight)
+        running = 0
+        chosen_index = None
+
+        for idx, (uid, weight) in enumerate(pool):
+            running += weight
+            if pick < running:
+                chosen_index = idx
+                break
+
+        if chosen_index is None:
+            break
+
+        chosen_uid = pool.pop(chosen_index)[0]
+        winners.append(chosen_uid)
+
+    return winners
+
+
+async def log_giveaway_edit(action: str, before: Optional[dict], after: Optional[dict], edited_by: discord.Member):
+    channel = bot.get_channel(GIVEAWAY_LOG_CHANNEL_ID)
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title=f"📝 Giveaway {action}",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Edited by", value=f"{edited_by} (`{edited_by.id}`)", inline=False)
+
+    if before is not None:
+        embed.add_field(
+            name="Before",
+            value=(
+                f"Prize: {before['prize']}\n"
+                f"Winners: {before['winners']}\n"
+                f"Invites/Entry: {before['invites_per_entry']}\n"
+                f"Thumbnail: {before['thumbnail'] or 'None'}"
+            ),
+            inline=False
+        )
+
+    if after is not None:
+        embed.add_field(
+            name="After",
+            value=(
+                f"Prize: {after['prize']}\n"
+                f"Winners: {after['winners']}\n"
+                f"Invites/Entry: {after['invites_per_entry']}\n"
+                f"Thumbnail: {after['thumbnail'] or 'None'}"
+            ),
+            inline=False
+        )
+
+    await channel.send(embed=embed)
+
+
+async def finish_giveaway(reason: str = "ended"):
+    giveaway = get_active_giveaway()
+    if not giveaway or not giveaway["active"]:
+        return
+
+    invite_event = get_active_event()
+    channel = bot.get_channel(int(giveaway["channel_id"])) if giveaway["channel_id"] else None
+
+    if not channel:
+        db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+        return
+
+    invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
+    winner_count = max(1, int(giveaway["winners"] or 1))
+
+    rows = db_fetchall("""
+        SELECT user_id, invites
+        FROM invite_counts
+        ORDER BY invites DESC, user_id ASC
+    """)
+
+    candidates = []
+    for row in rows:
+        invites = int(row["invites"] or 0)
+        entries = invites // invites_per_entry
+        if entries > 0:
+            candidates.append((int(row["user_id"]), entries))
+
+    chosen = weighted_unique_winners(candidates, winner_count)
+
+    db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+
+    if not chosen:
+        await channel.send(
+            "🏁 Giveaway ended, but there were no valid entries."
+        )
+        return
+
+    mentions = "\n".join(f"<@{uid}>" for uid in chosen)
+
+    embed = discord.Embed(
+        title="🏁 Giveaway Ended",
+        description=(
+            f"**Prize:** {giveaway['prize']}\n"
+            f"**Winners:**\n{mentions}"
+        ),
+        color=discord.Color.gold(),
+        timestamp=discord.utils.utcnow()
+    )
+
+    await channel.send(embed=embed)
+
+    log_channel = bot.get_channel(GIVEAWAY_LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(
+            f"🎁 Giveaway ended ({reason}). Winners: {', '.join(str(uid) for uid in chosen)}"
+        )
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="My Entries",
+        style=discord.ButtonStyle.green,
+        custom_id="giveaway_my_entries"
+    )
+    async def my_entries(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway = get_active_giveaway()
+        if not giveaway or not giveaway["active"]:
+            return await interaction.response.send_message(
+                "❌ No active giveaway right now.",
+                ephemeral=True
+            )
+
+        invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
+        invites = get_valid_invites(interaction.user.id)
+        entries = invites // invites_per_entry
+
+        embed = discord.Embed(
+            title="📊 Your Giveaway Stats",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="Valid invites", value=str(invites), inline=True)
+        embed.add_field(name="Entries", value=str(entries), inline=True)
+        embed.add_field(name="Rate", value=f"{invites_per_entry} invites = 1 entry", inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
+        label="Leaderboard",
+        style=discord.ButtonStyle.blurple,
+        custom_id="giveaway_leaderboard"
+    )
+    async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway = get_active_giveaway()
+        if not giveaway or not giveaway["active"]:
+            return await interaction.response.send_message(
+                "❌ No active giveaway right now.",
+                ephemeral=True
+            )
+
+        invites_per_entry = max(1, int(giveaway["invites_per_entry"] or 2))
+        rows = db_fetchall("""
+            SELECT user_id, invites
+            FROM invite_counts
+            ORDER BY invites DESC, user_id ASC
+        """)
+
+        lines = []
+        rank = 1
+        for row in rows:
+            invites = int(row["invites"] or 0)
+            entries = invites // invites_per_entry
+            if entries <= 0:
+                continue
+            lines.append(f"{rank}. <@{row['user_id']}> — {entries} entries ({invites} invites)")
+            rank += 1
+            if rank > 10:
+                break
+
+        if not lines:
+            return await interaction.response.send_message(
+                "No entries yet.",
+                ephemeral=True
+            )
+
+        embed = discord.Embed(
+            title="🏆 Giveaway Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.blurple()
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="giveaway_start", guild=guild_obj)
+@require_role()
+@app_commands.describe(
+    prize="What is being given away",
+    winners="How many winners",
+    invites_per_entry="How many valid invites are needed for 1 entry",
+    thumbnail_url="Optional image link for the embed"
+)
+async def giveaway_start(
+    interaction: discord.Interaction,
+    prize: str,
+    winners: int,
+    invites_per_entry: int,
+    thumbnail_url: str = None
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        if not interaction.guild or not interaction.channel:
+            return await interaction.followup.send(
+                "❌ This command only works in a server channel.",
+                ephemeral=True
+            )
+
+        invite_event = get_active_event()
+        if not invite_event or not invite_event["active"]:
+            return await interaction.followup.send(
+                "❌ There is no active invite event.",
+                ephemeral=True
+            )
+
+        if int(time.time()) >= int(invite_event["end_time"]):
+            return await interaction.followup.send(
+                "❌ The invite event has already ended.",
+                ephemeral=True
+            )
+
+        existing = get_active_giveaway()
+        if existing and existing["active"]:
+            return await interaction.followup.send(
+                "❌ There is already an active giveaway.",
+                ephemeral=True
+            )
+
+        winners = max(1, int(winners))
+        invites_per_entry = max(1, int(invites_per_entry))
+        end_time = int(invite_event["end_time"])
+
+        db_exec("""
+            INSERT INTO giveaway_events (
+                id, active, prize, winners, invites_per_entry,
+                start_time, end_time, channel_id, message_id, thumbnail, created_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                active = excluded.active,
+                prize = excluded.prize,
+                winners = excluded.winners,
+                invites_per_entry = excluded.invites_per_entry,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                channel_id = excluded.channel_id,
+                message_id = excluded.message_id,
+                thumbnail = excluded.thumbnail,
+                created_by = excluded.created_by
+        """, (
+            1, 1, prize, winners, invites_per_entry,
+            int(time.time()), end_time, interaction.channel_id, None,
+            thumbnail_url if thumbnail_url and thumbnail_url.startswith("http") else None,
+            interaction.user.id
+        ))
+
+        giveaway = get_active_giveaway()
+        embed = build_giveaway_embed(giveaway)
+        message = await interaction.channel.send(embed=embed, view=GiveawayView())
+
+        db_exec(
+            "UPDATE giveaway_events SET message_id = ? WHERE id = 1",
+            (message.id,)
+        )
+
+        await interaction.followup.send(
+            "✅ Giveaway started publicly in the channel.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        import traceback
+        print("[giveaway_start error]")
+        print(traceback.format_exc())
+        await interaction.followup.send(
+            f"❌ {type(e).__name__}: {e}",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="giveaway_edit", guild=guild_obj)
+async def giveaway_edit(
+    interaction: discord.Interaction,
+    prize: str = None,
+    winners: int = None,
+    invites_per_entry: int = None,
+    thumbnail_url: str = None
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        if not interaction.guild:
+            return await interaction.followup.send("❌ Guild only.", ephemeral=True)
+
+        if not isinstance(interaction.user, discord.Member) or not has_edit_role(interaction.user):
+            return await interaction.followup.send(
+                "❌ You do not have permission to edit giveaways.",
+                ephemeral=True
+            )
+
+        giveaway = get_active_giveaway()
+        if not giveaway or not giveaway["active"]:
+            return await interaction.followup.send(
+                "❌ No active giveaway to edit.",
+                ephemeral=True
+            )
+
+        before = {
+            "prize": giveaway["prize"],
+            "winners": int(giveaway["winners"] or 1),
+            "invites_per_entry": int(giveaway["invites_per_entry"] or 2),
+            "thumbnail": giveaway["thumbnail"]
+        }
+
+        new_prize = prize if prize is not None else giveaway["prize"]
+        new_winners = max(1, int(winners)) if winners is not None else int(giveaway["winners"] or 1)
+        new_invites_per_entry = max(1, int(invites_per_entry)) if invites_per_entry is not None else int(giveaway["invites_per_entry"] or 2)
+        new_thumbnail = thumbnail_url if thumbnail_url is not None else giveaway["thumbnail"]
+        if new_thumbnail and not str(new_thumbnail).startswith("http"):
+            new_thumbnail = None
+
+        db_exec("""
+            UPDATE giveaway_events
+            SET prize = ?, winners = ?, invites_per_entry = ?, thumbnail = ?
+            WHERE id = 1
+        """, (new_prize, new_winners, new_invites_per_entry, new_thumbnail))
+
+        after = {
+            "prize": new_prize,
+            "winners": new_winners,
+            "invites_per_entry": new_invites_per_entry,
+            "thumbnail": new_thumbnail
+        }
+
+        await log_giveaway_edit("edited", before, after, interaction.user)
+
+        await interaction.followup.send("✅ Giveaway updated.", ephemeral=True)
+
+    except Exception as e:
+        import traceback
+        print("[giveaway_edit error]")
+        print(traceback.format_exc())
+        await interaction.followup.send(
+            f"❌ {type(e).__name__}: {e}",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="giveaway_end", guild=guild_obj)
+@require_role()
+async def giveaway_end(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        giveaway = get_active_giveaway()
+        if not giveaway or not giveaway["active"]:
+            return await interaction.followup.send(
+                "❌ No active giveaway.",
+                ephemeral=True
+            )
+
+        await finish_giveaway(reason="manual end")
+        await interaction.followup.send("✅ Giveaway ended and winners picked.", ephemeral=True)
+
+    except Exception as e:
+        import traceback
+        print("[giveaway_end error]")
+        print(traceback.format_exc())
+        await interaction.followup.send(
+            f"❌ {type(e).__name__}: {e}",
+            ephemeral=True
+        )
+
+
+@tasks.loop(seconds=30)
+async def check_giveaway_event():
+    giveaway = get_active_giveaway()
+    if not giveaway or not giveaway["active"]:
+        return
+
+    invite_event = get_active_event()
+    if not invite_event or not invite_event["active"]:
+        await finish_giveaway(reason="invite event ended")
+        return
+
+    if int(time.time()) >= int(invite_event["end_time"]):
+        await finish_giveaway(reason="auto end")
+
+
+async def setup_giveaway_system():
+    if not check_giveaway_event.is_running():
+        check_giveaway_event.start()
+
+    bot.add_view(GiveawayView())
+
 class InviteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1621,7 +2123,6 @@ async def end_invite_event(interaction: discord.Interaction):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-
     if member.bot:
         return
 
@@ -1629,7 +2130,7 @@ async def on_member_join(member: discord.Member):
     if not event or not event["active"]:
         return
 
-    if int(time.time()) >= event["end_time"]:
+    if int(time.time()) >= int(event["end_time"]):
         return
 
     # first join only
@@ -1650,7 +2151,6 @@ async def on_member_join(member: discord.Member):
         before = INVITE_SNAPSHOTS.get(member.guild.id, {})
 
     used = None
-
     for inv in after:
         if int(inv.uses or 0) > int(before.get(inv.code, 0)):
             used = inv.code
@@ -1671,7 +2171,42 @@ async def on_member_join(member: discord.Member):
     if not row:
         return
 
-    increment_invite(int(row["inviter_id"]))
+    inviter_id = int(row["inviter_id"])
+
+    increment_invite(inviter_id)
+
+    db_exec(
+        "INSERT OR REPLACE INTO invite_member_links (member_id, inviter_id) VALUES (?, ?)",
+        (member.id, inviter_id)
+    )
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if member.bot:
+        return
+
+    row = db_fetchone(
+        "SELECT inviter_id FROM invite_member_links WHERE member_id = ?",
+        (member.id,)
+    )
+
+    if not row:
+        return
+
+    inviter_id = int(row["inviter_id"])
+
+    # remove mapping
+    db_exec(
+        "DELETE FROM invite_member_links WHERE member_id = ?",
+        (member.id,)
+    )
+
+    # decrease invite count safely
+    db_exec("""
+        UPDATE invite_counts
+        SET invites = CASE WHEN invites > 0 THEN invites - 1 ELSE 0 END
+        WHERE user_id = ?
+    """, (inviter_id,))
 
 @bot.tree.command(name="inviteleaderboard", guild=guild_obj)
 async def inviteleaderboard(interaction: discord.Interaction):
