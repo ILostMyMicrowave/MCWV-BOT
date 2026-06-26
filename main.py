@@ -1343,7 +1343,6 @@ async def on_ready():
         clan_leave_loop.start()
 
 # ---------------- SLASH COMMANDS ----------------
-
 class InviteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1363,6 +1362,12 @@ class InviteView(discord.ui.View):
             )
 
         guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message(
+                "❌ This can only be used in a server.",
+                ephemeral=True
+            )
+
         channel = get_invite_channel(guild, interaction.client)
 
         if not channel:
@@ -1392,6 +1397,32 @@ class InviteView(discord.ui.View):
             f"Your invite link:\n{invite.url}",
             ephemeral=True
         )
+
+    @discord.ui.button(
+        label="My Invites",
+        style=discord.ButtonStyle.green,
+        custom_id="invite_event_my_invites"
+    )
+    async def my_invites_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        row = db_fetchone(
+            "SELECT invites FROM invite_counts WHERE user_id = ?",
+            (interaction.user.id,)
+        )
+
+        invites = row["invites"] if row else 0
+
+        embed = discord.Embed(
+            title="📊 Invite Stats",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(
+            name="Your Invites",
+            value=str(invites),
+            inline=False
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------- INVITE DEBUG TOOLKIT ----------------
 
@@ -1516,12 +1547,10 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
         start = int(time.time())
         end = start + (duration_hours * 3600)
 
-        # reset tracking for this event
         db_exec("DELETE FROM invite_counts")
         db_exec("DELETE FROM invite_used_users")
         db_exec("DELETE FROM invite_cache")
 
-        # SQLite upsert
         db_exec("""
             INSERT INTO invite_events
             (id, active, start_time, end_time, channel_id)
@@ -1542,24 +1571,27 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
             description=(
                 f"**Duration:** {duration_hours} hour(s)\n"
                 f"**Ends:** <t:{end}:R>\n\n"
-                "Click the button below to get your personal invite link.\n"
-                "Only first-time joins count."
+                "Click the buttons below to get your invite link or view your stats.\n"
+                "Only first-time joins are counted."
             ),
             color=discord.Color.green()
         )
 
-        await interaction.followup.send(embed=embed, view=InviteView())
+        # 🔥 PUBLIC MESSAGE (IMPORTANT)
+        await interaction.channel.send(embed=embed, view=InviteView())
+
+        # private confirmation
+        await interaction.followup.send("✅ Invite event started.", ephemeral=True)
 
     except Exception as e:
         import traceback
-        print("[host_invite_event error]")
         print(traceback.format_exc())
 
         await interaction.followup.send(
             f"❌ {type(e).__name__}: {e}",
             ephemeral=True
         )
-
+        
 @bot.tree.command(name="end_invite_event", guild=guild_obj)
 @require_role()
 async def end_invite_event(interaction: discord.Interaction):
