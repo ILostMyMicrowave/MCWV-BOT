@@ -2623,17 +2623,28 @@ async def clanwar(interaction: discord.Interaction):
         status_cache.clear()
         await interaction.response.send_message("CLAN WAR OVER. GG EVERYONE!!")
 
+ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+
 @bot.tree.command(name="warinfo", description="Show current PS99 clan war details", guild=guild_obj)
 async def warinfo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
 
     try:
-        async with session.get(PS99_API) as r:
+        async with session.get(ACTIVE_BATTLE_API) as r:
             if r.status != 200:
                 return await interaction.followup.send(
-                    "❌ Could not reach the PS99 API right now.",
+                    "❌ Could not reach the PS99 war API right now.",
                     ephemeral=True
                 )
+
+            if "application/json" not in r.headers.get("Content-Type", ""):
+                text = await r.text()
+                print("[warinfo] war api returned non-JSON:", text[:200])
+                return await interaction.followup.send(
+                    "❌ War API returned invalid data.",
+                    ephemeral=True
+                )
+
             war_data = await r.json()
 
         async with session.get(CLAN_API) as r:
@@ -2642,15 +2653,24 @@ async def warinfo(interaction: discord.Interaction):
                     "❌ Could not reach the clan API right now.",
                     ephemeral=True
                 )
+
+            if "application/json" not in r.headers.get("Content-Type", ""):
+                text = await r.text()
+                print("[warinfo] clan api returned non-JSON:", text[:200])
+                return await interaction.followup.send(
+                    "❌ Clan API returned invalid data.",
+                    ephemeral=True
+                )
+
             clan_data = await r.json()
 
-    except Exception:
+    except Exception as e:
+        print("[warinfo error]", repr(e))
         return await interaction.followup.send(
             "❌ API request failed.",
             ephemeral=True
         )
 
-    # ---------------- CURRENT WAR ----------------
     battle_id, battle = get_current_war(war_data, clan_data)
 
     if not battle:
@@ -2659,7 +2679,6 @@ async def warinfo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    # ---------------- TIMING (BATTLE FIRST, CONFIG FALLBACK) ----------------
     war_config = war_data.get("data", {}).get("configData", {})
 
     start_ts = battle.get("StartTime")
@@ -2683,14 +2702,12 @@ async def warinfo(interaction: discord.Interaction):
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
 
-    # Friendly war name
     friendly_name = re.sub(
         r'(\d+)',
         r' \1',
         re.sub(r'([A-Z])', r' \1', str(battle_id))
     ).strip()
 
-    # ---------------- CONTRIBUTIONS ----------------
     contributions = sorted(
         battle.get("PointContributions", []),
         key=lambda x: x.get("Points", 0),
@@ -2700,7 +2717,6 @@ async def warinfo(interaction: discord.Interaction):
     total_points = battle.get("Points", 0)
     contributor_count = len(contributions)
 
-    # ---------------- TOP CONTRIBUTOR ----------------
     top_name = "Unknown"
     top_discord = "Not linked"
     top_points = 0
@@ -2719,7 +2735,6 @@ async def warinfo(interaction: discord.Interaction):
         else:
             top_name = str(top_user_id)
 
-    # ---------------- STATUS ----------------
     if now < start_ts:
         status_line = "⏳ UPCOMING"
         color = discord.Color.gold()
@@ -2744,7 +2759,6 @@ async def warinfo(interaction: discord.Interaction):
         m = rem // 60
         time_field = f"Ends {discord.utils.format_dt(finish_dt, 'R')} ({h}h {m}m left)"
 
-    # ---------------- EMBED ----------------
     embed = discord.Embed(
         title=f"🎮 {friendly_name}",
         description=f"**{status_line}**",
@@ -2752,37 +2766,19 @@ async def warinfo(interaction: discord.Interaction):
     )
 
     embed.add_field(name="Progress", value=bar, inline=False)
-
-    embed.add_field(
-        name="🕐 Start",
-        value=discord.utils.format_dt(start_dt, 'F'),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🏁 End",
-        value=discord.utils.format_dt(finish_dt, 'F'),
-        inline=True
-    )
-
-    embed.add_field(
-        name="⏱ Time",
-        value=time_field,
-        inline=False
-    )
-
+    embed.add_field(name="🕐 Start", value=discord.utils.format_dt(start_dt, 'F'), inline=True)
+    embed.add_field(name="🏁 End", value=discord.utils.format_dt(finish_dt, 'F'), inline=True)
+    embed.add_field(name="⏱ Time", value=time_field, inline=False)
     embed.add_field(
         name="🥇 Top Contributor",
         value=f"**{top_name}**\n{top_discord}\n**{format_points(top_points)} pts**",
         inline=True
     )
-
     embed.add_field(
         name="🔢 Clan Total",
         value=f"**{format_points(total_points)} pts**",
         inline=True
     )
-
     embed.add_field(
         name="👥 Contributors",
         value=f"**{contributor_count}**",
@@ -2790,10 +2786,7 @@ async def warinfo(interaction: discord.Interaction):
     )
 
     embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
-
     await interaction.followup.send(embed=embed)
-    
-ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
 
 @bot.tree.command(
     name="leaderboard",
