@@ -33,6 +33,18 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+def get_available_category(guild):
+    for cid in CLAN_MEMBER_CATEGORY_IDS:
+        category = guild.get_channel(cid)
+
+        if not category:
+            continue
+
+        if len(category.channels) < 50:
+            return category
+
+    return None
+
 INVITE_SNAPSHOTS = {}
 INVITE_SYSTEM_READY = False
 
@@ -1042,7 +1054,10 @@ GUILD_ID                  = 1501608673250640055
 CHANNEL_ID                = 1514663069639245904
 ALLOWED_ROLE_ID           = 1501986357516701827  # staff role (run commands)
 CLAN_MEMBER_ROLE_ID       = 1501986780667314246  # given on accept
-CLAN_MEMBERS_CATEGORY_ID  = 1503109089931034785  # ticket moved here on accept
+CLAN_MEMBER_CATEGORY_IDS = [
+    1503109089931034785,  # main
+    1520511998633185280   # backup
+]
 MEMBERS_CHANNEL_ID        = 1509276380674789617  # membership record posted here
 LOG_CHANNEL_ID            = 1502001938705682622  # accept/action log
 PS99_API                  = "https://ps99.biggamesapi.io"
@@ -4052,15 +4067,20 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
             errors.append("❌ Clan member role not found — check CLAN_MEMBER_ROLE_ID.")
 
         # --- move ticket to Clan Members category ---
-        category = guild.get_channel(CLAN_MEMBERS_CATEGORY_ID)
+        category = get_available_category(guild)
+
         if category:
             try:
-                await channel.edit(category=category, sync_permissions=True, reason="Member accepted")
+                await channel.edit(
+                    category=category,
+                    sync_permissions=True,
+                    reason="Member accepted"
+                )
                 actions.append(f"✅ Moved ticket to **{category.name}**")
             except Exception as e:
                 errors.append(f"❌ Could not move ticket: {e}")
         else:
-            errors.append("❌ Clan Members category not found — check CLAN_MEMBERS_CATEGORY_ID.")
+            errors.append("⚠️ All member categories are full — ticket not moved")
 
         # --- post membership record in members channel ---
         members_ch = guild.get_channel(MEMBERS_CHANNEL_ID)
