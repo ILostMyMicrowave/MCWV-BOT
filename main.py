@@ -3683,6 +3683,8 @@ async def clanstats(interaction: discord.Interaction):
             ephemeral=True
         )
 
+ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+
 @bot.tree.command(name="compare", description="Compare two linked clan members head-to-head in the current war", guild=guild_obj)
 async def compare(interaction: discord.Interaction, member1: discord.Member, member2: discord.Member):
     await interaction.response.defer()
@@ -3690,7 +3692,7 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     db_users = db_get_all()
 
     def get_linked(m):
-        return next((u for u in db_users if u[1] == m.id), None)
+        return next((u for u in db_users if int(u[1]) == m.id), None)
 
     link1 = get_linked(member1)
     link2 = get_linked(member2)
@@ -3707,13 +3709,48 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     name1, name2 = link1[2], link2[2]
 
     try:
-        async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
-            if war_r.status != 200 or clan_r.status != 200:
-                return await interaction.followup.send("❌ Could not reach the PS99 API.", ephemeral=True)
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
+            if war_r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 war API.",
+                    ephemeral=True
+                )
+
+            if "application/json" not in war_r.headers.get("Content-Type", ""):
+                text = await war_r.text()
+                print("[COMPARE] War API non-JSON:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 war API returned invalid data.",
+                    ephemeral=True
+                )
+
             war_data = await war_r.json()
+
+        async with session.get(CLAN_API, timeout=timeout) as clan_r:
+            if clan_r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 clan API.",
+                    ephemeral=True
+                )
+
+            if "application/json" not in clan_r.headers.get("Content-Type", ""):
+                text = await clan_r.text()
+                print("[COMPARE] Clan API non-JSON:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 clan API returned invalid data.",
+                    ephemeral=True
+                )
+
             clan_data = await clan_r.json()
-    except Exception:
-        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
+
+    except Exception as e:
+        print("[COMPARE ERROR]", repr(e))
+        return await interaction.followup.send(
+            "❌ API request failed.",
+            ephemeral=True
+        )
 
     war_config = war_data.get("data", {}).get("configData", {})
     active_battle_id = war_config.get("Title") or war_data.get("data", {}).get("configName")
@@ -3736,8 +3773,8 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     )
 
     def get_entry(rid):
-        entry = next((e for e in contributions if e["UserID"] == rid), None)
-        rank = next((i + 1 for i, e in enumerate(contributions) if e["UserID"] == rid), None)
+        entry = next((e for e in contributions if int(e.get("UserID", 0)) == rid), None)
+        rank = next((i + 1 for i, e in enumerate(contributions) if int(e.get("UserID", 0)) == rid), None)
         pts = entry["Points"] if entry else 0
         return pts, rank
 
@@ -3750,13 +3787,13 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     is_active = finish_ts and war_config.get("StartTime", 0) <= now <= finish_ts
     color = discord.Color.red() if is_active else discord.Color.dark_gold()
 
-    # head-to-head bar
     total = pts1 + pts2
     if total > 0:
         share1 = int((pts1 / total) * 20)
         share2 = 20 - share1
     else:
         share1 = share2 = 10
+
     hth_bar = f"{'█' * share1}{'░' * share2}"
     pct1 = (pts1 / total * 100) if total else 50.0
     pct2 = 100 - pct1
@@ -3765,7 +3802,6 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     rank1_display = medals.get(rank1, f"#{rank1}") if rank1 else "—"
     rank2_display = medals.get(rank2, f"#{rank2}") if rank2 else "—"
 
-    winner = ""
     if pts1 > pts2:
         winner = f"\n🏆 **{name1}** is ahead"
     elif pts2 > pts1:
@@ -3789,47 +3825,6 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     status_str = "⚔️ Active" if is_active else "🏁 Ended"
     embed.set_footer(text=f"{status_str} • ps99.biggamesapi.io")
     await interaction.followup.send(embed=embed)
-
-import re
-import asyncio
-from datetime import datetime, timezone
-import aiohttp
-import discord
-
-ROBLOX_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
-
-
-def _is_strict_username(text: str) -> bool:
-    text = text.strip()
-    return bool(ROBLOX_USERNAME_RE.fullmatch(text))
-
-
-def _parse_alt_input(raw: str):
-    raw = raw.strip()
-
-    # exact "none" only
-    if raw == "none":
-        return []
-
-    # reject anything that isn't comma-separated usernames only
-    parts = [p.strip() for p in raw.split(",")]
-    if not parts or any(not p for p in parts):
-        return None
-
-    # every item must be a strict username
-    if any(not _is_strict_username(p) for p in parts):
-        return None
-
-    # de-duplicate while preserving order
-    seen = set()
-    cleaned = []
-    for p in parts:
-        key = p.lower()
-        if key not in seen:
-            seen.add(key)
-            cleaned.append(p)
-
-    return cleaned
 
 
 @bot.tree.command(name="accept", description="Accept an applicant inside a Tickets v2 ticket", guild=guild_obj)
