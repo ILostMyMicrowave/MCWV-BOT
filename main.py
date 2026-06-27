@@ -2976,6 +2976,8 @@ async def leaderboard(interaction: discord.Interaction):
             ephemeral=True
         )
     
+ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+
 @bot.tree.command(
     name="mystats",
     description="Check a Roblox user's clan war contribution stats",
@@ -2983,6 +2985,8 @@ async def leaderboard(interaction: discord.Interaction):
 )
 async def mystats(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
+
+    global session
 
     try:
         # ---------------- RESOLVE USER ----------------
@@ -3001,15 +3005,49 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
         discord_display = f"<@{linked[1]}>" if linked else "Not linked"
 
+        # ---------------- SESSION SAFETY ----------------
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
         # ---------------- API CALL ----------------
-        async with session.get(PS99_API) as war_r, session.get(CLAN_API) as clan_r:
-            if war_r.status != 200 or clan_r.status != 200:
+        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
+            if war_r.status != 200:
+                text = await war_r.text()
+                print("[mystats] war api bad status:", war_r.status, text[:200])
                 return await interaction.followup.send(
-                    "❌ Could not reach the PS99 API.",
+                    "❌ Could not reach the PS99 war API.",
+                    ephemeral=True
+                )
+
+            if "application/json" not in war_r.headers.get("Content-Type", ""):
+                text = await war_r.text()
+                print("[mystats] war api non-json:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 war API returned invalid data.",
                     ephemeral=True
                 )
 
             war_data = await war_r.json()
+
+        async with session.get(CLAN_API, timeout=timeout) as clan_r:
+            if clan_r.status != 200:
+                text = await clan_r.text()
+                print("[mystats] clan api bad status:", clan_r.status, text[:200])
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 clan API.",
+                    ephemeral=True
+                )
+
+            if "application/json" not in clan_r.headers.get("Content-Type", ""):
+                text = await clan_r.text()
+                print("[mystats] clan api non-json:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 clan API returned invalid data.",
+                    ephemeral=True
+                )
+
             clan_data = await clan_r.json()
 
         # ---------------- CURRENT WAR ----------------
@@ -3045,7 +3083,7 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
             await interaction.followup.send(embed=embed)
             return
 
-        pts = user_entry.get("Points", 0)
+        pts = int(user_entry.get("Points", 0) or 0)
         pct = (pts / total_points * 100) if total_points else 0
 
         rank = next(
@@ -3060,7 +3098,7 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         else:
             top_percent = 0
 
-        top_pts = max(contributions[0].get("Points", 1), 1)
+        top_pts = max(int(contributions[0].get("Points", 1) or 1), 1)
         bar_len = int((pts / top_pts) * 20)
         bar = "█" * bar_len + "░" * (20 - bar_len)
 
@@ -3092,7 +3130,9 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        print("[mystats error]", repr(e))
+        import traceback
+        print("[mystats error]")
+        print(traceback.format_exc())
         await interaction.followup.send(
             "❌ Something went wrong while fetching stats.",
             ephemeral=True
