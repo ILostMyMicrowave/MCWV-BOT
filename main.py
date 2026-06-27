@@ -2793,6 +2793,8 @@ async def warinfo(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
     
+ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+
 @bot.tree.command(
     name="leaderboard",
     description="Show MCWV clan war contribution leaderboard",
@@ -2809,20 +2811,40 @@ async def leaderboard(interaction: discord.Interaction):
 
         timeout = aiohttp.ClientTimeout(total=15)
 
-        async with session.get(PS99_API, timeout=timeout) as war_r:
+        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
             if war_r.status != 200:
                 return await interaction.followup.send(
-                    "❌ Could not reach the PS99 war API.",
+                    "❌ Could not reach the PS99 war API right now.",
                     ephemeral=True
                 )
+
+            content_type = war_r.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                text = await war_r.text()
+                print("[LEADERBOARD] Non-JSON war API response:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 war API returned invalid data.",
+                    ephemeral=True
+                )
+
             war_data = await war_r.json()
 
         async with session.get(CLAN_API, timeout=timeout) as clan_r:
             if clan_r.status != 200:
                 return await interaction.followup.send(
-                    "❌ Could not reach the PS99 clan API.",
+                    "❌ Could not reach the PS99 clan API right now.",
                     ephemeral=True
                 )
+
+            content_type = clan_r.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                text = await clan_r.text()
+                print("[LEADERBOARD] Non-JSON clan API response:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 clan API returned invalid data.",
+                    ephemeral=True
+                )
+
             clan_data = await clan_r.json()
 
         war_config = war_data.get("data", {}).get("configData", {})
@@ -2848,7 +2870,6 @@ async def leaderboard(interaction: discord.Interaction):
                 ephemeral=True
             )
 
-        # ---------------- ROBLOX USERNAME LOOKUP FOR ALL CONTRIBUTORS ----------------
         user_ids = []
         seen_ids = set()
 
@@ -2890,7 +2911,6 @@ async def leaderboard(interaction: discord.Interaction):
         except Exception as e:
             print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
-        # ---------------- DISCORD LOOKUP ----------------
         tracked_rows = db_get_all_tracked()
         roblox_to_discord = {}
         for row in tracked_rows:
