@@ -1015,6 +1015,7 @@ CLAN_MEMBERS_CATEGORY_ID  = 1503109089931034785  # ticket moved here on accept
 MEMBERS_CHANNEL_ID        = 1509276380674789617  # membership record posted here
 LOG_CHANNEL_ID            = 1502001938705682622  # accept/action log
 PS99_API                  = "https://ps99.biggamesapi.io"
+ACTIVE_BATTLE_API         = f"{PS99_API}/api/activeClanBattle"
 CLAN_NAME                 = "MCWV"
 CLAN_API                  = f"https://ps99.biggamesapi.io/api/clan/{CLAN_NAME}"
 ROBLOX_USERS_API          = "https://users.roblox.com/v1/users"
@@ -5127,6 +5128,8 @@ async def reminder_loop():
 ps99_first_check = True
 ps99_war_active = False
 
+ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+
 @tasks.loop(minutes=20)
 async def war_poll_loop():
     global bot_enabled, ps99_war_active, ps99_first_check, session
@@ -5137,9 +5140,20 @@ async def war_poll_loop():
 
         timeout = aiohttp.ClientTimeout(total=15)
 
-        async with session.get(PS99_API, timeout=timeout) as r:
-            api_ok = r.status == 200
-            data = await r.json() if api_ok else {}
+        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as r:
+            if r.status != 200:
+                print(f"❌ War API returned {r.status}")
+                return
+
+            content_type = r.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                print(f"❌ War API returned non-JSON: {content_type}")
+                print(await r.text())
+                return
+
+            data = await r.json()
+
+        print("📦 War API response:", data)
 
         config = data.get("data", {}).get("configData", {})
         start = config.get("StartTime")
@@ -5147,7 +5161,6 @@ async def war_poll_loop():
         now = datetime.now(timezone.utc).timestamp()
 
         currently_active = (
-            api_ok and
             isinstance(start, (int, float)) and
             isinstance(finish, (int, float)) and
             start <= now <= finish
@@ -5180,7 +5193,7 @@ async def war_poll_loop():
 
     except Exception as e:
         print("War poll error:", e)
-
+        
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
 @tasks.loop(minutes=10)
 async def clan_leave_loop():
