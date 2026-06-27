@@ -3876,76 +3876,76 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
     guild = interaction.guild
     ticket_creator = member
 
-    # --- ask for Roblox username ---
-    await channel.send(
-        f"👋 {ticket_creator.mention} — you've been accepted into **MCWV**! 🎉\n"
-        f"Please reply with your **Roblox username only**.\n"
-        f"Do not add any extra words."
-    )
+    actions = []
+    errors = []
+    summary_text = None
 
-    def from_creator(m):
-        return m.author.id == ticket_creator.id and m.channel.id == channel.id and bool(m.content.strip())
-
-    roblox_input = None
-    for _ in range(3):
-        try:
-            username_msg = await bot.wait_for("message", check=from_creator, timeout=120)
-        except asyncio.TimeoutError:
-            return await interaction.followup.send(
-                "❌ Timed out waiting for Roblox username. Run `/accept` again to retry.",
-                ephemeral=True
-            )
-
-        candidate = username_msg.content.strip()
-
-        if not _is_strict_username(candidate):
-            await channel.send(
-                f"❌ `{candidate}` is not a valid Roblox username.\n"
-                f"Please send **one username only** with no extra words."
-            )
-            continue
-
-        roblox_input = candidate
-        break
-
-    if not roblox_input:
-        return await interaction.followup.send(
-            "❌ Could not get a valid Roblox username. Run `/accept` again to retry.",
-            ephemeral=True
+    try:
+        # --- ask for Roblox username ---
+        await channel.send(
+            f"👋 {ticket_creator.mention} — you've been accepted into **MCWV**! 🎉\n"
+            f"Please reply with your **Roblox username only**.\n"
+            f"Do not add any extra words."
         )
 
-    # --- ask for alts ---
-    await channel.send(
-        "Got it! If you have any other accounts **IN THE CLAN**, reply with the alt usernames **comma-separated**.\n"
-        "If you have none, reply with exactly `none`."
-    )
+        def from_creator(m):
+            return m.author.id == ticket_creator.id and m.channel.id == channel.id and bool(m.content.strip())
 
-    alts = []
-    for _ in range(3):
-        try:
-            alts_msg = await bot.wait_for("message", check=from_creator, timeout=90)
-        except asyncio.TimeoutError:
-            alts = []
+        roblox_input = None
+        for _ in range(3):
+            try:
+                username_msg = await bot.wait_for("message", check=from_creator, timeout=120)
+            except asyncio.TimeoutError:
+                summary_text = "❌ Timed out waiting for Roblox username. Run `/accept` again to retry."
+                return
+
+            candidate = username_msg.content.strip()
+
+            if not _is_strict_username(candidate):
+                await channel.send(
+                    f"❌ `{candidate}` is not a valid Roblox username.\n"
+                    f"Please send **one username only** with no extra words."
+                )
+                continue
+
+            roblox_input = candidate
             break
 
-        alts_raw = alts_msg.content.strip()
+        if not roblox_input:
+            summary_text = "❌ Could not get a valid Roblox username. Run `/accept` again to retry."
+            return
 
-        parsed_alts = _parse_alt_input(alts_raw)
-        if parsed_alts is None:
-            await channel.send(
-                "❌ Invalid input.\n"
-                "Reply with comma-separated Roblox usernames only, or exactly `none`."
-            )
-            continue
+        # --- ask for alts ---
+        await channel.send(
+            "Got it! If you have any other accounts **IN THE CLAN**, reply with the alt usernames **comma-separated**.\n"
+            "If you have none, reply with exactly `none`."
+        )
 
-        alts = parsed_alts
-        break
-    else:
         alts = []
+        for _ in range(3):
+            try:
+                alts_msg = await bot.wait_for("message", check=from_creator, timeout=90)
+            except asyncio.TimeoutError:
+                alts = []
+                break
 
-    # --- validate Roblox username via API ---
-    roblox_url = "https://users.roblox.com/v1/usernames/users"
-    try:
+            alts_raw = alts_msg.content.strip()
+
+            parsed_alts = _parse_alt_input(alts_raw)
+            if parsed_alts is None:
+                await channel.send(
+                    "❌ Invalid input.\n"
+                    "Reply with comma-separated Roblox usernames only, or exactly `none`."
+                )
+                continue
+
+            alts = parsed_alts
+            break
+        else:
+            alts = []
+
+        # --- validate Roblox username via API ---
+        roblox_url = "https://users.roblox.com/v1/usernames/users"
         async with session.post(
             roblox_url,
             json={"usernames": [roblox_input], "excludeBannedUsers": False}
@@ -3954,151 +3954,146 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
             print(f"[accept] Roblox lookup for '{roblox_input}': HTTP {r.status} → {body}")
 
             if r.status != 200:
-                return await interaction.followup.send(
-                    f"❌ Roblox API returned an error (HTTP {r.status}). Try again in a moment.",
-                    ephemeral=True
-                )
+                summary_text = f"❌ Roblox API returned an error (HTTP {r.status}). Try again in a moment."
+                return
 
             results = body.get("data", [])
             if not results:
-                return await interaction.followup.send(
-                    f"❌ Roblox user `{roblox_input}` not found. Please check the spelling and try again.",
-                    ephemeral=True
-                )
+                summary_text = f"❌ Roblox user `{roblox_input}` not found. Please check the spelling and try again."
+                return
 
             roblox_id = str(results[0]["id"])
             roblox_name = results[0]["name"]
 
-    except Exception as e:
-        print(f"[accept] Roblox API exception: {e}")
-        return await interaction.followup.send(
-            "❌ Roblox API error. Try again in a moment.",
-            ephemeral=True
+        # --- validate alt usernames via API if any were provided ---
+        valid_alts = []
+        invalid_alts = []
+
+        if alts:
+            try:
+                async with session.post(
+                    roblox_url,
+                    json={"usernames": alts, "excludeBannedUsers": False}
+                ) as r:
+                    body = await r.json()
+                    results = body.get("data", [])
+
+                    found = {}
+                    for item in results:
+                        try:
+                            requested = str(item.get("requestedUsername", "")).strip().lower()
+                            found[requested] = {
+                                "id": str(item["id"]),
+                                "name": item["name"]
+                            }
+                        except Exception:
+                            continue
+
+                    for alt_name in alts:
+                        key = alt_name.lower()
+                        if key in found:
+                            valid_alts.append(found[key]["name"])
+                        else:
+                            invalid_alts.append(alt_name)
+
+            except Exception as e:
+                print(f"[accept] Alt Roblox API exception: {e}")
+                invalid_alts = alts[:]
+                valid_alts = []
+
+        if invalid_alts:
+            await channel.send(
+                "⚠️ Some alt usernames could not be found and were ignored:\n"
+                + "\n".join(f"• `{x}`" for x in invalid_alts)
+            )
+
+        # --- link in bot DB ---
+        db_add(roblox_id, ticket_creator.id, roblox_name)
+
+        # --- give clan member role ---
+        clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
+        if clan_role:
+            try:
+                await ticket_creator.add_roles(clan_role, reason=f"Accepted by {interaction.user}")
+                actions.append(f"✅ Gave role **{clan_role.name}**")
+            except Exception as e:
+                errors.append(f"❌ Could not give role: {e}")
+        else:
+            errors.append("❌ Clan member role not found — check CLAN_MEMBER_ROLE_ID.")
+
+        # --- move ticket to Clan Members category ---
+        category = guild.get_channel(CLAN_MEMBERS_CATEGORY_ID)
+        if category:
+            try:
+                await channel.edit(category=category, sync_permissions=True, reason="Member accepted")
+                actions.append(f"✅ Moved ticket to **{category.name}**")
+            except Exception as e:
+                errors.append(f"❌ Could not move ticket: {e}")
+        else:
+            errors.append("❌ Clan Members category not found — check CLAN_MEMBERS_CATEGORY_ID.")
+
+        # --- post membership record in members channel ---
+        members_ch = guild.get_channel(MEMBERS_CHANNEL_ID)
+        alts_str = ", ".join(valid_alts) if valid_alts else "none"
+        record_msg = (
+            f"<#{channel.id}> {ticket_creator.mention}\n"
+            f"user:{roblox_name}\n"
+            f"alt:{alts_str}"
         )
 
-    # --- validate alt usernames via API if any were provided ---
-    valid_alts = []
-    invalid_alts = []
+        if members_ch:
+            try:
+                await members_ch.send(record_msg)
+                actions.append(f"✅ Posted membership record in <#{MEMBERS_CHANNEL_ID}>")
+            except Exception as e:
+                errors.append(f"❌ Could not post membership record: {e}")
+        else:
+            errors.append("❌ Members channel not found — check MEMBERS_CHANNEL_ID.")
 
-    if alts:
-        try:
-            async with session.post(
-                roblox_url,
-                json={"usernames": alts, "excludeBannedUsers": False}
-            ) as r:
-                body = await r.json()
-                results = body.get("data", [])
-
-                found = {}
-                for item in results:
-                    try:
-                        requested = str(item.get("requestedUsername", "")).strip().lower()
-                        found[requested] = {
-                            "id": str(item["id"]),
-                            "name": item["name"]
-                        }
-                    except Exception:
-                        continue
-
-                for alt_name in alts:
-                    key = alt_name.lower()
-                    if key in found:
-                        valid_alts.append(found[key]["name"])
-                    else:
-                        invalid_alts.append(alt_name)
-
-        except Exception as e:
-            print(f"[accept] Alt Roblox API exception: {e}")
-            invalid_alts = alts[:]
-            valid_alts = []
-
-    if invalid_alts:
+        # --- confirmation message in ticket ---
         await channel.send(
-            "⚠️ Some alt usernames could not be found and were ignored:\n"
-            + "\n".join(f"• `{x}`" for x in invalid_alts)
+            f"✅ All done, {ticket_creator.mention}! Welcome to **MCWV**!\n"
+            f"Roblox: **{roblox_name}**"
+            + (f"\nAlts: **{alts_str}**" if valid_alts else "")
         )
 
-    # --- link in bot DB ---
-    db_add(roblox_id, ticket_creator.id, roblox_name)
+        # --- log all actions ---
+        log_ch = guild.get_channel(LOG_CHANNEL_ID)
+        if log_ch:
+            log_embed = discord.Embed(
+                title="✅ Member Accepted",
+                color=discord.Color.green(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            log_embed.add_field(name="Staff", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="New Member", value=ticket_creator.mention, inline=True)
+            log_embed.add_field(name="Roblox", value=roblox_name, inline=True)
+            log_embed.add_field(name="Alts", value=alts_str, inline=True)
+            log_embed.add_field(name="Ticket", value=f"<#{channel.id}>", inline=True)
+            log_embed.add_field(name="Actions", value="\n".join(actions) or "—", inline=False)
+            if errors:
+                log_embed.add_field(name="⚠️ Errors", value="\n".join(errors), inline=False)
+            log_embed.set_footer(text=f"Member ID: {ticket_creator.id} • Roblox ID: {roblox_id}")
+            try:
+                await log_ch.send(embed=log_embed)
+            except Exception as e:
+                errors.append(f"❌ Could not send log embed: {e}")
 
-    actions = []
-    errors = []
-
-    # --- give clan member role ---
-    clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
-    if clan_role:
-        try:
-            await ticket_creator.add_roles(clan_role, reason=f"Accepted by {interaction.user}")
-            actions.append(f"✅ Gave role **{clan_role.name}**")
-        except Exception as e:
-            errors.append(f"❌ Could not give role: {e}")
-    else:
-        errors.append("❌ Clan member role not found — check CLAN_MEMBER_ROLE_ID.")
-
-    # --- move ticket to Clan Members category ---
-    category = guild.get_channel(CLAN_MEMBERS_CATEGORY_ID)
-    if category:
-        try:
-            await channel.edit(category=category, sync_permissions=True, reason="Member accepted")
-            actions.append(f"✅ Moved ticket to **{category.name}**")
-        except Exception as e:
-            errors.append(f"❌ Could not move ticket: {e}")
-    else:
-        errors.append("❌ Clan Members category not found — check CLAN_MEMBERS_CATEGORY_ID.")
-
-    # --- post membership record in members channel ---
-    members_ch = guild.get_channel(MEMBERS_CHANNEL_ID)
-    alts_str = ", ".join(valid_alts) if valid_alts else "none"
-    record_msg = (
-        f"<#{channel.id}> {ticket_creator.mention}\n"
-        f"user:{roblox_name}\n"
-        f"alt:{alts_str}"
-    )
-
-    if members_ch:
-        try:
-            await members_ch.send(record_msg)
-            actions.append(f"✅ Posted membership record in <#{MEMBERS_CHANNEL_ID}>")
-        except Exception as e:
-            errors.append(f"❌ Could not post membership record: {e}")
-    else:
-        errors.append("❌ Members channel not found — check MEMBERS_CHANNEL_ID.")
-
-    # --- confirmation message in ticket ---
-    await channel.send(
-        f"✅ All done, {ticket_creator.mention}! Welcome to **MCWV**!\n"
-        f"Roblox: **{roblox_name}**"
-        + (f"\nAlts: **{alts_str}**" if valid_alts else "")
-    )
-
-    # --- log all actions ---
-    log_ch = guild.get_channel(LOG_CHANNEL_ID)
-    if log_ch:
-        log_embed = discord.Embed(
-            title="✅ Member Accepted",
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        log_embed.add_field(name="Staff", value=interaction.user.mention, inline=True)
-        log_embed.add_field(name="New Member", value=ticket_creator.mention, inline=True)
-        log_embed.add_field(name="Roblox", value=roblox_name, inline=True)
-        log_embed.add_field(name="Alts", value=alts_str, inline=True)
-        log_embed.add_field(name="Ticket", value=f"<#{channel.id}>", inline=True)
-        log_embed.add_field(name="Actions", value="\n".join(actions) or "—", inline=False)
+        summary = "\n".join(actions) if actions else "—"
         if errors:
-            log_embed.add_field(name="⚠️ Errors", value="\n".join(errors), inline=False)
-        log_embed.set_footer(text=f"Member ID: {ticket_creator.id} • Roblox ID: {roblox_id}")
+            summary += "\n\n⚠️ **Some steps failed:**\n" + "\n".join(errors)
+
+        summary_text = f"**Accept complete!**\n{summary}"
+
+    except Exception as e:
+        print("[accept error]", repr(e))
+        summary_text = f"❌ Accept failed.\n```{type(e).__name__}: {e}```"
+
+    if summary_text:
         try:
-            await log_ch.send(embed=log_embed)
-        except Exception:
-            pass
-
-    # --- report back to staff (ephemeral) ---
-    summary = "\n".join(actions)
-    if errors:
-        summary += "\n\n⚠️ **Some steps failed:**\n" + "\n".join(errors)
-
-    await interaction.followup.send(f"**Accept complete!**\n{summary}", ephemeral=True)
+            await interaction.followup.send(summary_text, ephemeral=True)
+        except Exception as e:
+            print("[accept followup error]", repr(e))
     
 # ---- CLEANUP COMMAND -------
 import re
