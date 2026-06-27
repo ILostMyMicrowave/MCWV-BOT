@@ -167,6 +167,37 @@ def force_sync_giveaway_state():
         db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
         print("🛠️ Fixed invalid giveaway active state")
 
+ROBLOX_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+
+def _is_strict_username(text: str) -> bool:
+    text = text.strip()
+    return bool(ROBLOX_USERNAME_RE.fullmatch(text))
+
+
+def _parse_alt_input(raw: str):
+    raw = raw.strip()
+
+    if raw == "none":
+        return []
+
+    parts = [p.strip() for p in raw.split(",")]
+    if not parts or any(not p for p in parts):
+        return None
+
+    if any(not ROBLOX_USERNAME_RE.fullmatch(p) for p in parts):
+        return None
+
+    seen = set()
+    cleaned = []
+
+    for p in parts:
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(p)
+
+    return cleaned
+
 def mastery_gap(level: int) -> int:
     xp = math.floor(0.25 * math.floor(level + 300 * (2 ** (level / 7))))
     if level == 98:
@@ -3865,7 +3896,6 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     status_str = "⚔️ Active" if is_active else "🏁 Ended"
     embed.set_footer(text=f"{status_str} • ps99.biggamesapi.io")
     await interaction.followup.send(embed=embed)
-
 
 @bot.tree.command(name="accept", description="Accept an applicant inside a Tickets v2 ticket", guild=guild_obj)
 @require_role()
