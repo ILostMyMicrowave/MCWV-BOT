@@ -2876,199 +2876,207 @@ async def warinfo(interaction: discord.Interaction):
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    try:
-        global session
+try:
+    global session
 
-        if session is None or session.closed:
-            session = aiohttp.ClientSession()
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
 
-        timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=15)
 
-        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
-            if war_r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the PS99 war API right now.",
-                    ephemeral=True
-                )
-
-            content_type = war_r.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
-                text = await war_r.text()
-                print("[LEADERBOARD] Non-JSON war API response:", text[:200])
-                return await interaction.followup.send(
-                    "❌ PS99 war API returned invalid data.",
-                    ephemeral=True
-                )
-
-            war_data = await war_r.json()
-
-        async with session.get(CLAN_API, timeout=timeout) as clan_r:
-            if clan_r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the PS99 clan API right now.",
-                    ephemeral=True
-                )
-
-            content_type = clan_r.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
-                text = await clan_r.text()
-                print("[LEADERBOARD] Non-JSON clan API response:", text[:200])
-                return await interaction.followup.send(
-                    "❌ PS99 clan API returned invalid data.",
-                    ephemeral=True
-                )
-
-            clan_data = await clan_r.json()
-
-        war_config = war_data.get("data", {}).get("configData", {})
-        battle_id, battle = get_current_war(war_data, clan_data)
-
-        if not battle:
+    async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
+        if war_r.status != 200:
             return await interaction.followup.send(
-                "❌ No battle data found for MCWV.",
+                "❌ Could not reach the PS99 war API right now.",
                 ephemeral=True
             )
 
-        contributions = sorted(
-            battle.get("PointContributions", []),
-            key=lambda x: x.get("Points", 0),
-            reverse=True
+        content_type = war_r.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            text = await war_r.text()
+            print("[LEADERBOARD] Non-JSON war API response:", text[:200])
+            return await interaction.followup.send(
+                "❌ PS99 war API returned invalid data.",
+                ephemeral=True
+            )
+
+        war_data = await war_r.json()
+
+    async with session.get(CLAN_API, timeout=timeout) as clan_r:
+        if clan_r.status != 200:
+            return await interaction.followup.send(
+                "❌ Could not reach the PS99 clan API right now.",
+                ephemeral=True
+            )
+
+        content_type = clan_r.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            text = await clan_r.text()
+            print("[LEADERBOARD] Non-JSON clan API response:", text[:200])
+            return await interaction.followup.send(
+                "❌ PS99 clan API returned invalid data.",
+                ephemeral=True
+            )
+
+        clan_data = await clan_r.json()
+
+    war_config = war_data.get("data", {}).get("configData", {})
+    battle_id, battle = get_current_war(war_data, clan_data)
+
+    if not battle:
+        return await interaction.followup.send(
+            "❌ No battle data found for MCWV.",
+            ephemeral=True
         )
 
-        total_points = battle.get("Points", 0)
+    contributions = sorted(
+        battle.get("PointContributions", []),
+        key=lambda x: x.get("Points", 0),
+        reverse=True
+    )
 
-        if not contributions:
-            return await interaction.followup.send(
-                "❌ No contribution data yet for this war.",
-                ephemeral=True
-            )
+    total_points = battle.get("Points", 0)
 
-        user_ids = []
-        seen_ids = set()
+    if not contributions:
+        return await interaction.followup.send(
+            "❌ No contribution data yet for this war.",
+            ephemeral=True
+        )
 
-        for entry in contributions:
-            uid = entry.get("UserID")
-            if uid is None:
-                continue
-            try:
-                uid_int = int(uid)
-            except Exception:
-                continue
+    user_ids = []
+    seen_ids = set()
 
-            if uid_int not in seen_ids:
-                seen_ids.add(uid_int)
-                user_ids.append(uid_int)
-
-        
-        id_to_name = {}
+    for entry in contributions:
+        uid = entry.get("UserID")
+        if uid is None:
+            continue
 
         try:
-            for chunk in chunk_list(user_ids, 100):
-                async with session.post(
-                    ROBLOX_USERS_API,
-                    json={
-                        "userIds": chunk,
-                        "excludeBannedUsers": False
-                    },
-                    timeout=timeout
-                ) as r:
+            uid_int = int(uid)
+        except Exception:
+            continue
 
-                    if r.status != 200:
+        if uid_int not in seen_ids:
+            seen_ids.add(uid_int)
+            user_ids.append(uid_int)
+
+    id_to_name = {}
+
+    try:
+        for chunk in chunk_list(user_ids, 100):
+            async with session.post(
+                ROBLOX_USERS_API,
+                json={
+                    "userIds": chunk,
+                    "excludeBannedUsers": False
+                },
+                timeout=timeout
+            ) as r:
+
+                if r.status != 200:
+                    continue
+
+                roblox_data = await r.json()
+
+                for u in roblox_data.get("data", []):
+                    try:
+                        uid = int(u["id"])
+                        uname = str(u.get("name", f"Unknown ({uid})"))
+                        id_to_name[uid] = uname
+                    except Exception:
                         continue
 
-                    roblox_data = await r.json()
+    except Exception as e:
+        print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
-                    for u in roblox_data.get("data", []):
-                        try:
-                            uid = int(u["id"])
-                            uname = str(u.get("name", f"Unknown ({uid})"))
-                            id_to_name[uid] = uname
-                        except Exception:
-                            continue
+    # ---------------- DISCORD LINK MAP ----------------
+    tracked_rows = db_get_all_tracked()
+    roblox_to_discord = {}
 
-        except Exception as e:
-            print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
-
-        # ---------------- DISCORD LINK MAP ----------------
-        tracked_rows = db_get_all_tracked()
-        roblox_to_discord = {}
-
-        for row in tracked_rows:
-            try:
-                rid = int(row[0])
-                did = int(row[1])
-                roblox_to_discord[rid] = did
-            except Exception:
-                continue
-
-        # ---------------- BATTLE NAME ----------------
-        battle_name = re.sub(
-            r'(\d+)',
-            r' \1',
-            re.sub(r'([A-Z])', r' \1', str(battle_id))
-        ).strip()
-
-        # ---------------- WAR STATE ----------------
-        now = datetime.now(timezone.utc).timestamp()
-        finish_ts = war_config.get("FinishTime")
-        start_ts = war_config.get("StartTime", 0)
-
-        is_active = False
-        if finish_ts:
-            is_active = start_ts <= now <= finish_ts
-
-        # ---------------- BUILD ENTRIES ----------------
-        entries = []
-
-        for rank, entry in enumerate(contributions, start=1):
-            uid = entry.get("UserID")
-            if uid is None:
-                continue
-
-            try:
-                uid_int = int(uid)
-            except Exception:
-                continue
-
-            pts = int(entry.get("Points", 0) or 0)
-            name = id_to_name.get(uid_int, f"Unknown ({uid_int})")
-            discord_id = roblox_to_discord.get(uid_int)
-
-            entries.append({
-                "rank": rank,
-                "user_id": uid_int,
-                "name": name,
-                "points": pts,
-                "discord_id": discord_id
-            })
-
-        # ---------------- SAFETY CHECK ----------------
-        if not entries:
-            return await interaction.followup.send(
-                "❌ No valid leaderboard entries found.",
-                ephemeral=True
-            )
-
-        # ---------------- SAVE TO DATABASE ----------------
+    for row in tracked_rows:
         try:
-            save_leaderboard_to_db(entries, battle_name)
-        except Exception as db_err:
-            print("[DB SYNC ERROR]", repr(db_err))
+            rid = int(row[0])
+            did = int(row[1])
+            roblox_to_discord[rid] = did
+        except Exception:
+            continue
 
-        # ---------------- BUILD VIEW ----------------
-        view = LeaderboardView(
-            entries=entries,
-            battle_title=battle_name,
-            total_points=total_points,
-            is_active=is_active
+    # ---------------- BATTLE NAME ----------------
+    battle_name = re.sub(
+        r'(\d+)',
+        r' \1',
+        re.sub(r'([A-Z])', r' \1', str(battle_id))
+    ).strip()
+
+    # ---------------- WAR STATE ----------------
+    now = datetime.now(timezone.utc).timestamp()
+    finish_ts = war_config.get("FinishTime")
+    start_ts = war_config.get("StartTime", 0)
+
+    is_active = False
+    if finish_ts:
+        is_active = start_ts <= now <= finish_ts
+
+    # ---------------- BUILD ENTRIES ----------------
+    entries = []
+
+    for rank, entry in enumerate(contributions, start=1):
+        uid = entry.get("UserID")
+        if uid is None:
+            continue
+
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+
+        pts = int(entry.get("Points", 0) or 0)
+        name = id_to_name.get(uid_int, f"Unknown ({uid_int})")
+        discord_id = roblox_to_discord.get(uid_int)
+
+        entries.append({
+            "rank": rank,
+            "user_id": uid_int,
+            "name": name,
+            "points": pts,
+            "discord_id": discord_id
+        })
+
+    # ---------------- SAFETY CHECK ----------------
+    if not entries:
+        return await interaction.followup.send(
+            "❌ No valid leaderboard entries found.",
+            ephemeral=True
         )
 
-        await interaction.followup.send(
-            embed=view.build_embed(),
-            view=view
-        )
-    
-ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+    # ---------------- SAVE TO DATABASE ----------------
+    try:
+        save_leaderboard_to_db(entries, battle_name)
+    except Exception as db_err:
+        print("[DB SYNC ERROR]", repr(db_err))
+
+    # ---------------- BUILD VIEW ----------------
+    view = LeaderboardView(
+        entries=entries,
+        battle_title=battle_name,
+        total_points=total_points,
+        is_active=is_active
+    )
+
+    await interaction.followup.send(
+        embed=view.build_embed(),
+        view=view
+    )
+
+except Exception as e:
+    import traceback
+    print("[LEADERBOARD ERROR]")
+    print(traceback.format_exc())
+
+    await interaction.followup.send(
+        f"❌ {type(e).__name__}: {e}",
+        ephemeral=True
+    )
 
 @bot.tree.command(
     name="mystats",
