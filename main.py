@@ -53,12 +53,15 @@ def save_leaderboard_to_db_neon(entries, battle_name):
     cur = conn.cursor()
 
     try:
-        print("🔥 DELETING OLD DATA")
+        cur.execute("SELECT current_database();")
+        print("CONNECTED DB:", cur.fetchone())
+
+        cur.execute("SELECT current_schema();")
+        print("SCHEMA:", cur.fetchone())
+
         cur.execute("DELETE FROM live_leaderboard")
 
         for e in entries:
-            print("🔥 INSERTING:", e["user_id"])
-
             cur.execute("""
                 INSERT INTO live_leaderboard (
                     roblox_id,
@@ -76,15 +79,15 @@ def save_leaderboard_to_db_neon(entries, battle_name):
                 e.get("discord_id"),
                 int(e["points"]),
                 int(e["rank"]),
-                None,   # SAFE FIX
+                None,
                 battle_name
             ))
 
         conn.commit()
-        print("🔥 COMMIT DONE")
+        print("COMMIT OK")
 
     except Exception as e:
-        print("❌ NEON INSERT FAILED:", repr(e))
+        print("❌ DB ERROR:", repr(e))
         conn.rollback()
 
     finally:
