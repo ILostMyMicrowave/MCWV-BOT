@@ -2876,118 +2876,128 @@ async def warinfo(interaction: discord.Interaction):
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
-try:
-    global session
+    try:
+        global session
 
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
 
-    timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=15)
 
-    async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
-        if war_r.status != 200:
+        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
+            if war_r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 war API right now.",
+                    ephemeral=True
+                )
+
+            content_type = war_r.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                text = await war_r.text()
+                print("[LEADERBOARD] Non-JSON war API response:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 war API returned invalid data.",
+                    ephemeral=True
+                )
+
+            war_data = await war_r.json()
+
+        async with session.get(CLAN_API, timeout=timeout) as clan_r:
+            if clan_r.status != 200:
+                return await interaction.followup.send(
+                    "❌ Could not reach the PS99 clan API right now.",
+                    ephemeral=True
+                )
+
+            content_type = clan_r.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                text = await clan_r.text()
+                print("[LEADERBOARD] Non-JSON clan API response:", text[:200])
+                return await interaction.followup.send(
+                    "❌ PS99 clan API returned invalid data.",
+                    ephemeral=True
+                )
+
+            clan_data = await clan_r.json()
+
+        war_config = war_data.get("data", {}).get("configData", {})
+        battle_id, battle = get_current_war(war_data, clan_data)
+
+        if not battle:
             return await interaction.followup.send(
-                "❌ Could not reach the PS99 war API right now.",
+                "❌ No battle data found for MCWV.",
                 ephemeral=True
             )
 
-        content_type = war_r.headers.get("Content-Type", "")
-        if "application/json" not in content_type:
-            text = await war_r.text()
-            print("[LEADERBOARD] Non-JSON war API response:", text[:200])
-            return await interaction.followup.send(
-                "❌ PS99 war API returned invalid data.",
-                ephemeral=True
-            )
-
-        war_data = await war_r.json()
-
-    async with session.get(CLAN_API, timeout=timeout) as clan_r:
-        if clan_r.status != 200:
-            return await interaction.followup.send(
-                "❌ Could not reach the PS99 clan API right now.",
-                ephemeral=True
-            )
-
-        content_type = clan_r.headers.get("Content-Type", "")
-        if "application/json" not in content_type:
-            text = await clan_r.text()
-            print("[LEADERBOARD] Non-JSON clan API response:", text[:200])
-            return await interaction.followup.send(
-                "❌ PS99 clan API returned invalid data.",
-                ephemeral=True
-            )
-
-        clan_data = await clan_r.json()
-
-    war_config = war_data.get("data", {}).get("configData", {})
-    battle_id, battle = get_current_war(war_data, clan_data)
-
-    if not battle:
-        return await interaction.followup.send(
-            "❌ No battle data found for MCWV.",
-            ephemeral=True
+        contributions = sorted(
+            battle.get("PointContributions", []),
+            key=lambda x: x.get("Points", 0),
+            reverse=True
         )
 
-    contributions = sorted(
-        battle.get("PointContributions", []),
-        key=lambda x: x.get("Points", 0),
-        reverse=True
-    )
+        total_points = battle.get("Points", 0)
 
-    total_points = battle.get("Points", 0)
+        if not contributions:
+            return await interaction.followup.send(
+                "❌ No contribution data yet for this war.",
+                ephemeral=True
+            )
 
-    if not contributions:
-        return await interaction.followup.send(
-            "❌ No contribution data yet for this war.",
-            ephemeral=True
-        )
+        user_ids = []
+        seen_ids = set()
 
-    user_ids = []
-    seen_ids = set()
+        for entry in contributions:
+            uid = entry.get("UserID")
+            if uid is None:
+                continue
 
-    for entry in contributions:
-        uid = entry.get("UserID")
-        if uid is None:
-            continue
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
+
+            if uid_int not in seen_ids:
+                seen_ids.add(uid_int)
+                user_ids.append(uid_int)
+
+        id_to_name = {}
 
         try:
-            uid_int = int(uid)
-        except Exception:
-            continue
+            for chunk in chunk_list(user_ids, 100):
+                async with session.post(
+                    ROBLOX_USERS_API,
+                    json={
+                        "userIds": chunk,
+                        "excludeBannedUsers": False
+                    },
+                    timeout=timeout
+                ) as r:
 
-        if uid_int not in seen_ids:
-            seen_ids.add(uid_int)
-            user_ids.append(uid_int)
-
-    id_to_name = {}
-
-    try:
-        for chunk in chunk_list(user_ids, 100):
-            async with session.post(
-                ROBLOX_USERS_API,
-                json={
-                    "userIds": chunk,
-                    "excludeBannedUsers": False
-                },
-                timeout=timeout
-            ) as r:
-
-                if r.status != 200:
-                    continue
-
-                roblox_data = await r.json()
-
-                for u in roblox_data.get("data", []):
-                    try:
-                        uid = int(u["id"])
-                        uname = str(u.get("name", f"Unknown ({uid})"))
-                        id_to_name[uid] = uname
-                    except Exception:
+                    if r.status != 200:
                         continue
 
+                    roblox_data = await r.json()
+
+                    for u in roblox_data.get("data", []):
+                        try:
+                            uid = int(u["id"])
+                            uname = str(u.get("name", f"Unknown ({uid})"))
+                            id_to_name[uid] = uname
+                        except Exception:
+                            continue
+
+        except Exception as e:
+            print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
+
     except Exception as e:
-        print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
+        import traceback
+        print("[LEADERBOARD ERROR]")
+        print(traceback.format_exc())
+
+        return await interaction.followup.send(
+            f"❌ {type(e).__name__}: {e}",
+            ephemeral=True
+        )
 
     # ---------------- DISCORD LINK MAP ----------------
     tracked_rows = db_get_all_tracked()
