@@ -53,14 +53,12 @@ def save_leaderboard_to_db_neon(entries, battle_name):
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT current_database();")
-        print("CONNECTED DB:", cur.fetchone())
+        print("🔥 DB CONNECTED")
 
-        cur.execute("SELECT current_schema();")
-        print("SCHEMA:", cur.fetchone())
-
+        # clear old leaderboard
         cur.execute("DELETE FROM live_leaderboard")
 
+        # insert fresh rows
         for e in entries:
             cur.execute("""
                 INSERT INTO live_leaderboard (
@@ -79,16 +77,16 @@ def save_leaderboard_to_db_neon(entries, battle_name):
                 e.get("discord_id"),
                 int(e["points"]),
                 int(e["rank"]),
-                None,
+                e.get("avatar"),
                 battle_name
             ))
 
         conn.commit()
-        print("COMMIT OK")
+        print("🔥 COMMIT SUCCESS")
 
     except Exception as e:
-        print("❌ DB ERROR:", repr(e))
         conn.rollback()
+        print("❌ DB ERROR:", repr(e))
 
     finally:
         conn.close()
@@ -3065,7 +3063,8 @@ async def leaderboard(interaction: discord.Interaction):
                 "user_id": uid_int,
                 "name": name,
                 "points": pts,
-                "discord_id": discord_id
+                "discord_id": discord_id,
+                "avatar": None
             })
 
         if not entries:
@@ -3074,11 +3073,16 @@ async def leaderboard(interaction: discord.Interaction):
                 ephemeral=True
             )
 
-        # ---------------- SAVE DB ----------------
+        # ---------------- SAVE TO NEON ----------------
         try:
+            print("🔥 SAVING TO NEON:", len(entries), "entries")
+
             save_leaderboard_to_db_neon(entries, battle_name)
-        except Exception as db_err:
-            print("[DB SYNC ERROR]", repr(db_err))
+
+            print("🔥 SAVE DONE")
+
+        except Exception as e:
+            print("❌ SAVE FAILED:", repr(e))
 
         # ---------------- VIEW ----------------
         view = LeaderboardView(
@@ -3092,17 +3096,7 @@ async def leaderboard(interaction: discord.Interaction):
             embed=view.build_embed(),
             view=view
         )
-
-    except Exception as e:
-        import traceback
-        print("[LEADERBOARD ERROR]")
-        print(traceback.format_exc())
-
-        await interaction.followup.send(
-            f"❌ {type(e).__name__}: {e}",
-            ephemeral=True
-        )
-
+        
 @bot.tree.command(
     name="mystats",
     description="Check a Roblox user's clan war contribution stats",
