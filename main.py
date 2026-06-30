@@ -2876,14 +2876,16 @@ async def warinfo(interaction: discord.Interaction):
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    try:
-        global session
+    global session
 
+    try:
+        # ---------------- SESSION ----------------
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
         timeout = aiohttp.ClientTimeout(total=15)
 
+        # ---------------- WAR API ----------------
         async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
             if war_r.status != 200:
                 return await interaction.followup.send(
@@ -2891,8 +2893,7 @@ async def leaderboard(interaction: discord.Interaction):
                     ephemeral=True
                 )
 
-            content_type = war_r.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
+            if "application/json" not in war_r.headers.get("Content-Type", ""):
                 text = await war_r.text()
                 print("[LEADERBOARD] Non-JSON war API response:", text[:200])
                 return await interaction.followup.send(
@@ -2902,6 +2903,7 @@ async def leaderboard(interaction: discord.Interaction):
 
             war_data = await war_r.json()
 
+        # ---------------- CLAN API ----------------
         async with session.get(CLAN_API, timeout=timeout) as clan_r:
             if clan_r.status != 200:
                 return await interaction.followup.send(
@@ -2909,8 +2911,7 @@ async def leaderboard(interaction: discord.Interaction):
                     ephemeral=True
                 )
 
-            content_type = clan_r.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
+            if "application/json" not in clan_r.headers.get("Content-Type", ""):
                 text = await clan_r.text()
                 print("[LEADERBOARD] Non-JSON clan API response:", text[:200])
                 return await interaction.followup.send(
@@ -2920,6 +2921,7 @@ async def leaderboard(interaction: discord.Interaction):
 
             clan_data = await clan_r.json()
 
+        # ---------------- WAR DATA ----------------
         war_config = war_data.get("data", {}).get("configData", {})
         battle_id, battle = get_current_war(war_data, clan_data)
 
@@ -2935,14 +2937,15 @@ async def leaderboard(interaction: discord.Interaction):
             reverse=True
         )
 
-        total_points = battle.get("Points", 0)
-
         if not contributions:
             return await interaction.followup.send(
                 "❌ No contribution data yet for this war.",
                 ephemeral=True
             )
 
+        total_points = battle.get("Points", 0)
+
+        # ---------------- USER IDS ----------------
         user_ids = []
         seen_ids = set()
 
@@ -2960,6 +2963,7 @@ async def leaderboard(interaction: discord.Interaction):
                 seen_ids.add(uid_int)
                 user_ids.append(uid_int)
 
+        # ---------------- ROBLOX NAMES ----------------
         id_to_name = {}
 
         try:
@@ -2976,117 +2980,101 @@ async def leaderboard(interaction: discord.Interaction):
                     if r.status != 200:
                         continue
 
-                    roblox_data = await r.json()
+                    data = await r.json()
 
-                    for u in roblox_data.get("data", []):
+                    for u in data.get("data", []):
                         try:
                             uid = int(u["id"])
-                            uname = str(u.get("name", f"Unknown ({uid})"))
-                            id_to_name[uid] = uname
+                            id_to_name[uid] = u.get("name", f"Unknown ({uid})")
                         except Exception:
                             continue
 
         except Exception as e:
             print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
+        # ---------------- DISCORD MAP ----------------
+        tracked_rows = db_get_all_tracked()
+        roblox_to_discord = {}
+
+        for row in tracked_rows:
+            try:
+                roblox_to_discord[int(row[0])] = int(row[1])
+            except Exception:
+                continue
+
+        # ---------------- BATTLE NAME ----------------
+        battle_name = re.sub(
+            r'(\d+)',
+            r' \1',
+            re.sub(r'([A-Z])', r' \1', str(battle_id))
+        ).strip()
+
+        # ---------------- WAR STATE ----------------
+        now = datetime.now(timezone.utc).timestamp()
+        finish_ts = war_config.get("FinishTime")
+        start_ts = war_config.get("StartTime", 0)
+
+        is_active = bool(finish_ts and start_ts <= now <= finish_ts)
+
+        # ---------------- BUILD ENTRIES ----------------
+        entries = []
+
+        for rank, entry in enumerate(contributions, start=1):
+            uid = entry.get("UserID")
+            if uid is None:
+                continue
+
+            try:
+                uid_int = int(uid)
+            except Exception:
+                continue
+
+            pts = int(entry.get("Points", 0) or 0)
+            name = id_to_name.get(uid_int, f"Unknown ({uid_int})")
+            discord_id = roblox_to_discord.get(uid_int)
+
+            entries.append({
+                "rank": rank,
+                "user_id": uid_int,
+                "name": name,
+                "points": pts,
+                "discord_id": discord_id
+            })
+
+        if not entries:
+            return await interaction.followup.send(
+                "❌ No valid leaderboard entries found.",
+                ephemeral=True
+            )
+
+        # ---------------- SAVE DB ----------------
+        try:
+            save_leaderboard_to_db(entries, battle_name)
+        except Exception as db_err:
+            print("[DB SYNC ERROR]", repr(db_err))
+
+        # ---------------- VIEW ----------------
+        view = LeaderboardView(
+            entries=entries,
+            battle_title=battle_name,
+            total_points=total_points,
+            is_active=is_active
+        )
+
+        await interaction.followup.send(
+            embed=view.build_embed(),
+            view=view
+        )
+
     except Exception as e:
         import traceback
         print("[LEADERBOARD ERROR]")
         print(traceback.format_exc())
 
-        return await interaction.followup.send(
+        await interaction.followup.send(
             f"❌ {type(e).__name__}: {e}",
             ephemeral=True
         )
-
-    # ---------------- DISCORD LINK MAP ----------------
-    tracked_rows = db_get_all_tracked()
-    roblox_to_discord = {}
-
-    for row in tracked_rows:
-        try:
-            rid = int(row[0])
-            did = int(row[1])
-            roblox_to_discord[rid] = did
-        except Exception:
-            continue
-
-    # ---------------- BATTLE NAME ----------------
-    battle_name = re.sub(
-        r'(\d+)',
-        r' \1',
-        re.sub(r'([A-Z])', r' \1', str(battle_id))
-    ).strip()
-
-    # ---------------- WAR STATE ----------------
-    now = datetime.now(timezone.utc).timestamp()
-    finish_ts = war_config.get("FinishTime")
-    start_ts = war_config.get("StartTime", 0)
-
-    is_active = False
-    if finish_ts:
-        is_active = start_ts <= now <= finish_ts
-
-    # ---------------- BUILD ENTRIES ----------------
-    entries = []
-
-    for rank, entry in enumerate(contributions, start=1):
-        uid = entry.get("UserID")
-        if uid is None:
-            continue
-
-        try:
-            uid_int = int(uid)
-        except Exception:
-            continue
-
-        pts = int(entry.get("Points", 0) or 0)
-        name = id_to_name.get(uid_int, f"Unknown ({uid_int})")
-        discord_id = roblox_to_discord.get(uid_int)
-
-        entries.append({
-            "rank": rank,
-            "user_id": uid_int,
-            "name": name,
-            "points": pts,
-            "discord_id": discord_id
-        })
-
-    # ---------------- SAFETY CHECK ----------------
-    if not entries:
-        return await interaction.followup.send(
-            "❌ No valid leaderboard entries found.",
-            ephemeral=True
-        )
-
-    # ---------------- SAVE TO DATABASE ----------------
-    try:
-        save_leaderboard_to_db(entries, battle_name)
-    except Exception as db_err:
-        print("[DB SYNC ERROR]", repr(db_err))
-
-    # ---------------- BUILD VIEW ----------------
-    view = LeaderboardView(
-        entries=entries,
-        battle_title=battle_name,
-        total_points=total_points,
-        is_active=is_active
-    )
-
-    await interaction.followup.send(
-        embed=view.build_embed(),
-        view=view
-    )
-
-except Exception as e:
-    import traceback
-    print("[LEADERBOARD ERROR]")
-    print(traceback.format_exc())
-
-    await interaction.followup.send(
-        f"❌ {type(e).__name__}: {e}",
-        ephemeral=True
-    )
 
 @bot.tree.command(
     name="mystats",
