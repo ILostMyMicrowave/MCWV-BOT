@@ -363,19 +363,20 @@ def ensure_db_connection():
     global conn
 
     try:
-        if conn is None or conn.closed:
-            print("🔄 Reconnecting to database...")
+        if conn is None or conn.closed != 0:
+            print("🔄 Reconnecting to Neon DB...")
 
             conn = psycopg2.connect(
                 DATABASE_URL,
-                sslmode="require"
+                sslmode="require",
+                connect_timeout=10
             )
 
-            conn.autocommit = False
+            conn.autocommit = True
 
     except Exception as e:
-        print("Database reconnect failed:", repr(e))
-        raise
+        print("DB reconnect failed:", repr(e))
+        conn = None
 
 def db_get_all_alts():
     if not db_enabled():
