@@ -2958,6 +2958,7 @@ async def leaderboard(interaction: discord.Interaction):
                 seen_ids.add(uid_int)
                 user_ids.append(uid_int)
 
+        
         id_to_name = {}
 
         try:
