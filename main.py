@@ -33,6 +33,39 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
+async def save_leaderboard_to_db(entries, battle_name):
+    conn = get_db()
+    cur = conn.cursor()
+
+    # clear old data
+    cur.execute("DELETE FROM live_leaderboard")
+
+    # insert fresh data
+    for e in entries:
+        cur.execute("""
+            INSERT INTO live_leaderboard (
+                roblox_id,
+                username,
+                discord_id,
+                points,
+                rank,
+                avatar,
+                battle_name
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            str(e["user_id"]),
+            e["name"],
+            e.get("discord_id"),
+            e["points"],
+            e["rank"],
+            e.get("avatar"),
+            battle_name
+        ))
+
+    conn.commit()
+    conn.close()
+
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
         category = guild.get_channel(cid)
@@ -2926,6 +2959,7 @@ async def leaderboard(interaction: discord.Interaction):
                 user_ids.append(uid_int)
 
         id_to_name = {}
+
         try:
             for chunk in chunk_list(user_ids, 100):
                 async with session.post(
@@ -2936,10 +2970,12 @@ async def leaderboard(interaction: discord.Interaction):
                     },
                     timeout=timeout
                 ) as r:
+
                     if r.status != 200:
                         continue
 
                     roblox_data = await r.json()
+
                     for u in roblox_data.get("data", []):
                         try:
                             uid = int(u["id"])
@@ -2947,11 +2983,14 @@ async def leaderboard(interaction: discord.Interaction):
                             id_to_name[uid] = uname
                         except Exception:
                             continue
+
         except Exception as e:
             print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
+        # ---------------- DISCORD LINK MAP ----------------
         tracked_rows = db_get_all_tracked()
         roblox_to_discord = {}
+
         for row in tracked_rows:
             try:
                 rid = int(row[0])
@@ -2960,12 +2999,14 @@ async def leaderboard(interaction: discord.Interaction):
             except Exception:
                 continue
 
+        # ---------------- BATTLE NAME ----------------
         battle_name = re.sub(
             r'(\d+)',
             r' \1',
             re.sub(r'([A-Z])', r' \1', str(battle_id))
         ).strip()
 
+        # ---------------- WAR STATE ----------------
         now = datetime.now(timezone.utc).timestamp()
         finish_ts = war_config.get("FinishTime")
         start_ts = war_config.get("StartTime", 0)
@@ -2974,7 +3015,9 @@ async def leaderboard(interaction: discord.Interaction):
         if finish_ts:
             is_active = start_ts <= now <= finish_ts
 
+        # ---------------- BUILD ENTRIES ----------------
         entries = []
+
         for rank, entry in enumerate(contributions, start=1):
             uid = entry.get("UserID")
             if uid is None:
@@ -2997,12 +3040,20 @@ async def leaderboard(interaction: discord.Interaction):
                 "discord_id": discord_id
             })
 
+        # ---------------- SAFETY CHECK ----------------
         if not entries:
             return await interaction.followup.send(
                 "❌ No valid leaderboard entries found.",
                 ephemeral=True
             )
 
+        # ---------------- SAVE TO DATABASE ----------------
+        try:
+            await save_leaderboard_to_db(entries, battle_name)
+        except Exception as db_err:
+            print("[DB SYNC ERROR]", repr(db_err))
+
+        # ---------------- BUILD VIEW ----------------
         view = LeaderboardView(
             entries=entries,
             battle_title=battle_name,
@@ -3013,13 +3064,6 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=view.build_embed(),
             view=view
-        )
-
-    except Exception as e:
-        print("[LEADERBOARD ERROR]", repr(e))
-        await interaction.followup.send(
-            f"❌ Leaderboard failed.\n```{type(e).__name__}: {e}```",
-            ephemeral=True
         )
     
 ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
