@@ -45,52 +45,35 @@ def neon_connect():
 
 
 def save_leaderboard_to_db_neon(entries, battle_name):
-    print("🔥 START SAVE TO NEON")
+    conn = neon_connect()
+    cur = conn.cursor()
 
-    conn = None
-    try:
-        conn = neon_connect()
-        cur = conn.cursor()
+    cur.execute("DELETE FROM live_leaderboard")
 
-        print("🔥 NEON CONNECTED")
-
-        cur.execute("DELETE FROM live_leaderboard")
-        print("🔥 CLEARED TABLE")
-
-        for e in entries:
-            cur.execute("""
-                INSERT INTO live_leaderboard (
-                    roblox_id,
-                    username,
-                    discord_id,
-                    points,
-                    rank,
-                    avatar,
-                    battle_name
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                str(e["user_id"]),
-                e["name"],
-                e.get("discord_id"),
-                int(e["points"]),
-                int(e["rank"]),
-                e.get("avatar"),
+    for e in entries:
+        cur.execute("""
+            INSERT INTO live_leaderboard (
+                roblox_id,
+                username,
+                discord_id,
+                points,
+                rank,
+                avatar,
                 battle_name
-            ))
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            str(e["user_id"]),
+            e["name"],
+            e.get("discord_id"),
+            int(e["points"]),
+            int(e["rank"]),
+            e.get("avatar"),
+            battle_name
+        ))
 
-        conn.commit()
-        print("🔥 COMMIT SUCCESS")
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print("❌ NEON SAVE ERROR:", repr(e))
-        raise
-
-    finally:
-        if conn:
-            conn.close()
+    conn.commit()
+    conn.close()
         
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
