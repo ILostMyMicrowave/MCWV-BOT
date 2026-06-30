@@ -3049,7 +3049,7 @@ async def leaderboard(interaction: discord.Interaction):
 
         # ---------------- SAVE TO DATABASE ----------------
         try:
-            await save_leaderboard_to_db(entries, battle_name)
+            save_leaderboard_to_db(entries, battle_name)
         except Exception as db_err:
             print("[DB SYNC ERROR]", repr(db_err))
 
