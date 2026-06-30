@@ -33,14 +33,26 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
-def save_leaderboard_to_db(entries, battle_name):
-    conn = get_db()
-    cur = conn.cursor()
+import os
+import psycopg2
 
-    cur.execute("DELETE FROM live_leaderboard")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def db_connect():
+    return psycopg2.connect(DATABASE_URL)
+
+def db_exec_neon(query, params=()):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    conn.commit()
+    conn.close()
+
+def save_leaderboard_to_db_neon(entries, battle_name):
+    db_exec_neon("DELETE FROM live_leaderboard")
 
     for e in entries:
-        cur.execute("""
+        db_exec_neon("""
             INSERT INTO live_leaderboard (
                 roblox_id,
                 username,
@@ -60,9 +72,6 @@ def save_leaderboard_to_db(entries, battle_name):
             e.get("avatar"),
             battle_name
         ))
-
-    conn.commit()
-    conn.close()
 
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
@@ -3047,7 +3056,7 @@ async def leaderboard(interaction: discord.Interaction):
 
         # ---------------- SAVE DB ----------------
         try:
-            save_leaderboard_to_db(entries, battle_name)
+            save_leaderboard_to_db_neon(entries, battle_name)
         except Exception as db_err:
             print("[DB SYNC ERROR]", repr(db_err))
 
