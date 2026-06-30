@@ -39,28 +39,27 @@ import psycopg2
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def db_connect():
-    return psycopg2.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-def db_exec_neon(query, params=()):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    conn.close()
 
 def save_leaderboard_to_db_neon(entries, battle_name):
-    conn = db_connect()
-    cur = conn.cursor()
+    print("🔥 START SAVE TO NEON")
 
+    conn = None
     try:
+        conn = db_connect()
+        cur = conn.cursor()
+
         print("🔥 DB CONNECTED")
 
-        # clear old leaderboard
         cur.execute("DELETE FROM live_leaderboard")
+        print("🔥 CLEARED TABLE")
 
-        # insert fresh rows
         for e in entries:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO live_leaderboard (
                     roblox_id,
                     username,
@@ -70,26 +69,31 @@ def save_leaderboard_to_db_neon(entries, battle_name):
                     avatar,
                     battle_name
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                str(e["user_id"]),
-                e["name"],
-                e.get("discord_id"),
-                int(e["points"]),
-                int(e["rank"]),
-                e.get("avatar"),
-                battle_name
-            ))
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(e["user_id"]),
+                    e["name"],
+                    e.get("discord_id"),
+                    int(e["points"]),
+                    int(e["rank"]),
+                    e.get("avatar"),
+                    battle_name,
+                ),
+            )
 
         conn.commit()
         print("🔥 COMMIT SUCCESS")
 
     except Exception as e:
-        conn.rollback()
-        print("❌ DB ERROR:", repr(e))
+        if conn:
+            conn.rollback()
+        print("❌ NEON SAVE ERROR:", repr(e))
+        raise
 
     finally:
-        conn.close()
+        if conn:
+            conn.close()
         
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
@@ -2904,13 +2908,11 @@ async def leaderboard(interaction: discord.Interaction):
     global session
 
     try:
-        # ---------------- SESSION ----------------
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
         timeout = aiohttp.ClientTimeout(total=15)
 
-        # ---------------- WAR API ----------------
         async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
             if war_r.status != 200:
                 return await interaction.followup.send(
@@ -2928,7 +2930,6 @@ async def leaderboard(interaction: discord.Interaction):
 
             war_data = await war_r.json()
 
-        # ---------------- CLAN API ----------------
         async with session.get(CLAN_API, timeout=timeout) as clan_r:
             if clan_r.status != 200:
                 return await interaction.followup.send(
@@ -2946,7 +2947,6 @@ async def leaderboard(interaction: discord.Interaction):
 
             clan_data = await clan_r.json()
 
-        # ---------------- WAR DATA ----------------
         war_config = war_data.get("data", {}).get("configData", {})
         battle_id, battle = get_current_war(war_data, clan_data)
 
@@ -2970,7 +2970,6 @@ async def leaderboard(interaction: discord.Interaction):
 
         total_points = battle.get("Points", 0)
 
-        # ---------------- USER IDS ----------------
         user_ids = []
         seen_ids = set()
 
@@ -2988,7 +2987,6 @@ async def leaderboard(interaction: discord.Interaction):
                 seen_ids.add(uid_int)
                 user_ids.append(uid_int)
 
-        # ---------------- ROBLOX NAMES ----------------
         id_to_name = {}
 
         try:
@@ -3001,7 +2999,6 @@ async def leaderboard(interaction: discord.Interaction):
                     },
                     timeout=timeout
                 ) as r:
-
                     if r.status != 200:
                         continue
 
@@ -3017,7 +3014,6 @@ async def leaderboard(interaction: discord.Interaction):
         except Exception as e:
             print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
-        # ---------------- DISCORD MAP ----------------
         tracked_rows = db_get_all_tracked()
         roblox_to_discord = {}
 
@@ -3027,21 +3023,18 @@ async def leaderboard(interaction: discord.Interaction):
             except Exception:
                 continue
 
-        # ---------------- BATTLE NAME ----------------
         battle_name = re.sub(
             r'(\d+)',
             r' \1',
             re.sub(r'([A-Z])', r' \1', str(battle_id))
         ).strip()
 
-        # ---------------- WAR STATE ----------------
         now = datetime.now(timezone.utc).timestamp()
         finish_ts = war_config.get("FinishTime")
         start_ts = war_config.get("StartTime", 0)
 
         is_active = bool(finish_ts and start_ts <= now <= finish_ts)
 
-        # ---------------- BUILD ENTRIES ----------------
         entries = []
 
         for rank, entry in enumerate(contributions, start=1):
@@ -3073,18 +3066,13 @@ async def leaderboard(interaction: discord.Interaction):
                 ephemeral=True
             )
 
-        # ---------------- SAVE TO NEON ----------------
         try:
             print("🔥 SAVING TO NEON:", len(entries), "entries")
-
             save_leaderboard_to_db_neon(entries, battle_name)
-
             print("🔥 SAVE DONE")
-
         except Exception as e:
             print("❌ SAVE FAILED:", repr(e))
 
-        # ---------------- VIEW ----------------
         view = LeaderboardView(
             entries=entries,
             battle_title=battle_name,
@@ -3095,6 +3083,15 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(
             embed=view.build_embed(),
             view=view
+        )
+
+    except Exception as e:
+        import traceback
+        print("[LEADERBOARD ERROR]")
+        print(traceback.format_exc())
+        await interaction.followup.send(
+            f"❌ {type(e).__name__}: {e}",
+            ephemeral=True
         )
         
 @bot.tree.command(
