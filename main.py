@@ -49,10 +49,13 @@ def db_exec_neon(query, params=()):
     conn.close()
 
 def save_leaderboard_to_db_neon(entries, battle_name):
-    db_exec_neon("DELETE FROM live_leaderboard")
+    conn = db_connect()   # NEW connection
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM live_leaderboard")
 
     for e in entries:
-        db_exec_neon("""
+        cur.execute("""
             INSERT INTO live_leaderboard (
                 roblox_id,
                 username,
@@ -72,6 +75,9 @@ def save_leaderboard_to_db_neon(entries, battle_name):
             e.get("avatar"),
             battle_name
         ))
+
+    conn.commit()
+    conn.close()
 
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
