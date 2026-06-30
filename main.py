@@ -38,7 +38,7 @@ import psycopg2
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def db_connect():
+def neon_connect():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -49,17 +49,16 @@ def save_leaderboard_to_db_neon(entries, battle_name):
 
     conn = None
     try:
-        conn = db_connect()
+        conn = neon_connect()
         cur = conn.cursor()
 
-        print("🔥 DB CONNECTED")
+        print("🔥 NEON CONNECTED")
 
         cur.execute("DELETE FROM live_leaderboard")
         print("🔥 CLEARED TABLE")
 
         for e in entries:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO live_leaderboard (
                     roblox_id,
                     username,
@@ -69,18 +68,16 @@ def save_leaderboard_to_db_neon(entries, battle_name):
                     avatar,
                     battle_name
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    str(e["user_id"]),
-                    e["name"],
-                    e.get("discord_id"),
-                    int(e["points"]),
-                    int(e["rank"]),
-                    e.get("avatar"),
-                    battle_name,
-                ),
-            )
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                str(e["user_id"]),
+                e["name"],
+                e.get("discord_id"),
+                int(e["points"]),
+                int(e["rank"]),
+                e.get("avatar"),
+                battle_name
+            ))
 
         conn.commit()
         print("🔥 COMMIT SUCCESS")
@@ -113,26 +110,24 @@ INVITE_SYSTEM_READY = False
 DB_PATH = "bot.db"
 
 
-def db_connect():
+def sqlite_connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def db_exec(query, params=()):
-    with db_connect() as conn:
+    with sqlite_connect() as conn:
         conn.execute(query, params)
         conn.commit()
 
-
 def db_fetchone(query, params=()):
-    with db_connect() as conn:
+    with sqlite_connect() as conn:
         cur = conn.execute(query, params)
         return cur.fetchone()
 
-
 def db_fetchall(query, params=()):
-    with db_connect() as conn:
+    with sqlite_connect() as conn:
         cur = conn.execute(query, params)
         return cur.fetchall()
 
