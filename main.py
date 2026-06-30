@@ -3456,12 +3456,12 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                 ephemeral=True
             )
 
-        roblox_id = str(resolved["id"])
+        roblox_id = int(resolved["id"])
         roblox_name = resolved["name"]
 
         # ---------------- DB LOOKUP ----------------
         db_users = db_get_all()
-        linked = next((u for u in db_users if str(u[0]).strip() == roblox_id.strip()), None)
+        linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
 
         discord_id = str(linked[1]) if linked and linked[1] else None
         linked_status = "Linked" if discord_id else "Not linked"
@@ -3489,18 +3489,13 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             role_ids = {r.id for r in discord_member.roles}
 
             if OWNER_ROLE_ID in role_ids:
-                role = discord_member.guild.get_role(OWNER_ROLE_ID)
-                clan_role = role.mention if role else "Owner"
-
+                clan_role = "Owner"
             elif OFFICER_ROLE_ID in role_ids:
-                role = discord_member.guild.get_role(OFFICER_ROLE_ID)
-                clan_role = role.mention if role else "Officer"
-
+                clan_role = "Officer"
             elif MEMBER_ROLE_ID in role_ids:
-                role = discord_member.guild.get_role(MEMBER_ROLE_ID)
-                clan_role = role.mention if role else "Member"
+                clan_role = "Member"
 
-        # ---------------- SESSION ----------------
+        # ---------------- SESSION SAFETY ----------------
         global session
         if session is None or session.closed:
             session = aiohttp.ClientSession()
@@ -3526,7 +3521,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                         end = b_data.get("FinishTime", 0) or 0
                         contributions = b_data.get("PointContributions", [])
 
-                        if any(str(e.get("UserID")) == roblox_id for e in contributions):
+                        if any(int(e.get("UserID", 0)) == roblox_id for e in contributions):
                             war_count += 1
 
                         if start <= now <= end:
@@ -3539,7 +3534,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                             )
 
                             for i, entry in enumerate(contributions, start=1):
-                                if str(entry.get("UserID")) == roblox_id:
+                                if int(entry.get("UserID", 0)) == roblox_id:
                                     points = int(entry.get("Points", 0) or 0)
                                     rank = i
                                     break
@@ -3548,19 +3543,13 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         except Exception as e:
             print("[profile] war API error:", e)
 
-        # ---------------- PS99 API ----------------
-        extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(session, roblox_id)
-
-        view = ProfileView(
-            extended_data,
-            inventory_data,
-            profile_data,
-            roblox_name,
-            public_views,
+        # ---------------- PROFILE BUNDLE (FIX: FORCE REFRESH + TYPE SAFETY) ----------------
+        extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(
+            session,
             roblox_id,
-            session
+            force=True
         )
-        
+
         # ---------------- AVATAR ----------------
         avatar_url = (
             discord_member.display_avatar.url
@@ -3568,7 +3557,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             else interaction.user.display_avatar.url
         )
 
-        # ---------------- EMBED (IDENTICAL STYLE) ----------------
+        # ---------------- EMBED ----------------
         embed = discord.Embed(
             title=f"📇 Player Profile — {roblox_name}",
             color=discord.Color.blurple()
@@ -3578,15 +3567,9 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         embed.add_field(name="🎮 Username", value=roblox_name, inline=False)
         embed.add_field(name="💬 Discord", value=discord_display, inline=False)
-        embed.add_field(name="🆔 Roblox ID", value=roblox_id, inline=False)
-
+        embed.add_field(name="🆔 Roblox ID", value=str(roblox_id), inline=False)
         embed.add_field(name="🔗 Account Status", value=linked_status, inline=False)
-
-        embed.add_field(
-            name="🏷️ Clan Role",
-            value=clan_role or "None",
-            inline=False
-        )
+        embed.add_field(name="🏷️ Clan Role", value=clan_role or "None", inline=False)
 
         if battle:
             embed.add_field(
@@ -3607,6 +3590,17 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         embed.set_footer(
             text=f"MCWV Profile Dashboard • Requested by {interaction.user.display_name}"
+        )
+
+        # ---------------- VIEW ----------------
+        view = ProfileView(
+            extended_data,
+            inventory_data,
+            profile_data,
+            roblox_name,
+            public_views,
+            roblox_id,
+            session
         )
 
         await interaction.followup.send(embed=embed, view=view)
