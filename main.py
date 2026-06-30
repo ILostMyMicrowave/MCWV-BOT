@@ -49,36 +49,47 @@ def db_exec_neon(query, params=()):
     conn.close()
 
 def save_leaderboard_to_db_neon(entries, battle_name):
-    conn = db_connect()   # NEW connection
+    conn = db_connect()
     cur = conn.cursor()
 
-    cur.execute("DELETE FROM live_leaderboard")
+    try:
+        print("🔥 DELETING OLD DATA")
+        cur.execute("DELETE FROM live_leaderboard")
 
-    for e in entries:
-        cur.execute("""
-            INSERT INTO live_leaderboard (
-                roblox_id,
-                username,
-                discord_id,
-                points,
-                rank,
-                avatar,
+        for e in entries:
+            print("🔥 INSERTING:", e["user_id"])
+
+            cur.execute("""
+                INSERT INTO live_leaderboard (
+                    roblox_id,
+                    username,
+                    discord_id,
+                    points,
+                    rank,
+                    avatar,
+                    battle_name
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                str(e["user_id"]),
+                e["name"],
+                e.get("discord_id"),
+                int(e["points"]),
+                int(e["rank"]),
+                None,   # SAFE FIX
                 battle_name
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            str(e["user_id"]),
-            e["name"],
-            e.get("discord_id"),
-            e["points"],
-            e["rank"],
-            e.get("avatar"),
-            battle_name
-        ))
+            ))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        print("🔥 COMMIT DONE")
 
+    except Exception as e:
+        print("❌ NEON INSERT FAILED:", repr(e))
+        conn.rollback()
+
+    finally:
+        conn.close()
+        
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
         category = guild.get_channel(cid)
