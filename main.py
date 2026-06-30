@@ -33,14 +33,12 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
-async def save_leaderboard_to_db(entries, battle_name):
+def save_leaderboard_to_db(entries, battle_name):
     conn = get_db()
     cur = conn.cursor()
 
-    # clear old data
     cur.execute("DELETE FROM live_leaderboard")
 
-    # insert fresh data
     for e in entries:
         cur.execute("""
             INSERT INTO live_leaderboard (
@@ -3049,7 +3047,7 @@ async def leaderboard(interaction: discord.Interaction):
 
         # ---------------- SAVE DB ----------------
         try:
-            await save_leaderboard_to_db(entries, battle_name)
+            save_leaderboard_to_db(entries, battle_name)
         except Exception as db_err:
             print("[DB SYNC ERROR]", repr(db_err))
 
