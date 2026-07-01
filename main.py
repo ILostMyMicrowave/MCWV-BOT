@@ -32,48 +32,6 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_web, daemon=True).start()
-
-import os
-import psycopg2
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-def neon_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-
-def save_leaderboard_to_db_neon(entries, battle_name):
-    conn = neon_connect()
-    cur = conn.cursor()
-
-    cur.execute("DELETE FROM live_leaderboard")
-
-    for e in entries:
-        cur.execute("""
-            INSERT INTO live_leaderboard (
-                roblox_id,
-                username,
-                discord_id,
-                points,
-                rank,
-                avatar,
-                battle_name
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            str(e["user_id"]),
-            e["name"],
-            e.get("discord_id"),
-            int(e["points"]),
-            int(e["rank"]),
-            e.get("avatar"),
-            battle_name
-        ))
-
-    conn.commit()
-    conn.close()
         
 def get_available_category(guild):
     for cid in CLAN_MEMBER_CATEGORY_IDS:
@@ -3043,13 +3001,6 @@ async def leaderboard(interaction: discord.Interaction):
                 "❌ No valid leaderboard entries found.",
                 ephemeral=True
             )
-
-        try:
-            print("🔥 SAVING TO NEON:", len(entries), "entries")
-            save_leaderboard_to_db_neon(entries, battle_name)
-            print("🔥 SAVE DONE")
-        except Exception as e:
-            print("❌ SAVE FAILED:", repr(e))
 
         view = LeaderboardView(
             entries=entries,
