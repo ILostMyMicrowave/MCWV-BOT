@@ -2996,12 +2996,13 @@ async def leaderboard(interaction: discord.Interaction):
                 "avatar": None
             })
 
-        if not entries:
+                if not entries:
             return await interaction.followup.send(
                 "❌ No valid leaderboard entries found.",
                 ephemeral=True
             )
 
+        # ---------------- BUILD VIEW ----------------
         view = LeaderboardView(
             entries=entries,
             battle_title=battle_name,
@@ -3014,6 +3015,29 @@ async def leaderboard(interaction: discord.Interaction):
             view=view
         )
 
+        # ---------------- SYNC TO WEBSITE ----------------
+        try:
+            print("SYNC → sending to website")
+
+            async with session.post(
+                "https://mcwv-hub.vercel.app/api/leaderboard-sync",
+                json={
+                    "battle_name": battle_name,
+                    "entries": entries
+                },
+                headers={
+                    "x-api-key": os.getenv("API_KEY")
+                }
+            ) as r:
+
+                print("SYNC RESPONSE:", r.status)
+                print(await r.text())
+
+        except Exception as e:
+            print("[SYNC ERROR]", repr(e))
+            
+except Exception as e:
+    print("[SYNC ERROR]", repr(e))
     except Exception as e:
         import traceback
         print("[LEADERBOARD ERROR]")
