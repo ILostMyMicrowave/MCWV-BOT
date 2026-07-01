@@ -2833,6 +2833,7 @@ async def warinfo(interaction: discord.Interaction):
     embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
     await interaction.followup.send(embed=embed)
 
+
 @bot.tree.command(
     name="leaderboard",
     description="Show MCWV clan war contribution leaderboard",
@@ -2844,11 +2845,13 @@ async def leaderboard(interaction: discord.Interaction):
     global session
 
     try:
+        # ---------------- SESSION ----------------
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
         timeout = aiohttp.ClientTimeout(total=15)
 
+        # ---------------- WAR API ----------------
         async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
             if war_r.status != 200:
                 return await interaction.followup.send(
@@ -2866,6 +2869,7 @@ async def leaderboard(interaction: discord.Interaction):
 
             war_data = await war_r.json()
 
+        # ---------------- CLAN API ----------------
         async with session.get(CLAN_API, timeout=timeout) as clan_r:
             if clan_r.status != 200:
                 return await interaction.followup.send(
@@ -2883,6 +2887,7 @@ async def leaderboard(interaction: discord.Interaction):
 
             clan_data = await clan_r.json()
 
+        # ---------------- WAR DATA ----------------
         war_config = war_data.get("data", {}).get("configData", {})
         battle_id, battle = get_current_war(war_data, clan_data)
 
@@ -2906,6 +2911,7 @@ async def leaderboard(interaction: discord.Interaction):
 
         total_points = battle.get("Points", 0)
 
+        # ---------------- USER IDS ----------------
         user_ids = []
         seen_ids = set()
 
@@ -2923,6 +2929,7 @@ async def leaderboard(interaction: discord.Interaction):
                 seen_ids.add(uid_int)
                 user_ids.append(uid_int)
 
+        # ---------------- ROBLOX USERNAMES ----------------
         id_to_name = {}
 
         try:
@@ -2935,6 +2942,7 @@ async def leaderboard(interaction: discord.Interaction):
                     },
                     timeout=timeout
                 ) as r:
+
                     if r.status != 200:
                         continue
 
@@ -2950,6 +2958,7 @@ async def leaderboard(interaction: discord.Interaction):
         except Exception as e:
             print("[LEADERBOARD ROBLOX NAME ERROR]", repr(e))
 
+        # ---------------- DISCORD MAP ----------------
         tracked_rows = db_get_all_tracked()
         roblox_to_discord = {}
 
@@ -2959,18 +2968,21 @@ async def leaderboard(interaction: discord.Interaction):
             except Exception:
                 continue
 
+        # ---------------- BATTLE NAME ----------------
         battle_name = re.sub(
             r'(\d+)',
             r' \1',
             re.sub(r'([A-Z])', r' \1', str(battle_id))
         ).strip()
 
+        # ---------------- WAR STATE ----------------
         now = datetime.now(timezone.utc).timestamp()
         finish_ts = war_config.get("FinishTime")
         start_ts = war_config.get("StartTime", 0)
 
         is_active = bool(finish_ts and start_ts <= now <= finish_ts)
 
+        # ---------------- BUILD ENTRIES ----------------
         entries = []
 
         for rank, entry in enumerate(contributions, start=1):
@@ -2996,12 +3008,14 @@ async def leaderboard(interaction: discord.Interaction):
                 "avatar": None
             })
 
+        # ---------------- VALIDATION ----------------
         if not entries:
             return await interaction.followup.send(
                 "❌ No valid leaderboard entries found.",
                 ephemeral=True
             )
 
+        # ---------------- VIEW ----------------
         view = LeaderboardView(
             entries=entries,
             battle_title=battle_name,
@@ -3014,30 +3028,11 @@ async def leaderboard(interaction: discord.Interaction):
             view=view
         )
 
-        try:
-            print("SYNC → sending to website")
-
-            async with session.post(
-                "https://mcwv-hub.vercel.app/api/leaderboard-sync",
-                json={
-                    "battle_name": battle_name,
-                    "entries": entries
-                },
-                headers={
-                    "x-api-key": os.getenv("API_KEY")
-                },
-                timeout=timeout
-            ) as r:
-                print("SYNC RESPONSE:", r.status)
-                print(await r.text())
-
-        except Exception as e:
-            print("[SYNC ERROR]", repr(e))
-
     except Exception as e:
         import traceback
         print("[LEADERBOARD ERROR]")
         print(traceback.format_exc())
+
         await interaction.followup.send(
             f"❌ {type(e).__name__}: {e}",
             ephemeral=True
