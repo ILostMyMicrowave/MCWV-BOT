@@ -2,6 +2,10 @@ import os
 import re
 import asyncio
 import sqlite3
+import platform
+import resource
+import secrets
+from functools import wraps
 import discord
 import aiohttp
 import traceback
@@ -12,10 +16,15 @@ import random
 from datetime import datetime, timezone
 import time
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from flask import Flask
+from flask import Flask, jsonify, request
 from threading import Thread
 
 session = None
@@ -26,6 +35,609 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return "Bot is alive"
+
+
+# ---------------- ADMIN API ----------------
+# The Hub talks to these routes server-to-server using X-Admin-API-Key.
+# Keep every route registered before the Flask thread starts.
+ADMIN_API_KEY = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
+STARTED_AT = time.time()
+LAST_HEARTBEAT = datetime.now(timezone.utc).isoformat()
+COMMANDS_EXECUTED = 0
+ADMIN_LOGS = []
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def admin_log(event: str, message: str = "", level: str = "info", extra=None):
+    entry = {
+        "id": f"{int(time.time() * 1000)}-{len(ADMIN_LOGS)}",
+        "level": level,
+        "event": event,
+        "message": message,
+        "createdAt": _now_iso(),
+        "extra": extra or {},
+    }
+    ADMIN_LOGS.insert(0, entry)
+    del ADMIN_LOGS[200:]
+    print(f"[admin-api] {level.upper()} {event}: {message}")
+    return entry
+
+
+def _admin_api_authorized():
+    if not ADMIN_API_KEY:
+        return False
+
+    provided = request.headers.get("X-Admin-API-Key", "")
+    if not provided:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header.split(" ", 1)[1].strip()
+
+    return bool(provided) and secrets.compare_digest(str(provided), str(ADMIN_API_KEY))
+
+
+def require_admin_api_key(handler):
+    @wraps(handler)
+    def wrapper(*args, **kwargs):
+        if not _admin_api_authorized():
+            return jsonify({"error": "Unauthorized"}), 401
+        return handler(*args, **kwargs)
+
+    return wrapper
+
+
+def _row_to_dict(row):
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return {key: row[key] for key in row.keys()}
+    if isinstance(row, dict):
+        return row
+    return dict(row) if hasattr(row, "keys") else row
+
+
+def _safe_call(name, default=None, *args, **kwargs):
+    func = globals().get(name)
+    if not callable(func):
+        return default
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        print(f"[admin-api] {name} failed: {exc}")
+        return default
+
+
+def _loop_status(name):
+    loop_obj = globals().get(name)
+    if loop_obj is None:
+        return {"status": "Unknown"}
+    try:
+        return {
+            "status": "Running" if loop_obj.is_running() else "Stopped",
+            "seconds": getattr(loop_obj, "seconds", None),
+            "minutes": getattr(loop_obj, "minutes", None),
+        }
+    except Exception:
+        return {"status": "Unknown"}
+
+
+def _process_metrics():
+    if psutil is not None:
+        proc = psutil.Process(os.getpid())
+        return {
+            "cpu": round(psutil.cpu_percent(interval=None), 2),
+            "ramMb": round(proc.memory_info().rss / 1024 / 1024, 2),
+            "platform": platform.platform(),
+        }
+
+    # Fallback without psutil. ru_maxrss is KiB on Linux.
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return {
+        "cpu": None,
+        "ramMb": round(float(usage.ru_maxrss) / 1024, 2),
+        "platform": platform.platform(),
+    }
+
+
+def _bot_summary():
+    bot_obj = globals().get("bot")
+    if bot_obj is None:
+        return {
+            "ready": False,
+            "pingMs": None,
+            "guildCount": 0,
+            "users": 0,
+        }
+
+    guilds = list(getattr(bot_obj, "guilds", []) or [])
+    return {
+        "ready": bool(getattr(bot_obj, "is_ready", lambda: False)()),
+        "pingMs": round(float(getattr(bot_obj, "latency", 0) or 0) * 1000, 2),
+        "guildCount": len(guilds),
+        "users": sum(int(getattr(guild, "member_count", 0) or 0) for guild in guilds),
+    }
+
+
+def _db_connected():
+    func = globals().get("db_enabled")
+    if callable(func):
+        try:
+            return bool(func())
+        except Exception:
+            return False
+    return False
+
+
+def _tracked_players():
+    rows = _safe_call("db_get_all_tracked", [], ) or []
+    return len(rows)
+
+
+def _active_invite_payload():
+    event = _row_to_dict(_safe_call("get_active_event"))
+    if not event:
+        return None
+    event["active"] = bool(int(event.get("active") or 0))
+    return event
+
+
+def _active_giveaway_payload():
+    giveaway = _row_to_dict(_safe_call("get_giveaway_row"))
+    if not giveaway:
+        return None
+    giveaway["active"] = bool(int(giveaway.get("active") or 0))
+    return giveaway
+
+
+def _run_on_bot_loop(coro):
+    bot_obj = globals().get("bot")
+    if bot_obj is None or getattr(bot_obj, "loop", None) is None:
+        raise RuntimeError("Bot event loop is not ready")
+    return asyncio.run_coroutine_threadsafe(coro, bot_obj.loop)
+
+
+async def _restart_loop_from_admin(loop_name):
+    loop_obj = globals().get(loop_name)
+    if loop_obj is None:
+        raise RuntimeError(f"Loop not found: {loop_name}")
+    if loop_obj.is_running():
+        loop_obj.restart()
+    else:
+        loop_obj.start()
+
+
+async def _maybe_get_channel(channel_id):
+    bot_obj = globals().get("bot")
+    if bot_obj is None or not channel_id:
+        return None
+    channel = bot_obj.get_channel(int(channel_id))
+    if channel:
+        return channel
+    try:
+        return await bot_obj.fetch_channel(int(channel_id))
+    except Exception:
+        return None
+
+
+@app.route("/admin/status")
+@require_admin_api_key
+def admin_status():
+    global LAST_HEARTBEAT
+    LAST_HEARTBEAT = _now_iso()
+
+    active_invite = _active_invite_payload()
+    active_giveaway = _active_giveaway_payload()
+    metrics = _process_metrics()
+    summary = _bot_summary()
+    uptime = int(time.time() - STARTED_AT)
+
+    return jsonify({
+        "success": True,
+        "overview": {
+            "botStatus": "Online" if summary["ready"] else "Starting",
+            "uptimeSeconds": uptime,
+            "lastHeartbeat": LAST_HEARTBEAT,
+            "databaseStatus": "Connected" if _db_connected() else "Disconnected",
+            "trackedPlayers": _tracked_players(),
+            "activeGiveaway": bool(active_giveaway and active_giveaway.get("active")),
+            "activeInviteEvent": bool(active_invite and active_invite.get("active")),
+            "currentWar": globals().get("CLAN_NAME", "MCWV"),
+        },
+        "bot": {
+            **summary,
+            **metrics,
+            "uptimeSeconds": uptime,
+            "lastHeartbeat": LAST_HEARTBEAT,
+            "commandsExecuted": COMMANDS_EXECUTED,
+            "queueLengths": {},
+            "reminderInterval": globals().get("reminder_interval"),
+            "reminderChannel": globals().get("reminder_channel_id"),
+        },
+        "loops": {
+            "War Poll Loop": _loop_status("war_poll_loop"),
+            "Presence Loop": _loop_status("check_loop"),
+            "Reminder Loop": _loop_status("reminder_loop"),
+            "Invite Event Loop": _loop_status("check_invite_event"),
+            "Giveaway Loop": _loop_status("check_giveaway_event"),
+            "Clan Leave Loop": _loop_status("clan_leave_loop"),
+            "Invite Cache": {"status": "Healthy" if globals().get("INVITE_SYSTEM_READY") else "Starting"},
+            "Database": {"status": "Connected" if _db_connected() else "Disconnected"},
+        },
+        "invites": active_invite,
+        "giveaways": active_giveaway,
+        "logs": ADMIN_LOGS[:20],
+    })
+
+
+@app.route("/admin/players")
+@require_admin_api_key
+def admin_players():
+    rows = _safe_call("db_get_all_tracked", []) or []
+    players = []
+
+    for row in rows:
+        roblox_id = str(row[0]) if len(row) > 0 else ""
+        discord_id = str(row[1]) if len(row) > 1 else ""
+        username = str(row[2]) if len(row) > 2 else roblox_id
+        status_value = _safe_call("db_get_user_status", None, roblox_id)
+        status_label = _safe_call("status_text", "Unknown", status_value) if status_value is not None else "Unknown"
+        players.append({
+            "id": roblox_id,
+            "robloxId": roblox_id,
+            "username": username,
+            "discord": discord_id,
+            "status": status_label,
+            "currentWorld": "—",
+            "lastSeen": None,
+            "clanRank": "—",
+            "points": 0,
+            "avatar": None,
+        })
+
+    alts = _safe_call("db_get_all_alts", []) or []
+    links = [
+        {
+            "discord_id": str(row[0]) if len(row) > 0 else "",
+            "roblox_id": str(row[1]) if len(row) > 1 else "",
+            "username": str(row[2]) if len(row) > 2 else "Alt",
+        }
+        for row in alts
+    ]
+
+    return jsonify({"success": True, "source": "bot", "players": players, "links": links})
+
+
+@app.route("/admin/invites")
+@require_admin_api_key
+def admin_invites():
+    active = _active_invite_payload()
+    leaderboard_rows = db_fetchall(
+        "SELECT user_id, invites FROM invite_counts ORDER BY invites DESC, user_id ASC LIMIT 100"
+    )
+    invited_rows = db_fetchall(
+        "SELECT member_id, inviter_id FROM invite_member_links ORDER BY member_id DESC LIMIT 200"
+    )
+
+    leaderboard = [
+        {"user_id": str(row["user_id"]), "invites": int(row["invites"] or 0)}
+        for row in leaderboard_rows
+    ]
+    invited_members = [
+        {"member_id": str(row["member_id"]), "inviter_id": str(row["inviter_id"])}
+        for row in invited_rows
+    ]
+
+    events = []
+    if active:
+        events.append({
+            "id": active.get("id", 1),
+            "name": "Invite Event",
+            "status": "Active" if active.get("active") else "Ended",
+            "active": active.get("active"),
+            "start_time": active.get("start_time"),
+            "end_time": active.get("end_time"),
+            "invites": sum(item["invites"] for item in leaderboard),
+            "reward": active.get("reward") or "Giveaway entries",
+        })
+
+    return jsonify({
+        "success": True,
+        "source": "bot",
+        "active": events[0] if events else None,
+        "events": events,
+        "leaderboard": leaderboard,
+        "invitedMembers": invited_members,
+        "fakeInvitesRemoved": 0,
+    })
+
+
+@app.route("/admin/giveaways")
+@require_admin_api_key
+def admin_giveaways():
+    active = _active_giveaway_payload()
+    giveaways = []
+
+    if active:
+        invites_per_entry = max(1, int(active.get("invites_per_entry") or 2))
+        counts = db_fetchall("SELECT user_id, invites FROM invite_counts ORDER BY invites DESC")
+        entries = sum(max(0, int(row["invites"] or 0)) // invites_per_entry for row in counts)
+        giveaways.append({
+            "id": active.get("id", 1),
+            "prize": active.get("prize") or "Unknown prize",
+            "active": active.get("active"),
+            "entries": entries,
+            "end_time": active.get("end_time"),
+            "winners": int(active.get("winners") or 1),
+            "winnerCount": int(active.get("winners") or 1),
+            "linkedInviteEvent": "Invite Event",
+        })
+
+    return jsonify({
+        "success": True,
+        "source": "bot",
+        "active": giveaways[0] if giveaways else None,
+        "giveaways": giveaways,
+    })
+
+
+@app.route("/admin/logs")
+@require_admin_api_key
+def admin_logs():
+    return jsonify({"success": True, "source": "bot", "logs": ADMIN_LOGS[:200]})
+
+
+@app.route("/admin/sync", methods=["POST"])
+@require_admin_api_key
+def admin_sync():
+    body = request.get_json(silent=True) or {}
+    target = str(body.get("target") or body.get("action") or "war").lower()
+
+    if target == "profiles":
+        globals().get("PROFILE_CACHE", {}).clear()
+        admin_log("Profiles Refreshed", "Profile cache cleared from admin panel")
+        return jsonify({"success": True, "message": "Profile cache cleared"})
+
+    if target == "presence":
+        try:
+            _run_on_bot_loop(run_initial_presence_check())
+            admin_log("Presence Sync", "Presence check queued from admin panel")
+            return jsonify({"success": True, "message": "Presence check queued"})
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    if target == "war":
+        try:
+            _run_on_bot_loop(_restart_loop_from_admin("war_poll_loop"))
+            admin_log("War Sync", "War poll loop restart queued from admin panel")
+            return jsonify({"success": True, "message": "War sync queued"})
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"error": f"Unknown sync target: {target}"}), 400
+
+
+@app.route("/admin/giveaway/end", methods=["POST"])
+@require_admin_api_key
+def admin_giveaway_end():
+    try:
+        _run_on_bot_loop(finish_giveaway("admin panel"))
+        admin_log("Giveaway Ended", "Giveaway end queued from admin panel")
+        return jsonify({"success": True, "message": "Giveaway end queued"})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/giveaway/cancel", methods=["POST"])
+@require_admin_api_key
+def admin_giveaway_cancel():
+    db_exec("UPDATE giveaway_events SET active = 0 WHERE id = 1")
+    admin_log("Giveaway Cancelled", "Giveaway cancelled from admin panel", "warning")
+    return jsonify({"success": True, "message": "Giveaway cancelled"})
+
+
+@app.route("/admin/giveaway/reroll", methods=["POST"])
+@require_admin_api_key
+def admin_giveaway_reroll():
+    return jsonify({"error": "Giveaway reroll is not implemented in the bot yet"}), 501
+
+
+async def _create_giveaway_from_admin(body):
+    prize = str(body.get("prize") or "").strip()
+    if not prize:
+        raise ValueError("Prize is required")
+
+    winners = max(1, int(body.get("winners") or body.get("winner_count") or 1))
+    invites_per_entry = max(1, int(body.get("invites_per_entry") or 2))
+    duration_minutes = max(1, int(body.get("duration_minutes") or 60))
+    now = int(time.time())
+    end_time = int(body.get("end_time") or (now + duration_minutes * 60))
+    channel_id = int(body.get("channel_id") or CHANNEL_ID)
+    thumbnail = str(body.get("thumbnail") or "")
+
+    db_exec("""
+        INSERT INTO giveaway_events (
+            id, active, prize, winners, invites_per_entry,
+            start_time, end_time, channel_id, message_id,
+            thumbnail, created_by
+        ) VALUES (1, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0)
+        ON CONFLICT(id) DO UPDATE SET
+            active = excluded.active,
+            prize = excluded.prize,
+            winners = excluded.winners,
+            invites_per_entry = excluded.invites_per_entry,
+            start_time = excluded.start_time,
+            end_time = excluded.end_time,
+            channel_id = excluded.channel_id,
+            thumbnail = excluded.thumbnail,
+            created_by = excluded.created_by
+    """, (prize, winners, invites_per_entry, now, end_time, channel_id, thumbnail))
+
+    channel = await _maybe_get_channel(channel_id)
+    message_id = 0
+    if channel:
+        giveaway = get_active_giveaway()
+        message = await channel.send(embed=build_giveaway_embed(giveaway), view=GiveawayView())
+        message_id = int(message.id)
+        db_exec("UPDATE giveaway_events SET message_id = ? WHERE id = 1", (message_id,))
+
+    return {"message_id": message_id, "end_time": end_time}
+
+
+@app.route("/admin/giveaway/create", methods=["POST"])
+@require_admin_api_key
+def admin_giveaway_create():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_create_giveaway_from_admin(body))
+        result = future.result(timeout=20)
+        admin_log("Giveaway Created", str(body.get("prize") or "Giveaway created"))
+        return jsonify({"success": True, "message": "Giveaway created", **result})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+async def _start_invite_from_admin(body):
+    duration_hours = max(1, int(body.get("duration_hours") or 24))
+    now = int(time.time())
+    end = now + duration_hours * 3600
+    channel_id = int(body.get("channel_id") or CHANNEL_ID)
+
+    db_exec("DELETE FROM invite_counts")
+    db_exec("DELETE FROM invite_used_users")
+    db_exec("DELETE FROM invite_cache")
+    db_exec("""
+        INSERT INTO invite_events (id, active, start_time, end_time, channel_id)
+        VALUES (1, 1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            active = excluded.active,
+            start_time = excluded.start_time,
+            end_time = excluded.end_time,
+            channel_id = excluded.channel_id
+    """, (now, end, channel_id))
+
+    bot_obj = globals().get("bot")
+    if bot_obj:
+        for guild in bot_obj.guilds:
+            await load_invite_snapshot(guild)
+
+    channel = await _maybe_get_channel(channel_id)
+    if channel:
+        embed = discord.Embed(
+            title="📨 Invite Event Started",
+            description="Click the buttons below to get your invite link or view your stats.",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Ends", value=f"<t:{end}:R>", inline=True)
+        await channel.send(embed=embed, view=InviteView())
+
+    return {"end_time": end}
+
+
+@app.route("/admin/invite/start", methods=["POST"])
+@require_admin_api_key
+def admin_invite_start():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_start_invite_from_admin(body))
+        result = future.result(timeout=20)
+        admin_log("Invite Event Created", "Invite event started from admin panel")
+        return jsonify({"success": True, "message": "Invite event started", **result})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/invite/end", methods=["POST"])
+@require_admin_api_key
+def admin_invite_end():
+    db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+    admin_log("Invite Event Ended", "Invite event ended from admin panel")
+    return jsonify({"success": True, "message": "Invite event ended"})
+
+
+@app.route("/admin/invite/pause", methods=["POST"])
+@require_admin_api_key
+def admin_invite_pause():
+    db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+    admin_log("Invite Event Paused", "Invite event paused from admin panel", "warning")
+    return jsonify({"success": True, "message": "Invite event paused"})
+
+
+@app.route("/admin/invite/resume", methods=["POST"])
+@require_admin_api_key
+def admin_invite_resume():
+    db_exec("UPDATE invite_events SET active = 1 WHERE id = 1")
+    admin_log("Invite Event Resumed", "Invite event resumed from admin panel")
+    return jsonify({"success": True, "message": "Invite event resumed"})
+
+
+@app.route("/admin/invite/delete", methods=["POST"])
+@require_admin_api_key
+def admin_invite_delete():
+    db_exec("UPDATE invite_events SET active = 0, start_time = 0, end_time = 0 WHERE id = 1")
+    db_exec("DELETE FROM invite_counts")
+    db_exec("DELETE FROM invite_used_users")
+    db_exec("DELETE FROM invite_cache")
+    admin_log("Invite Event Deleted", "Invite event reset from admin panel", "warning")
+    return jsonify({"success": True, "message": "Invite event deleted"})
+
+
+@app.route("/admin/player/sync", methods=["POST"])
+@require_admin_api_key
+def admin_player_sync():
+    body = request.get_json(silent=True) or {}
+    roblox_id = body.get("roblox_id") or body.get("robloxId")
+    if roblox_id:
+        globals().get("PROFILE_CACHE", {}).pop(str(roblox_id), None)
+        admin_log("Player Synced", f"Profile cache cleared for {roblox_id}")
+        return jsonify({"success": True, "message": "Player sync queued"})
+    return jsonify({"success": True, "message": "No Roblox ID supplied; nothing to sync"})
+
+
+@app.route("/admin/player/remove", methods=["POST"])
+@require_admin_api_key
+def admin_player_remove():
+    body = request.get_json(silent=True) or {}
+    discord_id = body.get("discord_id") or body.get("discord")
+    roblox_id = body.get("roblox_id") or body.get("robloxId")
+
+    if discord_id:
+        _safe_call("db_remove_all_links_for_discord", None, discord_id)
+        admin_log("Player Removed", f"Removed links for Discord {discord_id}", "warning")
+        return jsonify({"success": True, "message": "Player links removed"})
+
+    if roblox_id:
+        link = _safe_call("db_find_roblox_link", None, roblox_id)
+        if link and link.get("discord_id"):
+            _safe_call("db_remove_all_links_for_discord", None, link.get("discord_id"))
+            admin_log("Player Removed", f"Removed links for Roblox {roblox_id}", "warning")
+            return jsonify({"success": True, "message": "Player links removed"})
+        return jsonify({"error": "Roblox link not found"}), 404
+
+    return jsonify({"error": "discord_id or roblox_id is required"}), 400
+
+
+@app.route("/admin/restart", methods=["POST"])
+@require_admin_api_key
+def admin_restart():
+    body = request.get_json(silent=True) or {}
+    if not body.get("confirm"):
+        return jsonify({"error": "Set confirm=true to restart"}), 400
+    if not ADMIN_RESTART_ENABLED:
+        return jsonify({"error": "Restart is disabled. Set ALLOW_ADMIN_RESTART=1 to enable it."}), 403
+
+    admin_log("Bot Restart", "Restart requested from admin panel", "warning")
+
+    def delayed_exit():
+        time.sleep(1.5)
+        os._exit(0)
+
+    Thread(target=delayed_exit, daemon=True).start()
+    return jsonify({"success": True, "message": "Bot restart scheduled"})
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -1075,6 +1687,12 @@ guild_obj = discord.Object(id=GUILD_ID)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!!", intents=intents)
+
+@bot.listen("on_app_command_completion")
+async def track_admin_command_completion(interaction: discord.Interaction, command: app_commands.Command):
+    global COMMANDS_EXECUTED
+    COMMANDS_EXECUTED += 1
+
 cooldowns = commands.CooldownMapping.from_cooldown(
     1, 10, commands.BucketType.user
 )
