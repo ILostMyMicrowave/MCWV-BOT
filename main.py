@@ -678,6 +678,76 @@ def admin_invite_delete():
     return jsonify({"success": True, "message": "Invite event deleted"})
 
 
+async def _resolve_roblox_username_for_admin(username):
+    username = str(username or "").strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+        raise ValueError("Enter a valid Roblox username.")
+
+    payload = {"usernames": [username], "excludeBannedUsers": False}
+
+    async def _post(client):
+        async with client.post(
+            "https://users.roblox.com/v1/usernames/users",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            if response.status != 200:
+                raise ValueError(f"Roblox username lookup failed with HTTP {response.status}.")
+            data = await response.json(content_type=None)
+
+        results = data.get("data", []) if isinstance(data, dict) else []
+        if not results:
+            raise ValueError("Roblox username not found.")
+
+        return {
+            "id": str(results[0]["id"]),
+            "name": str(results[0]["name"]),
+        }
+
+    if session is not None and not getattr(session, "closed", True):
+        return await _post(session)
+
+    async with aiohttp.ClientSession() as temp_session:
+        return await _post(temp_session)
+
+
+async def _admin_add_alt_from_body(body):
+    discord_id = body.get("discord_id") or body.get("discordId") or body.get("discord")
+    roblox_username = body.get("roblox_username") or body.get("robloxUsername") or body.get("username")
+
+    if not discord_id:
+        raise ValueError("Discord ID is required.")
+
+    resolved = await _resolve_roblox_username_for_admin(roblox_username)
+    ok, message = db_add_alt(discord_id, resolved["id"], resolved["name"])
+
+    if not ok:
+        raise ValueError(message)
+
+    return {
+        "discord_id": str(discord_id),
+        "roblox_id": resolved["id"],
+        "username": resolved["name"],
+        "message": f"Added {resolved['name']} as an alt.",
+    }
+
+
+@app.route("/admin/player/add-alt", methods=["POST"])
+@require_admin_api_key
+def admin_player_add_alt():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_add_alt_from_body(body))
+        result = future.result(timeout=20)
+        admin_log("Alt Added", f"{result['username']} added as an alt for {result['discord_id']}")
+        return jsonify({"success": True, **result})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/admin/player/sync", methods=["POST"])
 @require_admin_api_key
 def admin_player_sync():
