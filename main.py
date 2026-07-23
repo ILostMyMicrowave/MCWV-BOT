@@ -363,27 +363,100 @@ def admin_status():
     })
 
 
-@app.route("/admin/players")
-@require_admin_api_key
-def admin_players():
+async def _admin_fetch_presence(user_ids):
+    global session
+
+    presence_by_id = {}
+
+    if not user_ids:
+        return presence_by_id
+
+    if session is None or getattr(session, "closed", False):
+        session = aiohttp.ClientSession()
+
+    timeout = aiohttp.ClientTimeout(total=12)
+
+    for index in range(0, len(user_ids), 100):
+        chunk = user_ids[index:index + 100]
+
+        try:
+            async with session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": chunk},
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    print(f"[admin players] Roblox presence HTTP {response.status}")
+                    continue
+
+                data = await response.json(content_type=None)
+        except Exception as exc:
+            print(f"[admin players] Roblox presence request failed: {exc}")
+            continue
+
+        for presence in data.get("userPresences", []) if isinstance(data, dict) else []:
+            try:
+                user_id = str(presence.get("userId", "")).strip()
+                if user_id:
+                    presence_by_id[user_id] = presence
+            except Exception:
+                continue
+
+        await asyncio.sleep(0.2)
+
+    return presence_by_id
+
+
+async def _admin_players_payload():
     rows = _safe_call("db_get_all_tracked", []) or []
+    roblox_ids = []
+
+    for row in rows:
+        try:
+            roblox_ids.append(int(str(row[0]).strip()))
+        except Exception:
+            continue
+
+    presence_by_id = await _admin_fetch_presence(roblox_ids)
     players = []
 
     for row in rows:
-        roblox_id = str(row[0]) if len(row) > 0 else ""
-        discord_id = str(row[1]) if len(row) > 1 else ""
-        username = str(row[2]) if len(row) > 2 else roblox_id
-        status_value = _safe_call("db_get_user_status", None, roblox_id)
-        status_label = _safe_call("status_text", "Unknown", status_value) if status_value is not None else "Unknown"
+        roblox_id = str(row[0]).strip() if len(row) > 0 else ""
+        discord_id = str(row[1]).strip() if len(row) > 1 else ""
+        username = str(row[2]).strip() if len(row) > 2 else roblox_id
+        presence = presence_by_id.get(roblox_id)
+
+        if presence:
+            status_value = presence.get("userPresenceType")
+            try:
+                status_value = int(status_value)
+                _safe_call("db_set_user_status", None, roblox_id, status_value)
+            except Exception:
+                status_value = None
+
+            status_label = _safe_call("status_text", "Unknown", status_value) if status_value is not None else "Unknown"
+            current_world = presence.get("lastLocation") or "—"
+            last_seen = presence.get("lastOnline") or None
+        else:
+            status_value = _safe_call("db_get_user_status", None, roblox_id)
+            status_label = _safe_call("status_text", "Unknown", status_value) if status_value is not None else "Unknown"
+            current_world = "—"
+            last_seen = None
+
         players.append({
             "id": roblox_id,
             "robloxId": roblox_id,
+            "roblox_id": roblox_id,
             "username": username,
             "discord": discord_id,
+            "discord_id": discord_id,
             "status": status_label,
-            "currentWorld": "—",
-            "lastSeen": None,
+            "currentWorld": current_world,
+            "current_world": current_world,
+            "lastSeen": last_seen,
+            "last_seen": last_seen,
             "clanRank": "—",
+            "clan_rank": "—",
             "points": 0,
             "avatar": None,
         })
@@ -398,7 +471,19 @@ def admin_players():
         for row in alts
     ]
 
-    return jsonify({"success": True, "source": "bot", "players": players, "links": links})
+    return {"success": True, "source": "bot-live-presence", "players": players, "links": links}
+
+
+@app.route("/admin/players")
+@require_admin_api_key
+def admin_players():
+    try:
+        future = _run_on_bot_loop(_admin_players_payload())
+        payload = future.result(timeout=25)
+        return jsonify(payload)
+    except Exception as exc:
+        print("[admin players] error:", exc)
+        return jsonify({"error": str(exc), "players": [], "links": []}), 500
 
 
 @app.route("/admin/invites")
@@ -5895,6 +5980,7 @@ async def run_initial_presence_check():
 
                 status_cache[rid] = status
                 status_cache_time[rid] = now_dt
+                _safe_call("db_set_user_status", None, rid, status)
 
                 if status == 0:
                     offline_since[rid] = now_dt
