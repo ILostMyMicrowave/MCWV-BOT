@@ -768,17 +768,40 @@ def admin_player_remove():
     roblox_id = body.get("roblox_id") or body.get("robloxId")
 
     if discord_id:
-        _safe_call("db_remove_all_links_for_discord", None, discord_id)
+        if _safe_call("db_is_owner_discord", False, discord_id):
+            return jsonify({"error": "Owner accounts cannot be removed from the database or Roblox links."}), 400
+
+        ok, message = _safe_call("db_remove_all_links_for_discord", (False, "Failed to remove player links."), discord_id)
+        if not ok:
+            return jsonify({"error": message}), 400
         admin_log("Player Removed", f"Removed links for Discord {discord_id}", "warning")
-        return jsonify({"success": True, "message": "Player links removed"})
+        return jsonify({"success": True, "message": message})
 
     if roblox_id:
         link = _safe_call("db_find_roblox_link", None, roblox_id)
-        if link and link.get("discord_id"):
-            _safe_call("db_remove_all_links_for_discord", None, link.get("discord_id"))
-            admin_log("Player Removed", f"Removed links for Roblox {roblox_id}", "warning")
-            return jsonify({"success": True, "message": "Player links removed"})
-        return jsonify({"error": "Roblox link not found"}), 404
+        if not link or not link.get("discord_id"):
+            return jsonify({"error": "Roblox link not found"}), 404
+
+        if _safe_call("db_is_owner_discord", False, link.get("discord_id")):
+            return jsonify({"error": "Owner accounts cannot be removed from the database or Roblox links."}), 400
+
+        if link.get("kind") == "alt":
+            ok, _removed_id, message = _safe_call(
+                "db_remove_alt",
+                (False, None, "Failed to remove alt."),
+                link.get("discord_id"),
+                roblox_id,
+            )
+            if not ok:
+                return jsonify({"error": message}), 400
+            admin_log("Alt Removed", f"Removed alt Roblox {roblox_id}", "warning")
+            return jsonify({"success": True, "message": message})
+
+        ok, message = _safe_call("db_remove_all_links_for_discord", (False, "Failed to remove player links."), link.get("discord_id"))
+        if not ok:
+            return jsonify({"error": message}), 400
+        admin_log("Player Removed", f"Removed links for Roblox {roblox_id}", "warning")
+        return jsonify({"success": True, "message": message})
 
     return jsonify({"error": "discord_id or roblox_id is required"}), 400
 
@@ -1292,6 +1315,9 @@ def db_remove_alt(discord_id, alt_value):
     did = int(discord_id)
     alt_clean = str(alt_value).strip()
 
+    if db_is_owner_discord(did):
+        return False, None, "Owner accounts cannot be modified from Roblox Links."
+
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1318,18 +1344,50 @@ def db_remove_alt(discord_id, alt_value):
         return False, None, "Failed to remove alt."
 
 
-def db_remove_all_links_for_discord(discord_id):
+def db_is_owner_discord(discord_id):
     if not db_enabled():
-        return
+        return False
 
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_alts WHERE discord_id = %s", (int(discord_id),))
-            cur.execute("DELETE FROM users WHERE discord_id = %s", (int(discord_id),))
+            cur.execute(
+                "SELECT role FROM users WHERE discord_id = %s LIMIT 1",
+                (int(discord_id),)
+            )
+            row = cur.fetchone()
+
+        return bool(row and str(row[0] or "").lower() == "owner")
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("db_is_owner_discord error:", e)
+        return False
+
+
+def db_remove_all_links_for_discord(discord_id):
+    if not db_enabled():
+        return False, "Database is not available."
+
+    did = int(discord_id)
+
+    try:
+        with conn.cursor() as cur:
+            if db_is_owner_discord(did):
+                return False, "Owner accounts cannot be removed from Roblox Links. Restore or edit the owner manually in Neon."
+
+            # Important: do not DELETE from users. The Hub auth account lives in this table too.
+            # Only remove Roblox tracking/link data.
+            cur.execute("DELETE FROM user_alts WHERE discord_id = %s", (did,))
+            cur.execute("UPDATE users SET roblox_id = NULL WHERE discord_id = %s", (did,))
+
         conn.commit()
+        return True, "Player Roblox links removed. The Hub account was kept."
     except Exception as e:
         conn.rollback()
         print("db_remove_all_links_for_discord error:", e)
+        return False, "Failed to remove player links."
 
 status_cache = {}
 status_cache_time = {}
