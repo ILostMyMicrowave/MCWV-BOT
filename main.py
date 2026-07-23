@@ -223,6 +223,96 @@ async def _maybe_get_channel(channel_id):
         return None
 
 
+async def _validate_admin_text_channel(channel_id, require_invite=False):
+    if not channel_id:
+        raise ValueError("A Discord channel ID is required.")
+
+    try:
+        channel_id = int(channel_id)
+    except Exception:
+        raise ValueError("A valid numeric Discord channel ID is required.")
+
+    channel = await _maybe_get_channel(channel_id)
+    if channel is None:
+        raise ValueError("Channel not found. Check the channel ID and make sure the bot can see it.")
+
+    if not isinstance(channel, discord.TextChannel):
+        raise ValueError("The selected channel must be a server text channel.")
+
+    guild = channel.guild
+    bot_obj = globals().get("bot")
+    me = guild.me
+
+    if me is None and bot_obj and bot_obj.user:
+        me = guild.get_member(bot_obj.user.id)
+
+    if me is None:
+        raise ValueError("Could not check bot permissions for that channel.")
+
+    perms = channel.permissions_for(me)
+
+    if not perms.view_channel:
+        raise ValueError(f"Bot cannot view #{channel.name}.")
+    if not perms.send_messages:
+        raise ValueError(f"Bot cannot send messages in #{channel.name}.")
+    if not perms.embed_links:
+        raise ValueError(f"Bot cannot embed links in #{channel.name}.")
+    if require_invite and not perms.create_instant_invite:
+        raise ValueError(f"Bot cannot create invites in #{channel.name}.")
+
+    return channel
+
+
+async def _admin_channels_payload():
+    bot_obj = globals().get("bot")
+    if bot_obj is None or not getattr(bot_obj, "is_ready", lambda: False)():
+        return []
+
+    channels = []
+
+    for guild in bot_obj.guilds:
+        me = guild.me
+        if me is None and bot_obj.user:
+            me = guild.get_member(bot_obj.user.id)
+        if me is None:
+            continue
+
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(me)
+            can_send = bool(perms.view_channel and perms.send_messages and perms.embed_links)
+            can_invite = bool(can_send and perms.create_instant_invite)
+            parent_name = channel.category.name if channel.category else None
+            label = f"{parent_name + ' / ' if parent_name else ''}#{channel.name}"
+
+            channels.append({
+                "id": str(channel.id),
+                "name": channel.name,
+                "label": label,
+                "guildId": str(guild.id),
+                "guildName": guild.name,
+                "parentName": parent_name,
+                "canSendMessages": can_send,
+                "canCreateInvite": bool(perms.create_instant_invite),
+                "usableForGiveaways": can_send,
+                "usableForInvites": can_invite,
+                "position": channel.position,
+            })
+
+    channels.sort(key=lambda item: (item.get("guildName") or "", item.get("parentName") or "", item.get("position") or 0, item.get("name") or ""))
+    return channels
+
+
+@app.route("/admin/channels")
+@require_admin_api_key
+def admin_channels():
+    try:
+        future = _run_on_bot_loop(_admin_channels_payload())
+        channels = future.result(timeout=10)
+        return jsonify({"success": True, "source": "bot", "channels": channels})
+    except Exception as exc:
+        return jsonify({"error": str(exc), "channels": []}), 500
+
+
 @app.route("/admin/status")
 @require_admin_api_key
 def admin_status():
@@ -455,7 +545,8 @@ async def _create_giveaway_from_admin(body):
     duration_minutes = max(1, int(body.get("duration_minutes") or 60))
     now = int(time.time())
     end_time = int(body.get("end_time") or (now + duration_minutes * 60))
-    channel_id = int(body.get("channel_id") or CHANNEL_ID)
+    channel_id = int(body.get("channel_id") or 0)
+    channel = await _validate_admin_text_channel(channel_id, require_invite=False)
     thumbnail = str(body.get("thumbnail") or "")
 
     db_exec("""
@@ -476,15 +567,13 @@ async def _create_giveaway_from_admin(body):
             created_by = excluded.created_by
     """, (prize, winners, invites_per_entry, now, end_time, channel_id, thumbnail))
 
-    channel = await _maybe_get_channel(channel_id)
     message_id = 0
-    if channel:
-        giveaway = get_active_giveaway()
-        message = await channel.send(embed=build_giveaway_embed(giveaway), view=GiveawayView())
-        message_id = int(message.id)
-        db_exec("UPDATE giveaway_events SET message_id = ? WHERE id = 1", (message_id,))
+    giveaway = get_active_giveaway()
+    message = await channel.send(embed=build_giveaway_embed(giveaway), view=GiveawayView())
+    message_id = int(message.id)
+    db_exec("UPDATE giveaway_events SET message_id = ? WHERE id = 1", (message_id,))
 
-    return {"message_id": message_id, "end_time": end_time}
+    return {"message_id": message_id, "channel_id": str(channel.id), "end_time": end_time}
 
 
 @app.route("/admin/giveaway/create", methods=["POST"])
@@ -496,6 +585,8 @@ def admin_giveaway_create():
         result = future.result(timeout=20)
         admin_log("Giveaway Created", str(body.get("prize") or "Giveaway created"))
         return jsonify({"success": True, "message": "Giveaway created", **result})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -504,7 +595,8 @@ async def _start_invite_from_admin(body):
     duration_hours = max(1, int(body.get("duration_hours") or 24))
     now = int(time.time())
     end = now + duration_hours * 3600
-    channel_id = int(body.get("channel_id") or CHANNEL_ID)
+    channel_id = int(body.get("channel_id") or 0)
+    channel = await _validate_admin_text_channel(channel_id, require_invite=True)
 
     db_exec("DELETE FROM invite_counts")
     db_exec("DELETE FROM invite_used_users")
@@ -524,18 +616,16 @@ async def _start_invite_from_admin(body):
         for guild in bot_obj.guilds:
             await load_invite_snapshot(guild)
 
-    channel = await _maybe_get_channel(channel_id)
-    if channel:
-        embed = discord.Embed(
-            title="📨 Invite Event Started",
-            description="Click the buttons below to get your invite link or view your stats.",
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Ends", value=f"<t:{end}:R>", inline=True)
-        await channel.send(embed=embed, view=InviteView())
+    embed = discord.Embed(
+        title="📨 Invite Event Started",
+        description="Click the buttons below to get your invite link or view your stats.",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Ends", value=f"<t:{end}:R>", inline=True)
+    await channel.send(embed=embed, view=InviteView())
 
-    return {"end_time": end}
+    return {"channel_id": str(channel.id), "end_time": end}
 
 
 @app.route("/admin/invite/start", methods=["POST"])
@@ -547,6 +637,8 @@ def admin_invite_start():
         result = future.result(timeout=20)
         admin_log("Invite Event Created", "Invite event started from admin panel")
         return jsonify({"success": True, "message": "Invite event started", **result})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -641,6 +733,8 @@ def admin_restart():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
+    routes = sorted(str(rule) for rule in app.url_map.iter_rules())
+    print("🌐 Flask routes registered:", ", ".join(routes))
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_web, daemon=True).start()
