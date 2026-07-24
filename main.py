@@ -348,6 +348,22 @@ def admin_roles():
         return jsonify({"error": str(exc), "roles": []}), 500
 
 
+@app.route("/admin/broadcast/access", methods=["POST"])
+@require_admin_api_key
+def admin_broadcast_access():
+    body = request.get_json(silent=True) or {}
+    discord_id = body.get("discord_id") or body.get("discordId") or body.get("discord")
+
+    try:
+        future = _run_on_bot_loop(_admin_broadcast_access_from_body(discord_id))
+        payload = future.result(timeout=10)
+        return jsonify(payload)
+    except ValueError as exc:
+        return jsonify({"allowed": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"allowed": False, "error": str(exc)}), 500
+
+
 @app.route("/admin/broadcast/preview", methods=["POST"])
 @require_admin_api_key
 def admin_broadcast_preview():
@@ -2326,21 +2342,66 @@ def db_get_broadcast_users():
         return []
 
     try:
+        ensure_db_connection()
         with conn.cursor() as cur:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT")
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
             cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'users'
+            """)
+            columns = {str(row[0]) for row in cur.fetchall()}
+
+            if "roblox_id" not in columns or "discord_id" not in columns or "username" not in columns:
+                return []
+
+            role_expr = "COALESCE(role, 'member')" if "role" in columns else "'member'"
+            ticket_expr = "ticket_channel_id" if "ticket_channel_id" in columns else "NULL"
+
+            cur.execute(f"""
                 SELECT roblox_id,
                        discord_id,
                        username,
-                       COALESCE(role, 'member') AS role,
-                       ticket_channel_id
+                       {role_expr} AS role,
+                       {ticket_expr} AS ticket_channel_id
                 FROM users
                 WHERE roblox_id IS NOT NULL
                   AND TRIM(CAST(roblox_id AS TEXT)) <> ''
                   AND discord_id IS NOT NULL
                 ORDER BY username ASC
             """)
-            return cur.fetchall()
+            rows = cur.fetchall()
+
+            if rows:
+                return rows
+
+        # Fallback for older/odd schemas: use the same tracked source the admin players panel uses.
+        tracked = db_get_all_tracked() or []
+        return [
+            (
+                str(row[0]).strip(),
+                int(row[1]),
+                str(row[2]).strip() if len(row) > 2 else str(row[0]).strip(),
+                "member",
+                None,
+            )
+            for row in tracked
+            if len(row) > 1 and row[0] is not None and str(row[0]).strip() and row[1] is not None
+        ]
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         print("db_get_broadcast_users error:", e)
         return []
 
@@ -3663,6 +3724,37 @@ def broadcast_embed_for(message, recipient):
     )
     embed.set_footer(text="MCWV Staff Broadcast")
     return embed
+
+
+async def _admin_broadcast_access_from_body(discord_id):
+    if not discord_id:
+        raise ValueError("discord_id is required")
+
+    guild = broadcast_primary_guild()
+    if not guild:
+        raise ValueError("Broadcast guild is not available yet.")
+
+    try:
+        discord_id_int = int(discord_id)
+    except Exception:
+        raise ValueError("discord_id must be numeric")
+
+    member = guild.get_member(discord_id_int)
+    if member is None:
+        try:
+            member = await guild.fetch_member(discord_id_int)
+        except Exception:
+            member = None
+
+    if member is None:
+        return {"success": True, "allowed": False, "reason": "Member not found in Discord server"}
+
+    return {
+        "success": True,
+        "allowed": has_broadcast_permission(member),
+        "discord_id": str(discord_id_int),
+        "roles": [str(role.id) for role in member.roles],
+    }
 
 
 async def send_broadcast_to_recipient(guild, recipient, delivery, style, message):
