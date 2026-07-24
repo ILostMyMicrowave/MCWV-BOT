@@ -3732,8 +3732,19 @@ class BroadcastConfirmView(discord.ui.View):
             color=discord.Color.green() if not failed else discord.Color.orange(),
         )
         if failed:
-            preview = "\n".join(f"• {r['username']} — {err}" for r, err in failed[:10])
-            embed.add_field(name="Failures", value=preview[:1024], inline=False)
+            missing_ticket = [item for item in failed if "No ticket channel saved" in str(item[1])]
+            other_failed = [item for item in failed if item not in missing_ticket]
+
+            if missing_ticket:
+                preview = "\n".join(
+                    f"• {recipient['username']} — no saved ticket"
+                    for recipient, _error in missing_ticket[:15]
+                )
+                embed.add_field(name="Not sent: missing ticket", value=preview[:1024], inline=False)
+
+            if other_failed:
+                preview = "\n".join(f"• {r['username']} — {err}" for r, err in other_failed[:10])
+                embed.add_field(name="Other failures", value=preview[:1024], inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -3806,13 +3817,12 @@ async def broadcast_command(
     if not recipients:
         return await interaction.followup.send("No recipients matched that broadcast filter.", ephemeral=True)
 
+    missing_ticket_recipients = []
+    deliverable_count = len(recipients)
+
     if delivery.value == "ticket":
-        missing = [item for item in recipients if not item.get("ticket_channel_id")]
-        if missing:
-            return await interaction.followup.send(
-                f"❌ {len(missing)} recipient(s) do not have a saved ticket channel. Run `/broadcast_ticket_sync` first.",
-                ephemeral=True,
-            )
+        missing_ticket_recipients = [item for item in recipients if not item.get("ticket_channel_id")]
+        deliverable_count = len(recipients) - len(missing_ticket_recipients)
 
     actor_name = broadcast_actor_name(interaction)
     sample = recipients[:10]
@@ -3828,12 +3838,26 @@ async def broadcast_command(
             f"**Value:** {value or '—'}\n"
             f"**Delivery:** {delivery.name}\n"
             f"**Style:** {style.name}\n"
-            f"**Recipients:** {len(recipients)}\n\n"
+            f"**Recipients matched:** {len(recipients)}\n"
+            f"**Will attempt:** {deliverable_count if delivery.value == 'ticket' else len(recipients)}\n"
+            f"**Will fail / no ticket:** {len(missing_ticket_recipients) if delivery.value == 'ticket' else 0}\n\n"
             f"**Message:**\n{message[:1200]}"
         ),
         color=discord.Color.orange(),
     )
     embed.add_field(name="Sample recipients", value=sample_text[:1024] or "—", inline=False)
+
+    if missing_ticket_recipients:
+        missing_preview = "\n".join(
+            f"• {item['username']} — no saved ticket"
+            for item in missing_ticket_recipients[:10]
+        )
+        embed.add_field(
+            name="Will not send to these ticket recipients",
+            value=missing_preview[:1024],
+            inline=False,
+        )
+
     if len(recipients) > 25:
         embed.set_footer(text="Large broadcast: confirmation required and sending will be rate-limited.")
 
@@ -5675,8 +5699,18 @@ async def accept(interaction: discord.Interaction, member: discord.Member):
                 + "\n".join(f"• `{x}`" for x in invalid_alts)
             )
 
-        # --- link in bot DB ---
-        db_add(roblox_id, ticket_creator.id, roblox_name)
+        # --- link in bot DB and save this ticket channel for broadcasts ---
+        ok, db_msg = db_add(roblox_id, ticket_creator.id, roblox_name)
+        if not ok:
+            summary_text = f"❌ Could not link Roblox account: {db_msg}"
+            return
+
+        actions.append("✅ Linked Roblox account in database")
+
+        if db_set_ticket_channel(ticket_creator.id, channel.id):
+            actions.append(f"✅ Saved ticket channel <#{channel.id}> for broadcasts")
+        else:
+            errors.append("⚠️ Could not save ticket channel ID for broadcasts")
 
         # --- give clan member role ---
         clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID)
