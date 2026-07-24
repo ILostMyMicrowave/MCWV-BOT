@@ -2070,6 +2070,22 @@ if DATABASE_URL:
                 )
             """)
 
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    level TEXT NOT NULL DEFAULT 'info',
+                    event TEXT NOT NULL,
+                    message TEXT NOT NULL DEFAULT '',
+                    action TEXT,
+                    actor_user_id INTEGER,
+                    actor_username TEXT,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
         print("DB tables ready")
 
     except Exception as e:
@@ -2240,6 +2256,85 @@ def db_get_all_alts():
     except Exception as e:
         print("db_get_all_alts error:", e)
         return []
+
+
+def db_get_broadcast_users():
+    if not db_enabled():
+        return []
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id,
+                       discord_id,
+                       username,
+                       COALESCE(role, 'member') AS role,
+                       ticket_channel_id
+                FROM users
+                WHERE roblox_id IS NOT NULL
+                  AND TRIM(CAST(roblox_id AS TEXT)) <> ''
+                  AND discord_id IS NOT NULL
+                ORDER BY username ASC
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        print("db_get_broadcast_users error:", e)
+        return []
+
+
+def db_set_ticket_channel(discord_id, channel_id):
+    if not db_enabled():
+        return False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE users
+                SET ticket_channel_id = %s
+                WHERE discord_id = %s
+            """, (int(channel_id), int(discord_id)))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("db_set_ticket_channel error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def db_log_admin_action(level, event, message, action=None, actor_username=None, metadata=None):
+    if not db_enabled():
+        return
+
+    try:
+        import json as _json
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO admin_logs (
+                    level,
+                    event,
+                    message,
+                    action,
+                    actor_username,
+                    metadata
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            """, (
+                str(level or "info"),
+                str(event or "Bot Event"),
+                str(message or ""),
+                action,
+                actor_username,
+                _json.dumps(metadata or {})
+            ))
+        conn.commit()
+    except Exception as e:
+        print("db_log_admin_action error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 # ---------------- STATUS ----------------
 status_cache = {}
 offline_since = {}  # roblox_id -> datetime (UTC) when they went offline
@@ -3309,7 +3404,523 @@ async def setup_invite_system():
         await load_invite_snapshot(g)
 
     bot.add_view(InviteView())
-    
+
+# ---------------- BROADCAST SYSTEM ----------------
+BROADCAST_DEFAULT_ROLE_IDS = {
+    1225521918984061041,
+    1226507841301516329,
+    1194908177171480667,
+}
+
+
+def _parse_id_set(raw):
+    ids = set()
+    for part in str(raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+BROADCAST_ALLOWED_ROLE_IDS = _parse_id_set(os.environ.get("BROADCAST_ROLE_IDS")) or BROADCAST_DEFAULT_ROLE_IDS
+BROADCAST_RECENT = {}
+
+
+def has_broadcast_permission(member):
+    if not isinstance(member, discord.Member):
+        return False
+
+    if member.guild and member.guild.owner_id == member.id:
+        return True
+
+    return any(role.id in BROADCAST_ALLOWED_ROLE_IDS for role in member.roles)
+
+
+def normalize_ticket_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def broadcast_actor_name(interaction):
+    row = _safe_call("db_get_main_link", None, interaction.user.id)
+    if row and len(row) > 1 and row[1]:
+        return str(row[1])
+    return getattr(interaction.user, "display_name", None) or interaction.user.name
+
+
+async def fetch_broadcast_points_map():
+    global session
+
+    points = {}
+
+    try:
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
+            if war_r.status != 200:
+                return points
+            war_data = await war_r.json(content_type=None)
+
+        async with session.get(CLAN_API, timeout=timeout) as clan_r:
+            if clan_r.status != 200:
+                return points
+            clan_data = await clan_r.json(content_type=None)
+
+        _battle_id, battle = get_current_war(war_data, clan_data)
+        if not isinstance(battle, dict):
+            return points
+
+        contributions = (
+            battle.get("PointContributions")
+            or battle.get("pointContributions")
+            or battle.get("Contributions")
+            or []
+        )
+
+        for entry in contributions:
+            if not isinstance(entry, dict):
+                continue
+            user_id = entry.get("UserID") or entry.get("userId") or entry.get("user_id")
+            raw_points = entry.get("Points") or entry.get("points") or 0
+            try:
+                points[str(user_id).strip()] = int(float(raw_points or 0))
+            except Exception:
+                points[str(user_id).strip()] = 0
+
+    except Exception as exc:
+        print("fetch_broadcast_points_map error:", exc)
+
+    return points
+
+
+def broadcast_user_from_row(row, points_map):
+    roblox_id = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
+    discord_id = int(row[1]) if len(row) > 1 and row[1] is not None else 0
+    username = str(row[2]).strip() if len(row) > 2 and row[2] is not None else roblox_id
+    role = str(row[3] or "member").strip().lower() if len(row) > 3 else "member"
+    ticket_channel_id = int(row[4]) if len(row) > 4 and row[4] is not None else None
+    points = int(points_map.get(roblox_id, 0))
+
+    return {
+        "roblox_id": roblox_id,
+        "discord_id": discord_id,
+        "username": username,
+        "role": role,
+        "ticket_channel_id": ticket_channel_id,
+        "points": points,
+        "rank": None,
+    }
+
+
+def dedupe_recipients(users):
+    seen = set()
+    deduped = []
+    for user in users:
+        discord_id = user.get("discord_id")
+        if not discord_id or discord_id in seen:
+            continue
+        seen.add(discord_id)
+        deduped.append(user)
+    return deduped
+
+
+async def resolve_broadcast_recipients(interaction, audience, value=None, role=None, user=None):
+    rows = _safe_call("db_get_broadcast_users", []) or []
+    points_map = await fetch_broadcast_points_map()
+    users = [broadcast_user_from_row(row, points_map) for row in rows]
+
+    users.sort(key=lambda item: item["points"], reverse=True)
+    for index, item in enumerate(users, start=1):
+        item["rank"] = index
+
+    audience = str(audience or "everyone")
+    value = str(value or "").strip()
+
+    if audience == "everyone":
+        selected = users
+    elif audience == "below_points":
+        threshold = int(value or 0)
+        selected = [item for item in users if item["points"] < threshold]
+    elif audience == "above_points":
+        threshold = int(value or 0)
+        selected = [item for item in users if item["points"] > threshold]
+    elif audience == "zero_points":
+        selected = [item for item in users if item["points"] == 0]
+    elif audience == "bottom_n":
+        amount = max(1, int(value or 15))
+        selected = sorted(users, key=lambda item: item["points"])[:amount]
+    elif audience == "top_n":
+        amount = max(1, int(value or 15))
+        selected = sorted(users, key=lambda item: item["points"], reverse=True)[:amount]
+    elif audience == "members":
+        selected = [item for item in users if item["role"] == "member"]
+    elif audience == "officers":
+        selected = [item for item in users if item["role"] in ("officer", "owner")]
+    elif audience == "discord_role":
+        if not role:
+            raise ValueError("Choose a Discord role for the Discord role audience filter.")
+        selected = []
+        guild = interaction.guild
+        for item in users:
+            member = guild.get_member(item["discord_id"]) if guild else None
+            if member is None and guild:
+                try:
+                    member = await guild.fetch_member(item["discord_id"])
+                except Exception:
+                    member = None
+            if member and any(r.id == role.id for r in member.roles):
+                selected.append(item)
+    elif audience == "custom_user":
+        ids = set()
+        if user:
+            ids.add(int(user.id))
+        for token in re.findall(r"\d{15,25}", value):
+            ids.add(int(token))
+        selected = [item for item in users if item["discord_id"] in ids]
+    else:
+        raise ValueError("Unknown broadcast audience filter.")
+
+    return dedupe_recipients(selected)
+
+
+def render_broadcast_message(template, recipient):
+    return str(template or "").replace("{username}", str(recipient.get("username") or "")) \
+        .replace("{points}", str(recipient.get("points", 0))) \
+        .replace("{rank}", str(recipient.get("rank") or "—"))
+
+
+def broadcast_embed_for(message, recipient):
+    embed = discord.Embed(
+        title="📢 MCWV Broadcast",
+        description=render_broadcast_message(message, recipient),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="MCWV Staff Broadcast")
+    return embed
+
+
+async def send_broadcast_to_recipient(guild, recipient, delivery, style, message):
+    rendered = render_broadcast_message(message, recipient)
+    embed = broadcast_embed_for(message, recipient) if style == "embed" else None
+    content = None if embed else f"📢 **MCWV Broadcast**\n{rendered}"
+
+    async def _send_once():
+        if delivery == "dm":
+            member = guild.get_member(recipient["discord_id"]) if guild else None
+            if member is None and guild:
+                member = await guild.fetch_member(recipient["discord_id"])
+            if member is None:
+                raise RuntimeError("Member not found")
+            await member.send(content=content, embed=embed)
+            return "dm"
+
+        if delivery == "ticket":
+            channel_id = recipient.get("ticket_channel_id")
+            if not channel_id:
+                raise RuntimeError("No ticket channel saved")
+            channel = guild.get_channel(channel_id) if guild else None
+            if channel is None and guild:
+                channel = await guild.fetch_channel(channel_id)
+            if channel is None:
+                raise RuntimeError("Ticket channel not found")
+            await channel.send(content=content, embed=embed)
+            return "ticket"
+
+        raise RuntimeError("Unknown delivery method")
+
+    try:
+        return True, await _send_once(), None
+    except Exception as first_error:
+        await asyncio.sleep(2)
+        try:
+            return True, await _send_once(), None
+        except Exception as second_error:
+            return False, None, f"{type(second_error).__name__}: {second_error or first_error}"
+
+
+class BroadcastConfirmView(discord.ui.View):
+    def __init__(self, *, sender_id, actor_name, recipients, audience, value, delivery, style, message):
+        super().__init__(timeout=120)
+        self.sender_id = sender_id
+        self.actor_name = actor_name
+        self.recipients = recipients
+        self.audience = audience
+        self.value = value
+        self.delivery = delivery
+        self.style = style
+        self.message = message
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.sender_id:
+            await interaction.response.send_message("Only the broadcast creator can confirm this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Send Broadcast", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            return await interaction.response.send_message("This broadcast has already been handled.", ephemeral=True)
+
+        fingerprint = f"{self.sender_id}:{self.audience}:{self.value}:{self.delivery}:{self.style}:{self.message}:{','.join(str(r['discord_id']) for r in self.recipients)}"
+        now = time.time()
+        for key, created in list(BROADCAST_RECENT.items()):
+            if now - created > 300:
+                BROADCAST_RECENT.pop(key, None)
+        if fingerprint in BROADCAST_RECENT:
+            return await interaction.response.send_message("Duplicate broadcast blocked. Wait a few minutes before sending the same broadcast again.", ephemeral=True)
+        BROADCAST_RECENT[fingerprint] = now
+
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Sending broadcast...", view=self)
+
+        sent = 0
+        failed = []
+
+        for recipient in self.recipients:
+            ok, _where, error = await send_broadcast_to_recipient(
+                interaction.guild,
+                recipient,
+                self.delivery,
+                self.style,
+                self.message,
+            )
+            if ok:
+                sent += 1
+            else:
+                failed.append((recipient, error))
+            await asyncio.sleep(0.8)
+
+        metadata = {
+            "senderDiscordId": str(interaction.user.id),
+            "sender": self.actor_name,
+            "audience": self.audience,
+            "value": self.value,
+            "delivery": self.delivery,
+            "style": self.style,
+            "message": self.message,
+            "recipientCount": len(self.recipients),
+            "sent": sent,
+            "failed": len(failed),
+            "failedRecipients": [
+                {
+                    "discord_id": str(item[0].get("discord_id")),
+                    "username": item[0].get("username"),
+                    "error": item[1],
+                }
+                for item in failed[:25]
+            ],
+        }
+
+        db_log_admin_action(
+            "info" if not failed else "warning",
+            "Broadcast Sent",
+            f"{self.actor_name} sent broadcast to {sent}/{len(self.recipients)} recipients via {self.delivery}.",
+            "broadcast/send",
+            self.actor_name,
+            metadata,
+        )
+
+        embed = discord.Embed(
+            title="Broadcast complete",
+            description=f"✅ Sent: **{sent}**\n❌ Failed: **{len(failed)}**",
+            color=discord.Color.green() if not failed else discord.Color.orange(),
+        )
+        if failed:
+            preview = "\n".join(f"• {r['username']} — {err}" for r, err in failed[:10])
+            embed.add_field(name="Failures", value=preview[:1024], inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Broadcast cancelled.", view=self)
+
+
+@bot.tree.command(name="broadcast", description="Send a staff broadcast to selected MCWV members", guild=guild_obj)
+@app_commands.describe(
+    audience="Who should receive the broadcast",
+    delivery="Where to deliver the broadcast",
+    style="Send as plain text or embed",
+    message="Message to send. Supports {username}, {points}, {rank}",
+    value="Threshold, N, or custom Discord IDs depending on audience",
+    role="Discord role for the discord_role audience",
+    user="Specific user for custom_user audience",
+)
+@app_commands.choices(
+    audience=[
+        app_commands.Choice(name="Everyone", value="everyone"),
+        app_commands.Choice(name="Below X points", value="below_points"),
+        app_commands.Choice(name="Above X points", value="above_points"),
+        app_commands.Choice(name="Exactly 0 points", value="zero_points"),
+        app_commands.Choice(name="Bottom N players", value="bottom_n"),
+        app_commands.Choice(name="Top N players", value="top_n"),
+        app_commands.Choice(name="Members", value="members"),
+        app_commands.Choice(name="Officers", value="officers"),
+        app_commands.Choice(name="Discord role", value="discord_role"),
+        app_commands.Choice(name="Custom user(s)", value="custom_user"),
+    ],
+    delivery=[
+        app_commands.Choice(name="DM", value="dm"),
+        app_commands.Choice(name="Ticket", value="ticket"),
+    ],
+    style=[
+        app_commands.Choice(name="Plain text", value="plain"),
+        app_commands.Choice(name="Embed", value="embed"),
+    ],
+)
+async def broadcast_command(
+    interaction: discord.Interaction,
+    audience: app_commands.Choice[str],
+    delivery: app_commands.Choice[str],
+    style: app_commands.Choice[str],
+    message: str,
+    value: str = "",
+    role: discord.Role = None,
+    user: discord.Member = None,
+):
+    if not has_broadcast_permission(interaction.user):
+        return await interaction.response.send_message("❌ You do not have permission to use broadcasts.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        recipients = await resolve_broadcast_recipients(
+            interaction,
+            audience.value,
+            value=value,
+            role=role,
+            user=user,
+        )
+    except Exception as exc:
+        return await interaction.followup.send(f"❌ Broadcast filter failed: {exc}", ephemeral=True)
+
+    if not recipients:
+        return await interaction.followup.send("No recipients matched that broadcast filter.", ephemeral=True)
+
+    if delivery.value == "ticket":
+        missing = [item for item in recipients if not item.get("ticket_channel_id")]
+        if missing:
+            return await interaction.followup.send(
+                f"❌ {len(missing)} recipient(s) do not have a saved ticket channel. Run `/broadcast_ticket_sync` first.",
+                ephemeral=True,
+            )
+
+    actor_name = broadcast_actor_name(interaction)
+    sample = recipients[:10]
+    sample_text = "\n".join(
+        f"• {item['username']} — {item['points']} pts — <@{item['discord_id']}>"
+        for item in sample
+    )
+
+    embed = discord.Embed(
+        title="Broadcast Preview",
+        description=(
+            f"**Audience:** {audience.name}\n"
+            f"**Value:** {value or '—'}\n"
+            f"**Delivery:** {delivery.name}\n"
+            f"**Style:** {style.name}\n"
+            f"**Recipients:** {len(recipients)}\n\n"
+            f"**Message:**\n{message[:1200]}"
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Sample recipients", value=sample_text[:1024] or "—", inline=False)
+    if len(recipients) > 25:
+        embed.set_footer(text="Large broadcast: confirmation required and sending will be rate-limited.")
+
+    view = BroadcastConfirmView(
+        sender_id=interaction.user.id,
+        actor_name=actor_name,
+        recipients=recipients,
+        audience=audience.value,
+        value=value,
+        delivery=delivery.value,
+        style=style.value,
+        message=message,
+    )
+
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="broadcast_ticket_sync", description="Scan ticket categories and save member ticket channel IDs", guild=guild_obj)
+async def broadcast_ticket_sync(interaction: discord.Interaction):
+    if not has_broadcast_permission(interaction.user):
+        return await interaction.response.send_message("❌ You do not have permission to sync broadcast tickets.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    if not guild:
+        return await interaction.followup.send("This command must be used in the server.", ephemeral=True)
+
+    users = _safe_call("db_get_broadcast_users", []) or []
+    if not users:
+        return await interaction.followup.send("No linked users found to match tickets against.", ephemeral=True)
+
+    user_candidates = []
+    for row in users:
+        roblox_id = str(row[0]).strip() if len(row) > 0 else ""
+        discord_id = int(row[1]) if len(row) > 1 and row[1] else 0
+        username = str(row[2]).strip() if len(row) > 2 else roblox_id
+        keys = {normalize_ticket_key(username), normalize_ticket_key(str(discord_id)), normalize_ticket_key(roblox_id)}
+        keys = {key for key in keys if len(key) >= 3}
+        user_candidates.append({
+            "discord_id": discord_id,
+            "username": username,
+            "keys": keys,
+            "matched": False,
+        })
+
+    matched = []
+
+    for category_id in CLAN_MEMBER_CATEGORY_IDS:
+        category = guild.get_channel(category_id)
+        if not category or not hasattr(category, "channels"):
+            continue
+
+        for channel in category.channels:
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            channel_key = normalize_ticket_key(channel.name)
+            if not channel_key:
+                continue
+
+            for candidate in user_candidates:
+                if candidate["matched"]:
+                    continue
+                if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
+                    if db_set_ticket_channel(candidate["discord_id"], channel.id):
+                        candidate["matched"] = True
+                        matched.append((candidate["username"], channel.name))
+                    break
+
+    actor_name = broadcast_actor_name(interaction)
+    db_log_admin_action(
+        "info",
+        "Broadcast Tickets Synced",
+        f"{actor_name} synced {len(matched)} ticket channels.",
+        "broadcast/ticket-sync",
+        actor_name,
+        {"matched": len(matched), "categoryIds": CLAN_MEMBER_CATEGORY_IDS},
+    )
+
+    preview = "\n".join(f"• {name} → #{channel}" for name, channel in matched[:15])
+    await interaction.followup.send(
+        f"✅ Ticket sync complete. Matched **{len(matched)}** ticket channel(s).\n\n{preview or 'No matches found.'}",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="refreshprofile", guild=guild_obj)
 @require_role()
 @app_commands.describe(roblox_id="Roblox user ID to refresh")
@@ -6389,15 +7000,6 @@ async def on_ready():
         print(f"❌ Sync error: {e}")
 
     print(f"🤖 Logged in as {bot.user} ({bot.user.id})")
-
-    try:
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=discord.Game("Pet Simulator 99")
-        )
-        print("🎮 Presence set")
-    except Exception as e:
-        print(f"❌ Failed to set presence: {e}")
 
     # ---------------- START LOOPS ----------------
     try:
