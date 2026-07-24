@@ -6390,6 +6390,15 @@ async def on_ready():
 
     print(f"🤖 Logged in as {bot.user} ({bot.user.id})")
 
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Game("Pet Simulator 99")
+        )
+        print("🎮 Presence set")
+    except Exception as e:
+        print(f"❌ Failed to set presence: {e}")
+
     # ---------------- START LOOPS ----------------
     try:
         start_bot_loops()
