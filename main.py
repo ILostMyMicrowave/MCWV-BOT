@@ -3851,8 +3851,87 @@ async def broadcast_command(
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
+def likely_ticket_channel(channel):
+    category_name = getattr(getattr(channel, "category", None), "name", "")
+    combined = normalize_ticket_key(f"{getattr(channel, 'name', '')} {getattr(channel, 'topic', '') or ''} {category_name}")
+    return "ticket" in combined or "support" in combined or "application" in combined
+
+
+def ticket_sync_channels(guild, category=None, scan_all=False):
+    channels = []
+    seen = set()
+
+    def add_channel(channel):
+        if isinstance(channel, discord.TextChannel) and channel.id not in seen:
+            seen.add(channel.id)
+            channels.append(channel)
+
+    if category:
+        for channel in getattr(category, "channels", []):
+            add_channel(channel)
+        return channels
+
+    for category_id in CLAN_MEMBER_CATEGORY_IDS:
+        cat = guild.get_channel(category_id)
+        for channel in getattr(cat, "channels", []) if cat else []:
+            add_channel(channel)
+
+    for cat in guild.categories:
+        cat_key = normalize_ticket_key(cat.name)
+        if "ticket" in cat_key or "support" in cat_key or "application" in cat_key:
+            for channel in cat.channels:
+                add_channel(channel)
+
+    for channel in guild.text_channels:
+        if scan_all or likely_ticket_channel(channel):
+            add_channel(channel)
+
+    return channels
+
+
+async def build_ticket_sync_candidates(guild, users):
+    candidates = []
+
+    for row in users:
+        roblox_id = str(row[0]).strip() if len(row) > 0 else ""
+        discord_id = int(row[1]) if len(row) > 1 and row[1] else 0
+        username = str(row[2]).strip() if len(row) > 2 else roblox_id
+        keys = {normalize_ticket_key(username), normalize_ticket_key(str(discord_id)), normalize_ticket_key(roblox_id)}
+
+        member = guild.get_member(discord_id)
+        if member is None and discord_id:
+            try:
+                member = await guild.fetch_member(discord_id)
+            except Exception:
+                member = None
+
+        if member:
+            keys.add(normalize_ticket_key(member.name))
+            keys.add(normalize_ticket_key(member.display_name))
+            keys.add(normalize_ticket_key(getattr(member, "global_name", None)))
+            keys.add(normalize_ticket_key(getattr(member, "nick", None)))
+
+        keys = {key for key in keys if len(key) >= 3}
+        candidates.append({
+            "discord_id": discord_id,
+            "username": username,
+            "keys": keys,
+            "matched": False,
+        })
+
+    return candidates
+
+
 @bot.tree.command(name="broadcast_ticket_sync", description="Scan ticket categories and save member ticket channel IDs", guild=guild_obj)
-async def broadcast_ticket_sync(interaction: discord.Interaction):
+@app_commands.describe(
+    category="Optional category to scan. Leave empty to auto-detect ticket channels.",
+    scan_all="Scan every text channel if auto-detect misses tickets. Slower but more complete."
+)
+async def broadcast_ticket_sync(
+    interaction: discord.Interaction,
+    category: discord.CategoryChannel = None,
+    scan_all: bool = False,
+):
     if not has_broadcast_permission(interaction.user):
         return await interaction.response.send_message("❌ You do not have permission to sync broadcast tickets.", ephemeral=True)
 
@@ -3866,43 +3945,27 @@ async def broadcast_ticket_sync(interaction: discord.Interaction):
     if not users:
         return await interaction.followup.send("No linked users found to match tickets against.", ephemeral=True)
 
-    user_candidates = []
-    for row in users:
-        roblox_id = str(row[0]).strip() if len(row) > 0 else ""
-        discord_id = int(row[1]) if len(row) > 1 and row[1] else 0
-        username = str(row[2]).strip() if len(row) > 2 else roblox_id
-        keys = {normalize_ticket_key(username), normalize_ticket_key(str(discord_id)), normalize_ticket_key(roblox_id)}
-        keys = {key for key in keys if len(key) >= 3}
-        user_candidates.append({
-            "discord_id": discord_id,
-            "username": username,
-            "keys": keys,
-            "matched": False,
-        })
-
+    user_candidates = await build_ticket_sync_candidates(guild, users)
+    channels = ticket_sync_channels(guild, category=category, scan_all=scan_all)
     matched = []
+    matched_channel_ids = set()
 
-    for category_id in CLAN_MEMBER_CATEGORY_IDS:
-        category = guild.get_channel(category_id)
-        if not category or not hasattr(category, "channels"):
+    for channel in channels:
+        channel_key = normalize_ticket_key(f"{channel.name} {channel.topic or ''}")
+        if not channel_key:
             continue
 
-        for channel in category.channels:
-            if not isinstance(channel, discord.TextChannel):
+        for candidate in user_candidates:
+            if candidate["matched"]:
                 continue
+            if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
+                if db_set_ticket_channel(candidate["discord_id"], channel.id):
+                    candidate["matched"] = True
+                    matched_channel_ids.add(channel.id)
+                    matched.append((candidate["username"], channel.name))
+                break
 
-            channel_key = normalize_ticket_key(channel.name)
-            if not channel_key:
-                continue
-
-            for candidate in user_candidates:
-                if candidate["matched"]:
-                    continue
-                if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
-                    if db_set_ticket_channel(candidate["discord_id"], channel.id):
-                        candidate["matched"] = True
-                        matched.append((candidate["username"], channel.name))
-                    break
+    unmatched = [candidate["username"] for candidate in user_candidates if not candidate["matched"]]
 
     actor_name = broadcast_actor_name(interaction)
     db_log_admin_action(
@@ -3911,14 +3974,30 @@ async def broadcast_ticket_sync(interaction: discord.Interaction):
         f"{actor_name} synced {len(matched)} ticket channels.",
         "broadcast/ticket-sync",
         actor_name,
-        {"matched": len(matched), "categoryIds": CLAN_MEMBER_CATEGORY_IDS},
+        {
+            "matched": len(matched),
+            "unmatched": len(unmatched),
+            "scannedChannels": len(channels),
+            "categoryId": str(category.id) if category else None,
+            "scanAll": scan_all,
+            "categoryIds": CLAN_MEMBER_CATEGORY_IDS,
+        },
     )
 
-    preview = "\n".join(f"• {name} → #{channel}" for name, channel in matched[:15])
-    await interaction.followup.send(
-        f"✅ Ticket sync complete. Matched **{len(matched)}** ticket channel(s).\n\n{preview or 'No matches found.'}",
-        ephemeral=True,
+    matched_preview = "\n".join(f"• {name} → #{channel}" for name, channel in matched[:15])
+    unmatched_preview = "\n".join(f"• {name}" for name in unmatched[:15])
+    message = (
+        f"✅ Ticket sync complete.\n"
+        f"Scanned **{len(channels)}** channel(s).\n"
+        f"Matched **{len(matched)}** ticket channel(s).\n"
+        f"Unmatched **{len(unmatched)}** linked user(s).\n\n"
+        f"**Matches:**\n{matched_preview or 'No matches found.'}"
     )
+
+    if unmatched_preview:
+        message += f"\n\n**First unmatched:**\n{unmatched_preview}"
+
+    await interaction.followup.send(message[:1900], ephemeral=True)
 
 
 @bot.tree.command(name="refreshprofile", guild=guild_obj)
