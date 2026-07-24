@@ -313,6 +313,69 @@ def admin_channels():
         return jsonify({"error": str(exc), "channels": []}), 500
 
 
+async def _admin_roles_payload():
+    bot_obj = globals().get("bot")
+    if bot_obj is None or not getattr(bot_obj, "is_ready", lambda: False)():
+        return []
+
+    roles = []
+
+    for guild in bot_obj.guilds:
+        for role in sorted(guild.roles, key=lambda item: item.position, reverse=True):
+            if role.is_default() or role.managed:
+                continue
+            roles.append({
+                "id": str(role.id),
+                "name": role.name,
+                "guildId": str(guild.id),
+                "guildName": guild.name,
+                "position": role.position,
+                "color": str(role.color),
+                "memberCount": len(role.members),
+            })
+
+    return roles
+
+
+@app.route("/admin/roles")
+@require_admin_api_key
+def admin_roles():
+    try:
+        future = _run_on_bot_loop(_admin_roles_payload())
+        roles = future.result(timeout=10)
+        return jsonify({"success": True, "source": "bot", "roles": roles})
+    except Exception as exc:
+        return jsonify({"error": str(exc), "roles": []}), 500
+
+
+@app.route("/admin/broadcast/preview", methods=["POST"])
+@require_admin_api_key
+def admin_broadcast_preview():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_broadcast_preview_from_body(body))
+        payload = future.result(timeout=25)
+        return jsonify(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/broadcast/send", methods=["POST"])
+@require_admin_api_key
+def admin_broadcast_send():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_broadcast_send_from_body(body))
+        payload = future.result(timeout=120)
+        return jsonify(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/admin/status")
 @require_admin_api_key
 def admin_status():
@@ -3639,6 +3702,151 @@ async def send_broadcast_to_recipient(guild, recipient, delivery, style, message
             return True, await _send_once(), None
         except Exception as second_error:
             return False, None, f"{type(second_error).__name__}: {second_error or first_error}"
+
+
+def broadcast_primary_guild():
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        return guild
+    return bot.guilds[0] if bot.guilds else None
+
+
+def broadcast_payload_value(body, *keys, default=""):
+    for key in keys:
+        value = body.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+async def resolve_broadcast_recipients_from_body(body):
+    guild = broadcast_primary_guild()
+    if not guild:
+        raise ValueError("Broadcast guild is not available yet.")
+
+    audience = broadcast_payload_value(body, "audience", default="everyone")
+    value = broadcast_payload_value(body, "value", "custom", "custom_user_ids", default="")
+    role_id = broadcast_payload_value(body, "role_id", "roleId", default="")
+    user_id = broadcast_payload_value(body, "user_id", "userId", default="")
+
+    role = None
+    if role_id:
+        try:
+            role = guild.get_role(int(role_id))
+        except Exception:
+            role = None
+        if audience == "discord_role" and role is None:
+            raise ValueError("Selected Discord role was not found.")
+
+    if user_id:
+        value = f"{value} {user_id}".strip()
+
+    context = type("BroadcastContext", (), {"guild": guild})()
+    return await resolve_broadcast_recipients(context, audience, value=value, role=role, user=None)
+
+
+def broadcast_preview_payload(recipients, delivery):
+    missing_tickets = [item for item in recipients if delivery == "ticket" and not item.get("ticket_channel_id")]
+    deliverable_count = len(recipients) - len(missing_tickets)
+
+    return {
+        "recipientCount": len(recipients),
+        "deliverableCount": deliverable_count,
+        "missingTicketCount": len(missing_tickets),
+        "sampleRecipients": recipients[:10],
+        "missingTicketRecipients": missing_tickets[:25],
+    }
+
+
+async def _admin_broadcast_preview_from_body(body):
+    delivery = broadcast_payload_value(body, "delivery", default="dm")
+    recipients = await resolve_broadcast_recipients_from_body(body)
+    return {
+        "success": True,
+        **broadcast_preview_payload(recipients, delivery),
+    }
+
+
+async def _admin_broadcast_send_from_body(body):
+    guild = broadcast_primary_guild()
+    if not guild:
+        raise ValueError("Broadcast guild is not available yet.")
+
+    audience = broadcast_payload_value(body, "audience", default="everyone")
+    value = broadcast_payload_value(body, "value", "custom", "custom_user_ids", default="")
+    delivery = broadcast_payload_value(body, "delivery", default="dm")
+    style = broadcast_payload_value(body, "style", default="plain")
+    message = broadcast_payload_value(body, "message", default="")
+    actor_name = broadcast_payload_value(body, "requested_by", "sender", default="Hub Admin")
+
+    if delivery not in ("dm", "ticket"):
+        raise ValueError("Unknown delivery method.")
+    if style not in ("plain", "embed"):
+        raise ValueError("Unknown broadcast style.")
+    if not message:
+        raise ValueError("Broadcast message is required.")
+
+    recipients = await resolve_broadcast_recipients_from_body(body)
+    if not recipients:
+        raise ValueError("No recipients matched that broadcast filter.")
+
+    fingerprint = f"web:{actor_name}:{audience}:{value}:{delivery}:{style}:{message}:{','.join(str(r['discord_id']) for r in recipients)}"
+    now = time.time()
+    for key, created in list(BROADCAST_RECENT.items()):
+        if now - created > 300:
+            BROADCAST_RECENT.pop(key, None)
+    if fingerprint in BROADCAST_RECENT:
+        raise ValueError("Duplicate broadcast blocked. Wait a few minutes before sending the same broadcast again.")
+    BROADCAST_RECENT[fingerprint] = now
+
+    sent = 0
+    failed = []
+
+    for recipient in recipients:
+        ok, _where, error = await send_broadcast_to_recipient(guild, recipient, delivery, style, message)
+        if ok:
+            sent += 1
+        else:
+            failed.append((recipient, error))
+        await asyncio.sleep(0.8)
+
+    metadata = {
+        "sender": actor_name,
+        "audience": audience,
+        "value": value,
+        "delivery": delivery,
+        "style": style,
+        "message": message,
+        "recipientCount": len(recipients),
+        "sent": sent,
+        "failed": len(failed),
+        "failedRecipients": [
+            {
+                "discord_id": str(item[0].get("discord_id")),
+                "username": item[0].get("username"),
+                "error": item[1],
+            }
+            for item in failed[:50]
+        ],
+    }
+
+    db_log_admin_action(
+        "info" if not failed else "warning",
+        "Broadcast Sent",
+        f"{actor_name} sent broadcast to {sent}/{len(recipients)} recipients via {delivery}.",
+        "broadcast/send",
+        actor_name,
+        metadata,
+    )
+
+    return {
+        "success": True,
+        "message": f"Broadcast complete: {sent} sent, {len(failed)} failed.",
+        "sent": sent,
+        "failed": len(failed),
+        "recipientCount": len(recipients),
+        "failedRecipients": metadata["failedRecipients"],
+    }
 
 
 class BroadcastConfirmView(discord.ui.View):
