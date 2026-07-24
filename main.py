@@ -2149,6 +2149,18 @@ if DATABASE_URL:
                 )
             """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS player_presence_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    previous_status TEXT,
+                    next_status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("CREATE INDEX IF NOT EXISTS player_presence_events_roblox_created_idx ON player_presence_events (roblox_id, created_at DESC)")
+
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT")
 
             cur.execute("""
@@ -2287,8 +2299,15 @@ def db_set_user_status(rid, status):
     if not db_enabled():
         return
 
+    rid = str(rid).strip()
+    next_status = int(status)
+
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT status FROM user_status WHERE roblox_id = %s", (rid,))
+            row = cur.fetchone()
+            previous_status = int(row[0]) if row and row[0] is not None else None
+
             cur.execute("""
                 INSERT INTO user_status (roblox_id, status, updated_at)
                 VALUES (%s, %s, NOW())
@@ -2296,7 +2315,23 @@ def db_set_user_status(rid, status):
                 DO UPDATE SET
                     status = EXCLUDED.status,
                     updated_at = NOW()
-            """, (str(rid).strip(), int(status)))
+            """, (rid, next_status))
+
+            if previous_status is not None and previous_status != next_status:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS player_presence_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        roblox_id TEXT NOT NULL,
+                        previous_status TEXT,
+                        next_status TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    INSERT INTO player_presence_events (roblox_id, previous_status, next_status, created_at)
+                    VALUES (%s, %s, %s, NOW())
+                """, (rid, str(previous_status), str(next_status)))
+
         conn.commit()
     except Exception as e:
         print("db_set_user_status error:", e)
@@ -7085,14 +7120,7 @@ async def check_loop():
                 status_cache_time[rid] = now
 
                 try:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO user_status (roblox_id, status, updated_at)
-                            VALUES (%s, %s, NOW())
-                            ON CONFLICT (roblox_id)
-                            DO UPDATE SET status = EXCLUDED.status,
-                                          updated_at = NOW()
-                        """, (rid, current))
+                    db_set_user_status(rid, current)
                 except Exception as db_error:
                     print("Loop DB error:", db_error)
 
