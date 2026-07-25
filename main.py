@@ -2499,6 +2499,11 @@ status_cache = {}
 offline_since = {}  # roblox_id -> datetime (UTC) when they went offline
 
 def status_text(v):
+    try:
+        v = int(v)
+    except Exception:
+        return "UNKNOWN"
+
     return {
         0: "OFFLINE",
         1: "ONLINE",
