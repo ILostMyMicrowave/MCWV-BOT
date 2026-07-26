@@ -4333,15 +4333,91 @@ async def build_ticket_sync_candidates(guild, users):
     return candidates
 
 
+
+def candidate_by_discord_id(candidates, discord_id):
+    try:
+        target = int(discord_id)
+    except Exception:
+        return None
+    return next((candidate for candidate in candidates if int(candidate.get("discord_id") or 0) == target), None)
+
+
+def visible_non_staff_ticket_members(channel):
+    staff_role_id = int(TICKET_STAFF_ROLE_ID)
+    members = []
+    for member in getattr(channel, "members", []) or []:
+        if getattr(member, "bot", False):
+            continue
+        if any(getattr(role, "id", 0) == staff_role_id for role in getattr(member, "roles", [])):
+            continue
+        members.append(member)
+    return members
+
+
+class TicketLinkUserSelect(discord.ui.UserSelect):
+    def __init__(self, channel_id):
+        super().__init__(
+            placeholder="Select the clan member this ticket belongs to",
+            min_values=1,
+            max_values=1,
+        )
+        self.channel_id = int(channel_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not has_broadcast_permission(interaction.user):
+            return await interaction.response.send_message("❌ You do not have permission to save ticket links.", ephemeral=True)
+
+        member = self.values[0]
+        if db_set_ticket_channel(member.id, self.channel_id):
+            await interaction.response.send_message(
+                f"✅ Saved this ticket for {member.mention}.",
+                ephemeral=True,
+            )
+            try:
+                self.view.stop()
+                for child in self.view.children:
+                    child.disabled = True
+                await interaction.message.edit(view=self.view)
+            except Exception:
+                pass
+        else:
+            await interaction.response.send_message(
+                f"⚠️ {member.mention} is not linked in the bot database yet. Link/accept them first, then try again.",
+                ephemeral=True,
+            )
+
+
+class TicketLinkResolveView(discord.ui.View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=7 * 24 * 60 * 60)
+        self.add_item(TicketLinkUserSelect(channel_id))
+
+
+async def send_ticket_resolve_menu(channel):
+    try:
+        await channel.send(
+            "I couldn't automatically tell which clan member this ticket belongs to. "
+            "Please select/ping the member below and I'll save this ticket for broadcasts.",
+            view=TicketLinkResolveView(channel.id),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        return True
+    except Exception as exc:
+        print(f"[ticket sync] failed to send resolver in #{getattr(channel, 'name', channel.id)}: {exc}")
+        return False
+
+
 @bot.tree.command(name="broadcast_ticket_sync", description="Scan ticket categories and save member ticket channel IDs", guild=guild_obj)
 @app_commands.describe(
     category="Optional category to scan. Leave empty to auto-detect ticket channels.",
-    scan_all="Scan every text channel if auto-detect misses tickets. Slower but more complete."
+    scan_all="Scan every text channel if auto-detect misses tickets. Slower but more complete.",
+    send_menus="Send a resolver menu into tickets that still cannot be matched."
 )
 async def broadcast_ticket_sync(
     interaction: discord.Interaction,
     category: discord.CategoryChannel = None,
     scan_all: bool = False,
+    send_menus: bool = True,
 ):
     if not has_broadcast_permission(interaction.user):
         return await interaction.response.send_message("❌ You do not have permission to sync broadcast tickets.", ephemeral=True)
@@ -4361,22 +4437,58 @@ async def broadcast_ticket_sync(
     matched = []
     matched_channel_ids = set()
 
+    ambiguous_channels = []
+
     for channel in channels:
-        channel_key = normalize_ticket_key(f"{channel.name} {channel.topic or ''}")
-        if not channel_key:
+        # First try the reliable method: identify who can see the ticket, excluding staff.
+        visible_members = visible_non_staff_ticket_members(channel)
+        linked_visible = []
+        for member in visible_members:
+            candidate = candidate_by_discord_id(user_candidates, member.id)
+            if candidate and not candidate["matched"]:
+                linked_visible.append((member, candidate))
+
+        if len(linked_visible) == 1:
+            member, candidate = linked_visible[0]
+            if db_set_ticket_channel(candidate["discord_id"], channel.id):
+                candidate["matched"] = True
+                matched_channel_ids.add(channel.id)
+                matched.append((candidate["username"], channel.name))
+                continue
+        elif len(linked_visible) > 1:
+            ambiguous_channels.append(channel)
             continue
 
-        for candidate in user_candidates:
-            if candidate["matched"]:
-                continue
-            if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
-                if db_set_ticket_channel(candidate["discord_id"], channel.id):
-                    candidate["matched"] = True
-                    matched_channel_ids.add(channel.id)
-                    matched.append((candidate["username"], channel.name))
-                break
+        channel_key = normalize_ticket_key(f"{channel.name} {channel.topic or ''}")
+        if channel_key:
+            for candidate in user_candidates:
+                if candidate["matched"]:
+                    continue
+                if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
+                    if db_set_ticket_channel(candidate["discord_id"], channel.id):
+                        candidate["matched"] = True
+                        matched_channel_ids.add(channel.id)
+                        matched.append((candidate["username"], channel.name))
+                    break
+
+        if channel.id not in matched_channel_ids:
+            ambiguous_channels.append(channel)
 
     unmatched = [candidate["username"] for candidate in user_candidates if not candidate["matched"]]
+    resolver_sent = 0
+    if send_menus:
+        unique_ambiguous = []
+        seen_ambiguous = set()
+        for channel in ambiguous_channels:
+            if channel.id in seen_ambiguous or channel.id in matched_channel_ids:
+                continue
+            seen_ambiguous.add(channel.id)
+            unique_ambiguous.append(channel)
+
+        for channel in unique_ambiguous[:25]:
+            if await send_ticket_resolve_menu(channel):
+                resolver_sent += 1
+            await asyncio.sleep(0.4)
 
     actor_name = broadcast_actor_name(interaction)
     db_log_admin_action(
@@ -4391,6 +4503,7 @@ async def broadcast_ticket_sync(
             "scannedChannels": len(channels),
             "categoryId": str(category.id) if category else None,
             "scanAll": scan_all,
+            "resolverMenusSent": resolver_sent,
             "categoryIds": CLAN_MEMBER_CATEGORY_IDS,
         },
     )
