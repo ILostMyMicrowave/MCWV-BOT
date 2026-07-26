@@ -4343,12 +4343,20 @@ def candidate_by_discord_id(candidates, discord_id):
 def visible_non_staff_ticket_members(channel):
     staff_role_id = int(TICKET_STAFF_ROLE_ID)
     members = []
-    for member in getattr(channel, "members", []) or []:
-        if getattr(member, "bot", False):
+
+    # Do NOT use channel.members here. On large servers it can scan every guild member
+    # and make /broadcast_ticket_sync take several minutes. Ticket bots normally add
+    # a member-specific permission overwrite for the ticket owner, so read overwrites.
+    overwrites = getattr(channel, "overwrites", {}) or {}
+    for target in overwrites.keys():
+        if not isinstance(target, discord.Member):
             continue
-        if any(getattr(role, "id", 0) == staff_role_id for role in getattr(member, "roles", [])):
+        if getattr(target, "bot", False):
             continue
-        members.append(member)
+        if any(getattr(role, "id", 0) == staff_role_id for role in getattr(target, "roles", [])):
+            continue
+        members.append(target)
+
     return members
 
 
@@ -4433,19 +4441,34 @@ async def broadcast_ticket_sync(
     user_candidates = await build_ticket_sync_candidates(guild, users)
     channels = ticket_sync_channels(guild, category=category, scan_all=scan_all)
 
-    if len(channels) > 40:
-        await interaction.followup.send(
-            f"Scanning **{len(channels)}** ticket channel(s). This should take under a minute unless Discord is rate-limiting.",
-            ephemeral=True,
-        )
+    progress_message = await interaction.followup.send(
+        f"🔎 Starting ticket sync... **0/{len(channels)}** channel(s) checked.",
+        ephemeral=True,
+        wait=True,
+    )
+    last_progress_edit = 0.0
 
     matched = []
     matched_channel_ids = set()
 
     ambiguous_channels = []
 
-    for channel in channels:
-        # First try the reliable method: identify who can see the ticket, excluding staff.
+    for channel_index, channel in enumerate(channels, start=1):
+        now_ts = time.time()
+        if channel_index == 1 or channel_index == len(channels) or now_ts - last_progress_edit >= 2.0:
+            last_progress_edit = now_ts
+            try:
+                await progress_message.edit(
+                    content=(
+                        f"🔎 Ticket sync running... **{channel_index}/{len(channels)}** checked.\n"
+                        f"Currently checking: {channel.mention} (`#{channel.name}`)\n"
+                        f"Matched so far: **{len(matched)}**"
+                    )
+                )
+            except Exception:
+                pass
+
+        # First try the reliable method: identify who has a member-specific ticket overwrite, excluding staff.
         visible_members = visible_non_staff_ticket_members(channel)
         linked_visible = []
         for member in visible_members:
@@ -4490,7 +4513,17 @@ async def broadcast_ticket_sync(
             seen_ambiguous.add(channel.id)
             unique_ambiguous.append(channel)
 
-        for channel in unique_ambiguous[:25]:
+        for menu_index, channel in enumerate(unique_ambiguous[:25], start=1):
+            try:
+                await progress_message.edit(
+                    content=(
+                        f"🧩 Auto-scan finished. Sending resolver menus... **{menu_index}/{min(len(unique_ambiguous), 25)}**\n"
+                        f"Current ticket: {channel.mention} (`#{channel.name}`)\n"
+                        f"Matched: **{len(matched)}**"
+                    )
+                )
+            except Exception:
+                pass
             if await send_ticket_resolve_menu(channel):
                 resolver_sent += 1
             await asyncio.sleep(0.4)
@@ -4526,7 +4559,10 @@ async def broadcast_ticket_sync(
     if unmatched_preview:
         message += f"\n\n**First unmatched:**\n{unmatched_preview}"
 
-    await interaction.followup.send(message[:1900], ephemeral=True)
+    try:
+        await progress_message.edit(content=message[:1900])
+    except Exception:
+        await interaction.followup.send(message[:1900], ephemeral=True)
 
 
 @bot.tree.command(name="refreshprofile", guild=guild_obj)
