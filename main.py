@@ -42,6 +42,9 @@ def home():
 # Keep every route registered before the Flask thread starts.
 ADMIN_API_KEY = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
 ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
+HUB_BASE_URL = (os.environ.get("MCWV_HUB_URL") or os.environ.get("HUB_URL") or "").rstrip("/")
+WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "")
+WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "1") or "1"))
 STARTED_AT = time.time()
 LAST_HEARTBEAT = datetime.now(timezone.utc).isoformat()
 COMMANDS_EXECUTED = 0
@@ -364,6 +367,26 @@ def admin_broadcast_access():
         return jsonify({"allowed": False, "error": str(exc)}), 500
 
 
+@app.route("/admin/broadcast/allowed-users", methods=["GET", "POST"])
+@require_admin_api_key
+def admin_broadcast_allowed_users():
+    if request.method == "GET":
+        return jsonify({
+            "success": True,
+            "user_ids": [str(value) for value in sorted(get_broadcast_allowed_user_ids())],
+            "env_user_ids": [str(value) for value in sorted(BROADCAST_DEFAULT_USER_IDS)],
+        })
+
+    body = request.get_json(silent=True) or {}
+    raw = body.get("user_ids") or body.get("userIds") or body.get("ids") or ""
+    if isinstance(raw, list):
+        ids = _parse_id_set(",".join(str(value) for value in raw))
+    else:
+        ids = _parse_id_set(raw)
+    saved = set_broadcast_allowed_user_ids(ids)
+    return jsonify({"success": True, "user_ids": [str(value) for value in saved]})
+
+
 @app.route("/admin/broadcast/preview", methods=["POST"])
 @require_admin_api_key
 def admin_broadcast_preview():
@@ -428,6 +451,7 @@ def admin_status():
         },
         "loops": {
             "War Poll Loop": _loop_status("war_poll_loop"),
+            "War Collector Loop": _loop_status("hub_war_collect_loop"),
             "Presence Loop": _loop_status("check_loop"),
             "Reminder Loop": _loop_status("reminder_loop"),
             "Invite Event Loop": _loop_status("check_invite_event"),
@@ -2596,6 +2620,10 @@ async def on_ready():
     if not war_poll_loop.is_running():
         war_poll_loop.start()
 
+    if HUB_BASE_URL and not hub_war_collect_loop.is_running():
+        hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
+        hub_war_collect_loop.start()
+
     if not clan_leave_loop.is_running():
         clan_leave_loop.start()
 
@@ -3587,7 +3615,19 @@ def _parse_id_set(raw):
 
 
 BROADCAST_ALLOWED_ROLE_IDS = _parse_id_set(os.environ.get("BROADCAST_ROLE_IDS")) or BROADCAST_DEFAULT_ROLE_IDS
+BROADCAST_DEFAULT_USER_IDS = _parse_id_set(os.environ.get("BROADCAST_USER_IDS"))
 BROADCAST_RECENT = {}
+
+
+def get_broadcast_allowed_user_ids():
+    saved = _safe_call("db_get_setting", "", "broadcast_allowed_user_ids") or ""
+    return set(BROADCAST_DEFAULT_USER_IDS) | _parse_id_set(saved)
+
+
+def set_broadcast_allowed_user_ids(ids):
+    cleaned = sorted({int(value) for value in ids if str(value).isdigit()})
+    _safe_call("db_set_setting", None, "broadcast_allowed_user_ids", ",".join(str(value) for value in cleaned))
+    return cleaned
 
 
 def has_broadcast_permission(member):
@@ -3595,6 +3635,9 @@ def has_broadcast_permission(member):
         return False
 
     if member.guild and member.guild.owner_id == member.id:
+        return True
+
+    if member.id in get_broadcast_allowed_user_ids():
         return True
 
     return any(role.id in BROADCAST_ALLOWED_ROLE_IDS for role in member.roles)
@@ -3750,9 +3793,12 @@ async def resolve_broadcast_recipients(interaction, audience, value=None, role=N
 
 
 def render_broadcast_message(template, recipient):
+    discord_id = recipient.get("discord_id") or ""
+    ping = f"<@{discord_id}>" if discord_id else ""
     return str(template or "").replace("{username}", str(recipient.get("username") or "")) \
         .replace("{points}", str(recipient.get("points", 0))) \
-        .replace("{rank}", str(recipient.get("rank") or "—"))
+        .replace("{rank}", str(recipient.get("rank") or "—")) \
+        .replace("{ping}", ping)
 
 
 def broadcast_embed_for(message, recipient):
@@ -3793,6 +3839,7 @@ async def _admin_broadcast_access_from_body(discord_id):
         "success": True,
         "allowed": has_broadcast_permission(member),
         "discord_id": str(discord_id_int),
+        "hardcoded_user_ids": [str(value) for value in sorted(get_broadcast_allowed_user_ids())],
         "roles": [str(role.id) for role in member.roles],
     }
 
@@ -7396,6 +7443,51 @@ class ClanReviewView(discord.ui.View):
                 )
             except Exception:
                 pass
+
+# ---------------- HUB WAR COLLECTOR LOOP ----------------
+@tasks.loop(minutes=WAR_COLLECT_INTERVAL_MINUTES)
+async def hub_war_collect_loop():
+    global session
+
+    if not HUB_BASE_URL:
+        return
+
+    try:
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        url = f"{HUB_BASE_URL}/api/war-collector"
+        if WAR_COLLECT_SECRET:
+            url = f"{url}?secret={WAR_COLLECT_SECRET}"
+
+        timeout = aiohttp.ClientTimeout(total=25)
+        async with session.get(url, timeout=timeout) as response:
+            text = await response.text()
+            if response.status != 200:
+                print(f"[hub war collector] HTTP {response.status}: {text[:300]}")
+                return
+
+            try:
+                data = await response.json(content_type=None)
+            except Exception:
+                data = {}
+
+            if data.get("success"):
+                if data.get("active"):
+                    clan = data.get("clan") or {}
+                    print(f"[hub war collector] saved {data.get('battleId')} rank={clan.get('rank')} points={clan.get('points')}")
+                else:
+                    print("[hub war collector] no active battle")
+            else:
+                print(f"[hub war collector] failed: {data or text[:300]}")
+    except Exception as exc:
+        print("[hub war collector] error:", exc)
+
+
+@hub_war_collect_loop.before_loop
+async def before_hub_war_collect_loop():
+    await bot.wait_until_ready()
+
 
 # ---------------- LOOP STARTER ----------------
 def start_bot_loops():
