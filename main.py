@@ -3709,13 +3709,86 @@ async def fetch_broadcast_points_map():
     return points
 
 
-def broadcast_user_from_row(row, points_map):
+
+def fetch_broadcast_metrics_map():
+    metrics = {}
+    if not db_enabled():
+        return metrics
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS exists
+            """)
+            exists = cur.fetchone()
+            if not exists or not exists[0]:
+                return metrics
+
+            cur.execute("""
+                WITH latest AS (
+                    SELECT DISTINCT ON (roblox_id)
+                        roblox_id::text AS roblox_id,
+                        points::bigint AS points,
+                        captured_at
+                    FROM player_leaderboard_history
+                    WHERE points IS NOT NULL
+                    ORDER BY roblox_id, captured_at DESC
+                ), hour_base AS (
+                    SELECT DISTINCT ON (roblox_id)
+                        roblox_id::text AS roblox_id,
+                        points::bigint AS points,
+                        captured_at
+                    FROM player_leaderboard_history
+                    WHERE points IS NOT NULL
+                      AND captured_at <= NOW() - INTERVAL '1 hour'
+                    ORDER BY roblox_id, captured_at DESC
+                ), recent_hour_base AS (
+                    SELECT DISTINCT ON (roblox_id)
+                        roblox_id::text AS roblox_id,
+                        points::bigint AS points,
+                        captured_at
+                    FROM player_leaderboard_history
+                    WHERE points IS NOT NULL
+                      AND captured_at >= NOW() - INTERVAL '1 hour'
+                    ORDER BY roblox_id, captured_at ASC
+                ), five_base AS (
+                    SELECT DISTINCT ON (roblox_id)
+                        roblox_id::text AS roblox_id,
+                        points::bigint AS points,
+                        captured_at
+                    FROM player_leaderboard_history
+                    WHERE points IS NOT NULL
+                      AND captured_at <= NOW() - INTERVAL '5 minutes'
+                    ORDER BY roblox_id, captured_at DESC
+                )
+                SELECT
+                    l.roblox_id,
+                    GREATEST(0, l.points - COALESCE(h.points, rh.points, l.points)) AS pph,
+                    GREATEST(0, l.points - COALESCE(f.points, l.points)) AS change_5m
+                FROM latest l
+                LEFT JOIN hour_base h ON h.roblox_id = l.roblox_id
+                LEFT JOIN recent_hour_base rh ON rh.roblox_id = l.roblox_id
+                LEFT JOIN five_base f ON f.roblox_id = l.roblox_id
+            """)
+            for roblox_id, pph, change_5m in cur.fetchall():
+                metrics[str(roblox_id)] = {
+                    "pph": int(pph or 0),
+                    "change5m": int(change_5m or 0),
+                }
+    except Exception as exc:
+        print("fetch_broadcast_metrics_map error:", exc)
+
+    return metrics
+
+
+def broadcast_user_from_row(row, points_map, metrics_map):
     roblox_id = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
     discord_id = int(row[1]) if len(row) > 1 and row[1] is not None else 0
     username = str(row[2]).strip() if len(row) > 2 and row[2] is not None else roblox_id
     role = str(row[3] or "member").strip().lower() if len(row) > 3 else "member"
     ticket_channel_id = int(row[4]) if len(row) > 4 and row[4] is not None else None
     points = int(points_map.get(roblox_id, 0))
+    metrics = metrics_map.get(roblox_id, {}) if isinstance(metrics_map, dict) else {}
 
     return {
         "roblox_id": roblox_id,
@@ -3724,6 +3797,8 @@ def broadcast_user_from_row(row, points_map):
         "role": role,
         "ticket_channel_id": ticket_channel_id,
         "points": points,
+        "pph": int(metrics.get("pph", 0) or 0),
+        "change5m": int(metrics.get("change5m", 0) or 0),
         "rank": None,
     }
 
@@ -3743,7 +3818,8 @@ def dedupe_recipients(users):
 async def resolve_broadcast_recipients(interaction, audience, value=None, role=None, user=None):
     rows = _safe_call("db_get_broadcast_users", []) or []
     points_map = await fetch_broadcast_points_map()
-    users = [broadcast_user_from_row(row, points_map) for row in rows]
+    metrics_map = fetch_broadcast_metrics_map()
+    users = [broadcast_user_from_row(row, points_map, metrics_map) for row in rows]
 
     users.sort(key=lambda item: item["points"], reverse=True)
     for index, item in enumerate(users, start=1):
@@ -3802,10 +3878,19 @@ async def resolve_broadcast_recipients(interaction, audience, value=None, role=N
 def render_broadcast_message(template, recipient):
     discord_id = recipient.get("discord_id") or ""
     ping = f"<@{discord_id}>" if discord_id else ""
+    ticket_channel_id = recipient.get("ticket_channel_id")
+    ticket = f"<#{ticket_channel_id}>" if ticket_channel_id else "—"
     return str(template or "").replace("{username}", str(recipient.get("username") or "")) \
         .replace("{points}", str(recipient.get("points", 0))) \
         .replace("{rank}", str(recipient.get("rank") or "—")) \
-        .replace("{ping}", ping)
+        .replace("{ping}", ping) \
+        .replace("{mention}", ping) \
+        .replace("{discord_id}", str(discord_id or "")) \
+        .replace("{roblox_id}", str(recipient.get("roblox_id") or "")) \
+        .replace("{role}", str(recipient.get("role") or "member")) \
+        .replace("{ticket}", ticket) \
+        .replace("{pph}", str(recipient.get("pph", 0))) \
+        .replace("{change5m}", str(recipient.get("change5m", 0)))
 
 
 def broadcast_embed_for(message, recipient):
