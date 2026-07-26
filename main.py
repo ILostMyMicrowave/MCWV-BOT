@@ -3617,6 +3617,13 @@ def _parse_id_set(raw):
 BROADCAST_ALLOWED_ROLE_IDS = _parse_id_set(os.environ.get("BROADCAST_ROLE_IDS")) or BROADCAST_DEFAULT_ROLE_IDS
 BROADCAST_DEFAULT_USER_IDS = _parse_id_set(os.environ.get("BROADCAST_USER_IDS"))
 BROADCAST_RECENT = {}
+TICKET_STAFF_ROLE_ID = int(os.environ.get("TICKET_STAFF_ROLE_ID", "1501986357516701827"))
+TICKET_IGNORE_ROLE_IDS = (
+    _parse_id_set(os.environ.get("TICKET_IGNORE_ROLE_IDS"))
+    or {TICKET_STAFF_ROLE_ID, 1502339420207059066}
+)
+TICKET_IGNORE_ROLE_IDS.add(TICKET_STAFF_ROLE_ID)
+TICKET_IGNORE_ROLE_IDS.add(1502339420207059066)
 
 
 def get_broadcast_allowed_user_ids():
@@ -4341,7 +4348,6 @@ def candidate_by_discord_id(candidates, discord_id):
 
 
 def visible_non_staff_ticket_members(channel):
-    staff_role_id = int(TICKET_STAFF_ROLE_ID)
     members = []
 
     # Do NOT use channel.members here. On large servers it can scan every guild member
@@ -4353,11 +4359,13 @@ def visible_non_staff_ticket_members(channel):
             continue
         if getattr(target, "bot", False):
             continue
-        if any(getattr(role, "id", 0) == staff_role_id for role in getattr(target, "roles", [])):
+        member_role_ids = {getattr(role, "id", 0) for role in getattr(target, "roles", [])}
+        if member_role_ids.intersection(TICKET_IGNORE_ROLE_IDS):
             continue
         members.append(target)
 
     return members
+
 
 
 class TicketLinkUserSelect(discord.ui.UserSelect):
