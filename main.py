@@ -4309,12 +4309,10 @@ async def build_ticket_sync_candidates(guild, users):
         username = str(row[2]).strip() if len(row) > 2 else roblox_id
         keys = {normalize_ticket_key(username), normalize_ticket_key(str(discord_id)), normalize_ticket_key(roblox_id)}
 
-        member = guild.get_member(discord_id)
-        if member is None and discord_id:
-            try:
-                member = await guild.fetch_member(discord_id)
-            except Exception:
-                member = None
+        # Keep ticket sync fast: do not fetch every linked member from Discord here.
+        # Fetching hundreds of members can make /broadcast_ticket_sync run for several minutes.
+        # Cached members still improve name matching, and visible ticket members are checked directly per channel below.
+        member = guild.get_member(discord_id) if discord_id else None
 
         if member:
             keys.add(normalize_ticket_key(member.name))
@@ -4434,6 +4432,13 @@ async def broadcast_ticket_sync(
 
     user_candidates = await build_ticket_sync_candidates(guild, users)
     channels = ticket_sync_channels(guild, category=category, scan_all=scan_all)
+
+    if len(channels) > 40:
+        await interaction.followup.send(
+            f"Scanning **{len(channels)}** ticket channel(s). This should take under a minute unless Discord is rate-limiting.",
+            ephemeral=True,
+        )
+
     matched = []
     matched_channel_ids = set()
 
