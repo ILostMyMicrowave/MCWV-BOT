@@ -4421,6 +4421,51 @@ async def send_ticket_resolve_menu(channel):
         return False
 
 
+@bot.tree.command(name="broadcast_ticket_link", description="Save a member's broadcast ticket channel", guild=guild_obj)
+@app_commands.describe(
+    member="The clan member this ticket belongs to.",
+    channel="Ticket channel to save. Leave empty to use the current channel."
+)
+async def broadcast_ticket_link(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    channel: discord.TextChannel = None,
+):
+    if not has_broadcast_permission(interaction.user):
+        return await interaction.response.send_message("❌ You do not have permission to link broadcast tickets.", ephemeral=True)
+
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        return await interaction.response.send_message("❌ Please run this in a ticket text channel or choose a text channel.", ephemeral=True)
+
+    if getattr(member, "bot", False):
+        return await interaction.response.send_message("❌ Pick the clan member, not a bot.", ephemeral=True)
+
+    if db_set_ticket_channel(member.id, target_channel.id):
+        actor_name = broadcast_actor_name(interaction)
+        db_log_admin_action(
+            "info",
+            "Broadcast Ticket Linked",
+            f"{actor_name} linked {member} to #{target_channel.name}.",
+            "broadcast/ticket-link",
+            actor_name,
+            {
+                "memberId": str(member.id),
+                "channelId": str(target_channel.id),
+                "channelName": target_channel.name,
+            },
+        )
+        return await interaction.response.send_message(
+            f"✅ Saved {target_channel.mention} as the broadcast ticket for {member.mention}.",
+            ephemeral=True,
+        )
+
+    return await interaction.response.send_message(
+        f"⚠️ {member.mention} is not linked in the bot database yet. Accept/link them first, then try again.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="broadcast_ticket_sync", description="Scan ticket categories and save member ticket channel IDs", guild=guild_obj)
 @app_commands.describe(
     category="Optional category to scan. Leave empty to auto-detect ticket channels.",
