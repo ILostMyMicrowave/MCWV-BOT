@@ -351,6 +351,73 @@ def admin_roles():
         return jsonify({"error": str(exc), "roles": []}), 500
 
 
+@app.route("/admin/signup/verify-dm", methods=["POST"])
+@require_admin_api_key
+def admin_signup_verify_dm():
+    body = request.get_json(silent=True) or {}
+    discord_id = body.get("discord_id") or body.get("discordId")
+    username = str(body.get("username") or "MCWV member")[:80]
+    code = str(body.get("code") or "").strip()
+
+    if not discord_id or not code:
+        return jsonify({"error": "discord_id and code are required"}), 400
+
+    try:
+        future = _run_on_bot_loop(_send_signup_verification_dm(discord_id, username, code))
+        payload = future.result(timeout=15)
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+async def _send_signup_verification_dm(discord_id, username, code):
+    try:
+        user_id = int(discord_id)
+    except Exception:
+        raise ValueError("discord_id must be numeric")
+
+    member = None
+    guild = broadcast_primary_guild()
+    if guild:
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except Exception:
+                member = None
+
+    target = member
+    if target is None:
+        try:
+            target = await bot.fetch_user(user_id)
+        except Exception:
+            target = None
+
+    if target is None:
+        raise ValueError("Discord user could not be found")
+
+    embed = discord.Embed(
+        title="MCWV Hub verification",
+        description=(
+            f"Someone is creating an MCWV Hub account for **{username}**.\n\n"
+            f"Your verification code is:\n\n"
+            f"`{code}`\n\n"
+            "Enter this code on the signup page to finish creating your account. "
+            "If this was not you, ignore this message."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="This code expires in 10 minutes.")
+
+    try:
+        await target.send(embed=embed)
+    except Exception:
+        raise ValueError("Could not DM that Discord user. They may have DMs disabled.")
+
+    return {"success": True, "sent": True, "discord_id": str(user_id)}
+
+
 @app.route("/admin/broadcast/access", methods=["POST"])
 @require_admin_api_key
 def admin_broadcast_access():
