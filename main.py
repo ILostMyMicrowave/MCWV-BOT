@@ -4417,13 +4417,15 @@ async def send_ticket_resolve_menu(channel):
 @app_commands.describe(
     category="Optional category to scan. Leave empty to auto-detect ticket channels.",
     scan_all="Scan every text channel if auto-detect misses tickets. Slower but more complete.",
-    send_menus="Send a resolver menu into tickets that still cannot be matched."
+    send_menus="Send a resolver menu into tickets that still cannot be matched.",
+    name_fallback="Also try slower channel-name matching if overwrite detection fails."
 )
 async def broadcast_ticket_sync(
     interaction: discord.Interaction,
     category: discord.CategoryChannel = None,
     scan_all: bool = False,
     send_menus: bool = True,
+    name_fallback: bool = False,
 ):
     if not has_broadcast_permission(interaction.user):
         return await interaction.response.send_message("❌ You do not have permission to sync broadcast tickets.", ephemeral=True)
@@ -4487,20 +4489,24 @@ async def broadcast_ticket_sync(
             ambiguous_channels.append(channel)
             continue
 
-        channel_key = normalize_ticket_key(f"{channel.name} {channel.topic or ''}")
-        if channel_key:
-            for candidate in user_candidates:
-                if candidate["matched"]:
-                    continue
-                if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
-                    if db_set_ticket_channel(candidate["discord_id"], channel.id):
-                        candidate["matched"] = True
-                        matched_channel_ids.add(channel.id)
-                        matched.append((candidate["username"], channel.name))
-                    break
+        if name_fallback:
+            channel_key = normalize_ticket_key(f"{channel.name} {channel.topic or ''}")
+            if channel_key:
+                for candidate in user_candidates:
+                    if candidate["matched"]:
+                        continue
+                    if any(key and (key in channel_key or channel_key in key) for key in candidate["keys"]):
+                        if db_set_ticket_channel(candidate["discord_id"], channel.id):
+                            candidate["matched"] = True
+                            matched_channel_ids.add(channel.id)
+                            matched.append((candidate["username"], channel.name))
+                        break
 
         if channel.id not in matched_channel_ids:
             ambiguous_channels.append(channel)
+
+        # Yield back to Discord's event loop so progress edits and interactions stay responsive.
+        await asyncio.sleep(0)
 
     unmatched = [candidate["username"] for candidate in user_candidates if not candidate["matched"]]
     resolver_sent = 0
@@ -4541,6 +4547,8 @@ async def broadcast_ticket_sync(
             "scannedChannels": len(channels),
             "categoryId": str(category.id) if category else None,
             "scanAll": scan_all,
+            "sendMenus": send_menus,
+            "nameFallback": name_fallback,
             "resolverMenusSent": resolver_sent,
             "categoryIds": CLAN_MEMBER_CATEGORY_IDS,
         },
