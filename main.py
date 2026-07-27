@@ -15,6 +15,7 @@ import math
 import random
 from datetime import datetime, timezone
 import time
+import json
 
 try:
     import psutil
@@ -591,6 +592,16 @@ async def _admin_ticket_close(ticket_id, actor_id, reason):
     return {"success": True}
 
 
+@app.route("/admin/tickets/settings", methods=["GET", "POST"])
+@require_admin_api_key
+def admin_ticket_settings():
+    if request.method == "GET":
+        return jsonify({"success": True, "settings": get_mcwv_ticket_settings()})
+    body = request.get_json(silent=True) or {}
+    settings = save_mcwv_ticket_settings(body.get("settings") if isinstance(body.get("settings"), dict) else body)
+    return jsonify({"success": True, "settings": settings})
+
+
 @app.route("/admin/tickets", methods=["GET"])
 @require_admin_api_key
 def admin_tickets_list():
@@ -642,6 +653,11 @@ async def _admin_send_ticket_panel(channel_id, title, description, button_label)
         channel = await bot.fetch_channel(int(channel_id))
     if not isinstance(channel, discord.TextChannel):
         raise ValueError("Panel channel must be a text channel")
+    settings = get_mcwv_ticket_settings()
+    panel = settings.get("panel", {})
+    title = title or panel.get("title") or "MCWV Applications"
+    description = description or panel.get("description") or "Ready to apply for MCWV? Open a private application ticket below."
+    button_label = button_label or panel.get("buttonLabel") or "Open Application"
     embed = discord.Embed(
         title=title,
         description=description,
@@ -2650,6 +2666,77 @@ def db_set_setting(key, value):
         conn.rollback()
 
 
+def deep_merge_dict(base, override):
+    result = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def sanitize_ticket_settings(raw):
+    settings = deep_merge_dict(DEFAULT_MCWV_TICKET_SETTINGS, raw if isinstance(raw, dict) else {})
+
+    panel = settings.get("panel", {})
+    panel["title"] = str(panel.get("title") or DEFAULT_MCWV_TICKET_SETTINGS["panel"]["title"])[:256]
+    panel["description"] = str(panel.get("description") or DEFAULT_MCWV_TICKET_SETTINGS["panel"]["description"])[:4000]
+    panel["buttonLabel"] = str(panel.get("buttonLabel") or "Open Application")[:80]
+    try:
+        panel["accentColor"] = int(str(panel.get("accentColor", 0x34D399)).replace("#", ""), 16) if isinstance(panel.get("accentColor"), str) else int(panel.get("accentColor", 0x34D399))
+    except Exception:
+        panel["accentColor"] = 0x34D399
+    settings["panel"] = panel
+
+    messages = settings.get("messages", {})
+    messages["welcomeTitle"] = str(messages.get("welcomeTitle") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeTitle"])[:256]
+    messages["welcomeDescription"] = str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"])[:4000]
+    settings["messages"] = messages
+
+    questions = settings.get("questions") if isinstance(settings.get("questions"), list) else []
+    defaults = DEFAULT_MCWV_TICKET_SETTINGS["questions"]
+    cleaned = []
+    for index in range(5):
+        item = questions[index] if index < len(questions) and isinstance(questions[index], dict) else {}
+        default = defaults[index]
+        key = default["key"]
+        cleaned.append({
+            "key": key,
+            "label": str(item.get("label") or default["label"])[:45],
+            "placeholder": str(item.get("placeholder") or default.get("placeholder") or "")[:100],
+            "style": "paragraph" if item.get("style", default["style"]) == "paragraph" else "short",
+            "required": bool(item.get("required", default.get("required", True))),
+            "maxLength": max(16, min(int(item.get("maxLength", default.get("maxLength", 500)) or 500), 1000)),
+        })
+    # Discord modal title/input flow needs field 1 to be Roblox username.
+    cleaned[0]["key"] = "roblox_username"
+    cleaned[0]["style"] = "short"
+    cleaned[0]["required"] = True
+    cleaned[0]["maxLength"] = min(cleaned[0]["maxLength"], 32)
+    settings["questions"] = cleaned
+
+    features = settings.get("features", {}) if isinstance(settings.get("features"), dict) else {}
+    base_features = DEFAULT_MCWV_TICKET_SETTINGS["features"]
+    settings["features"] = {**base_features, **features}
+    return settings
+
+
+def get_mcwv_ticket_settings():
+    raw = _safe_call("db_get_setting", "", "mcwv_ticket_settings") or ""
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        parsed = {}
+    return sanitize_ticket_settings(parsed)
+
+
+def save_mcwv_ticket_settings(settings):
+    cleaned = sanitize_ticket_settings(settings)
+    _safe_call("db_set_setting", None, "mcwv_ticket_settings", json.dumps(cleaned))
+    return cleaned
+
+
 def db_ensure_mcwv_ticket_tables():
     if not db_enabled():
         return
@@ -4192,6 +4279,45 @@ PS99_IMPORTANT_GAMEPASSES = {
     720275150: "Double Stars",
 }
 
+DEFAULT_MCWV_TICKET_SETTINGS = {
+    "panel": {
+        "title": "MCWV Applications",
+        "description": "Ready to apply for MCWV? Open a private application ticket below. Inside the ticket, you’ll submit your Roblox details for staff review.",
+        "buttonLabel": "Open Application",
+        "accentColor": 0x34D399,
+    },
+    "messages": {
+        "welcomeTitle": "Thank you for applying for MCWV!",
+        "welcomeDescription": (
+            "Please send the following screenshots of your:\n\n"
+            "• Pets\n"
+            "• Rank\n"
+            "• Masteries\n"
+            "• Enchants\n"
+            "• Game-passes\n"
+            "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
+            "**Make sure the screenshots are NON-CROPPED!**"
+        ),
+    },
+    "questions": [
+        {"key": "roblox_username", "label": "Roblox username", "placeholder": "Your Roblox username", "style": "short", "required": True, "maxLength": 32},
+        {"key": "afk_247", "label": "Can you AFK 24/7 on Windows?", "placeholder": "Yes/No + details", "style": "paragraph", "required": True, "maxLength": 500},
+        {"key": "activity", "label": "Discord + in-game active hours", "placeholder": "Example: 6h Discord, 12h in-game", "style": "paragraph", "required": True, "maxLength": 500},
+        {"key": "liquid_gems", "label": "Liquid gems you can spend per war", "placeholder": "Example: 5b liquid gems", "style": "paragraph", "required": True, "maxLength": 500},
+        {"key": "why_accept", "label": "Why should we accept you?", "placeholder": "Tell us why you fit MCWV", "style": "paragraph", "required": True, "maxLength": 900},
+    ],
+    "features": {
+        "openLimit": 1,
+        "acceptButton": True,
+        "closeButton": True,
+        "staffInfoButton": True,
+        "transcripts": True,
+        "deleteAfterClose": True,
+        "supportHours": False,
+    },
+}
+
+
 
 def get_broadcast_allowed_user_ids():
     saved = _safe_call("db_get_setting", "", "broadcast_allowed_user_ids") or ""
@@ -5500,16 +5626,28 @@ async def accept_application_ticket(interaction, ticket_row):
     await interaction.response.send_message("✅ Applicant accepted, linked, ticket saved, and role assigned.", ephemeral=True)
 
 
-class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
-    roblox_username = discord.ui.TextInput(label="Roblox username", placeholder="Your Roblox username", max_length=32)
-    afk_247 = discord.ui.TextInput(label="Can you AFK 24/7 on Windows?", style=discord.TextStyle.paragraph, max_length=500)
-    activity = discord.ui.TextInput(label="Discord + in-game active hours", style=discord.TextStyle.paragraph, max_length=500)
-    liquid_gems = discord.ui.TextInput(label="Liquid gems you can spend per war", style=discord.TextStyle.paragraph, max_length=500)
-    why_accept = discord.ui.TextInput(label="Why should we accept you?", style=discord.TextStyle.paragraph, max_length=900)
-
+class ApplicationModal(discord.ui.Modal):
     def __init__(self, opener):
-        super().__init__()
+        super().__init__(title="MCWV Application")
         self.opener = opener
+        self.settings = get_mcwv_ticket_settings()
+        self.inputs_by_key = {}
+
+        for question in self.settings.get("questions", DEFAULT_MCWV_TICKET_SETTINGS["questions"]):
+            style = discord.TextStyle.paragraph if question.get("style") == "paragraph" else discord.TextStyle.short
+            text_input = discord.ui.TextInput(
+                label=str(question.get("label") or "Question")[:45],
+                placeholder=str(question.get("placeholder") or "")[:100],
+                style=style,
+                required=bool(question.get("required", True)),
+                max_length=int(question.get("maxLength") or 500),
+            )
+            self.inputs_by_key[str(question.get("key"))] = text_input
+            self.add_item(text_input)
+
+    def answer(self, key, default=""):
+        item = self.inputs_by_key.get(key)
+        return str(getattr(item, "value", default) or default)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -5521,7 +5659,8 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
         if existing:
             return await interaction.followup.send(f"You already have an open application: {existing.mention}", ephemeral=True)
 
-        resolved = await resolve_roblox_username_basic(str(self.roblox_username.value).strip())
+        roblox_input = self.answer("roblox_username").strip()
+        resolved = await resolve_roblox_username_basic(roblox_input)
         if not resolved:
             return await interaction.followup.send("❌ Roblox username not found. Please check spelling and try again.", ephemeral=True)
 
@@ -5550,14 +5689,19 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
         ticket_id = f"app-{channel.id}"
         db_create_mcwv_ticket(ticket_id, channel.id, guild.id, interaction.user.id)
 
+        afk_247 = self.answer("afk_247")
+        activity = self.answer("activity")
+        liquid_gems = self.answer("liquid_gems")
+        why_accept = self.answer("why_accept")
+
         saved = db_save_ticket_application(
             ticket_id,
             resolved["name"],
             resolved["id"],
-            str(self.afk_247.value),
-            str(self.activity.value),
-            str(self.liquid_gems.value),
-            str(self.why_accept.value),
+            afk_247,
+            activity,
+            liquid_gems,
+            why_accept,
         )
         if not saved:
             return await interaction.followup.send("❌ Ticket created, but I could not save the application. Please contact staff.", ephemeral=True)
@@ -5565,18 +5709,10 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
         db_ticket_log(ticket_id, interaction.user.id, "ticket/opened", "Application ticket opened", {"robloxId": resolved["id"]})
         db_ticket_log(ticket_id, interaction.user.id, "application/submitted", f"Application submitted for {resolved['name']}", {"robloxId": resolved["id"]})
 
+        messages = self.settings.get("messages", DEFAULT_MCWV_TICKET_SETTINGS["messages"])
         screenshot_embed = discord.Embed(
-            title="Thank you for applying for MCWV!",
-            description=(
-                "Please send the following screenshots of your:\n\n"
-                "• Pets\n"
-                "• Rank\n"
-                "• Masteries\n"
-                "• Enchants\n"
-                "• Game-passes\n"
-                "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
-                "**Make sure the screenshots are NON-CROPPED!**"
-            ),
+            title=str(messages.get("welcomeTitle") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeTitle"]),
+            description=str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"]),
             color=discord.Color.from_rgb(52, 211, 153),
             timestamp=datetime.now(timezone.utc),
         )
@@ -5588,10 +5724,10 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
             interaction.user,
             resolved["name"],
             resolved["id"],
-            str(self.afk_247.value),
-            str(self.activity.value),
-            str(self.liquid_gems.value),
-            str(self.why_accept.value),
+            afk_247,
+            activity,
+            liquid_gems,
+            why_accept,
         )
         await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
         await interaction.followup.send(f"✅ Application ticket created: {channel.mention}", ephemeral=True)
@@ -5692,8 +5828,10 @@ class ApplicationReviewView(discord.ui.View):
 
 
 class MCWVTicketPanelView(discord.ui.View):
-    def __init__(self, button_label="Open Application"):
+    def __init__(self, button_label=None):
         super().__init__(timeout=None)
+        if button_label is None:
+            button_label = get_mcwv_ticket_settings().get("panel", {}).get("buttonLabel", "Open Application")
         for child in self.children:
             if getattr(child, "custom_id", None) == "mcwv_open_application_ticket":
                 child.label = str(button_label or "Open Application")[:80]
