@@ -799,6 +799,7 @@ def admin_status():
         "loops": {
             "War Poll Loop": _loop_status("war_poll_loop"),
             "War Collector Loop": _loop_status("hub_war_collect_loop"),
+            "Ticket Screenshot Reminder Loop": _loop_status("ticket_screenshot_reminder_loop"),
             "Presence Loop": _loop_status("check_loop"),
             "Reminder Loop": _loop_status("reminder_loop"),
             "Invite Event Loop": _loop_status("check_invite_event"),
@@ -4296,7 +4297,8 @@ DEFAULT_MCWV_TICKET_SETTINGS = {
             "• Enchants\n"
             "• Game-passes\n"
             "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
-            "**Make sure the screenshots are NON-CROPPED!**"
+            "**Make sure the screenshots are NON-CROPPED!**\n\n"
+            "After uploading them in this ticket, press **I've uploaded my screenshots** below."
         ),
     },
     "questions": [
@@ -5626,6 +5628,35 @@ async def accept_application_ticket(interaction, ticket_row):
     await interaction.response.send_message("✅ Applicant accepted, linked, ticket saved, and role assigned.", ephemeral=True)
 
 
+class ScreenshotUploadedView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="I've uploaded my screenshots", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_screenshots_uploaded")
+    async def uploaded_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        if interaction.user.id != int(row[3]):
+            return await interaction.response.send_message("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
+
+        staff_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS))
+        db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
+
+        await interaction.response.send_message("✅ Thank you — staff have been notified.", ephemeral=True)
+        await interaction.channel.send(
+            f"✅ Thanks {interaction.user.mention}! {staff_mentions} will review your application soon.",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+        )
+
+        try:
+            for child in self.children:
+                child.disabled = True
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+
 class ApplicationModal(discord.ui.Modal):
     def __init__(self, opener):
         super().__init__(title="MCWV Application")
@@ -5710,14 +5741,18 @@ class ApplicationModal(discord.ui.Modal):
         db_ticket_log(ticket_id, interaction.user.id, "application/submitted", f"Application submitted for {resolved['name']}", {"robloxId": resolved["id"]})
 
         messages = self.settings.get("messages", DEFAULT_MCWV_TICKET_SETTINGS["messages"])
+        welcome_description = str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"])
+        if "uploaded my screenshots" not in welcome_description.lower():
+            welcome_description += "\n\nAfter uploading them in this ticket, press **I've uploaded my screenshots** below."
+
         screenshot_embed = discord.Embed(
             title=str(messages.get("welcomeTitle") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeTitle"]),
-            description=str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"]),
+            description=welcome_description,
             color=discord.Color.from_rgb(52, 211, 153),
             timestamp=datetime.now(timezone.utc),
         )
         screenshot_embed.set_footer(text="MCWV Applications")
-        await channel.send(content=interaction.user.mention, embed=screenshot_embed)
+        await channel.send(content=interaction.user.mention, embed=screenshot_embed, view=ScreenshotUploadedView())
 
         review_embed = build_application_review_embed(
             ticket_id,
@@ -9134,6 +9169,79 @@ class ClanReviewView(discord.ui.View):
             except Exception:
                 pass
 
+# ---------------- TICKET SCREENSHOT REMINDER LOOP ----------------
+def db_tickets_needing_screenshot_reminder():
+    if not db_enabled():
+        return []
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.ticket_id, t.channel_id, t.opener_discord_id
+                FROM mcwv_tickets t
+                WHERE t.status IN ('open', 'pending')
+                  AND t.created_at <= NOW() - INTERVAL '6 hours'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM mcwv_ticket_actions a
+                    WHERE a.ticket_id = t.ticket_id
+                      AND a.action = 'screenshots/uploaded'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM mcwv_ticket_actions a
+                    WHERE a.ticket_id = t.ticket_id
+                      AND a.action = 'screenshots/reminder_sent'
+                      AND a.created_at >= NOW() - INTERVAL '6 hours'
+                  )
+                ORDER BY t.created_at ASC
+                LIMIT 25
+            """)
+            return cur.fetchall()
+    except Exception as exc:
+        print("db_tickets_needing_screenshot_reminder error:", exc)
+        return []
+
+
+@tasks.loop(minutes=10)
+async def ticket_screenshot_reminder_loop():
+    await bot.wait_until_ready()
+    rows = db_tickets_needing_screenshot_reminder()
+    if not rows:
+        return
+
+    for ticket_id, channel_id, opener_id in rows:
+        try:
+            channel = bot.get_channel(int(channel_id))
+            if channel is None:
+                channel = await bot.fetch_channel(int(channel_id))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            embed = discord.Embed(
+                title="Screenshot reminder",
+                description=(
+                    "Please upload your **non-cropped** screenshots for your MCWV application, then press "
+                    "**I've uploaded my screenshots** so staff know your application is ready."
+                ),
+                color=discord.Color.orange(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(
+                name="Needed screenshots",
+                value="• Pets\n• Rank\n• Masteries\n• Enchants\n• Game-passes\n• Player profile",
+                inline=False,
+            )
+            await channel.send(
+                content=f"<@{int(opener_id)}>",
+                embed=embed,
+                view=ScreenshotUploadedView(),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+            db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Screenshot reminder sent after 6 hours")
+            await asyncio.sleep(0.5)
+        except Exception as exc:
+            print(f"ticket_screenshot_reminder_loop error for {ticket_id}: {exc}")
+
+
 # ---------------- HUB WAR COLLECTOR LOOP ----------------
 @tasks.loop(minutes=WAR_COLLECT_INTERVAL_MINUTES)
 async def hub_war_collect_loop():
@@ -9190,6 +9298,9 @@ def start_bot_loops():
     if not war_poll_loop.is_running():
         war_poll_loop.start()
 
+    if not ticket_screenshot_reminder_loop.is_running():
+        ticket_screenshot_reminder_loop.start()
+
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
         hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
         hub_war_collect_loop.start()
@@ -9229,6 +9340,7 @@ async def on_ready():
 
     try:
         bot.add_view(MCWVTicketPanelView())
+        bot.add_view(ScreenshotUploadedView())
         bot.add_view(TicketWelcomeView("persistent"))
         bot.add_view(ApplicationReviewView("persistent"))
         print("✅ MCWV ticket views registered")
