@@ -5165,18 +5165,51 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
     liquid_gems = discord.ui.TextInput(label="Liquid gems you can spend per war", style=discord.TextStyle.paragraph, max_length=500)
     why_accept = discord.ui.TextInput(label="Why should we accept you?", style=discord.TextStyle.paragraph, max_length=900)
 
-    def __init__(self, ticket_id, opener):
+    def __init__(self, opener):
         super().__init__()
-        self.ticket_id = ticket_id
         self.opener = opener
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        if not guild:
+            return await interaction.followup.send("❌ This must be used in the server.", ephemeral=True)
+
+        existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
+        if existing:
+            return await interaction.followup.send(f"You already have an open application: {existing.mention}", ephemeral=True)
+
         resolved = await resolve_roblox_username_basic(str(self.roblox_username.value).strip())
         if not resolved:
-            return await interaction.followup.send("❌ Roblox username not found. Please check spelling and submit again.", ephemeral=True)
+            return await interaction.followup.send("❌ Roblox username not found. Please check spelling and try again.", ephemeral=True)
+
+        category = guild.get_channel(MCWV_TICKET_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.followup.send("❌ Ticket category is not configured correctly. Please contact staff.", ephemeral=True)
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True, embed_links=True),
+        }
+        for role_id in MCWV_TICKET_STAFF_ROLE_IDS:
+            role = guild.get_role(role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True, manage_messages=True)
+
+        safe_name = normalize_ticket_key(resolved["name"] or interaction.user.display_name or interaction.user.name)[:24] or str(interaction.user.id)
+        channel = await guild.create_text_channel(
+            name=f"⭐-ticket-{safe_name}",
+            category=category,
+            topic=f"mcwv-ticket-owner:{interaction.user.id}",
+            overwrites=overwrites,
+            reason=f"MCWV application opened by {interaction.user}",
+        )
+        ticket_id = f"app-{channel.id}"
+        db_create_mcwv_ticket(ticket_id, channel.id, guild.id, interaction.user.id)
+
         saved = db_save_ticket_application(
-            self.ticket_id,
+            ticket_id,
             resolved["name"],
             resolved["id"],
             str(self.afk_247.value),
@@ -5185,10 +5218,31 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
             str(self.why_accept.value),
         )
         if not saved:
-            return await interaction.followup.send("❌ Could not save application. Please contact staff.", ephemeral=True)
-        db_ticket_log(self.ticket_id, interaction.user.id, "application/submitted", f"Application submitted for {resolved['name']}", {"robloxId": resolved["id"]})
-        embed = build_application_review_embed(
-            self.ticket_id,
+            return await interaction.followup.send("❌ Ticket created, but I could not save the application. Please contact staff.", ephemeral=True)
+
+        db_ticket_log(ticket_id, interaction.user.id, "ticket/opened", "Application ticket opened", {"robloxId": resolved["id"]})
+        db_ticket_log(ticket_id, interaction.user.id, "application/submitted", f"Application submitted for {resolved['name']}", {"robloxId": resolved["id"]})
+
+        screenshot_embed = discord.Embed(
+            title="Thank you for applying for MCWV!",
+            description=(
+                "Please send the following screenshots of your:\n\n"
+                "• Pets\n"
+                "• Rank\n"
+                "• Masteries\n"
+                "• Enchants\n"
+                "• Game-passes\n"
+                "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
+                "**Make sure the screenshots are NON-CROPPED!**"
+            ),
+            color=discord.Color.from_rgb(52, 211, 153),
+            timestamp=datetime.now(timezone.utc),
+        )
+        screenshot_embed.set_footer(text="MCWV Applications")
+        await channel.send(content=interaction.user.mention, embed=screenshot_embed)
+
+        review_embed = build_application_review_embed(
+            ticket_id,
             interaction.user,
             resolved["name"],
             resolved["id"],
@@ -5197,8 +5251,8 @@ class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
             str(self.liquid_gems.value),
             str(self.why_accept.value),
         )
-        await interaction.channel.send(embed=embed, view=ApplicationReviewView(self.ticket_id))
-        await interaction.followup.send("✅ Application submitted. Staff will review it here.", ephemeral=True)
+        await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
+        await interaction.followup.send(f"✅ Application ticket created: {channel.mention}", ephemeral=True)
 
 
 class TicketWelcomeView(discord.ui.View):
@@ -5278,34 +5332,6 @@ class ApplicationReviewView(discord.ui.View):
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         await accept_application_ticket(interaction, row)
 
-    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_reject")
-    async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.staff_ok(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        await interaction.response.send_modal(RejectModal(self.ticket_id))
-
-    @discord.ui.button(label="Request Info", style=discord.ButtonStyle.secondary, custom_id="mcwv_ticket_more_info")
-    async def info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.staff_ok(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        db_ticket_log(self.ticket_id, interaction.user.id, "request/info", "Staff requested more info")
-        await interaction.channel.send("ℹ️ Staff need a little more information before reviewing this application. Please reply below with anything requested.")
-        await interaction.response.send_message("✅ Request posted.", ephemeral=True)
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_claim")
-    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.staff_ok(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        db_update_ticket_status(self.ticket_id, "pending", interaction.user.id, claimed_by=interaction.user.id)
-        await interaction.response.send_message(f"✅ Claimed by {interaction.user.mention}.", ephemeral=True)
-        await interaction.channel.send(f"🛡️ {interaction.user.mention} claimed this application.")
-
-    @discord.ui.button(label="Staff Note", style=discord.ButtonStyle.secondary, custom_id="mcwv_ticket_note")
-    async def note_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.staff_ok(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        await interaction.response.send_modal(NoteModal(self.ticket_id))
-
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.staff_ok(interaction):
@@ -5314,84 +5340,55 @@ class ApplicationReviewView(discord.ui.View):
 
 
 class MCWVTicketPanelView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, button_label="Open Application"):
         super().__init__(timeout=None)
+        for child in self.children:
+            if getattr(child, "custom_id", None) == "mcwv_open_application_ticket":
+                child.label = str(button_label or "Open Application")[:80]
 
     @discord.ui.button(label="Open Application", style=discord.ButtonStyle.success, custom_id="mcwv_open_application_ticket")
     async def open_application(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         if not guild:
             return await interaction.response.send_message("This must be used in the server.", ephemeral=True)
-        category = guild.get_channel(MCWV_TICKET_CATEGORY_ID)
-        if not isinstance(category, discord.CategoryChannel):
-            return await interaction.response.send_message("Ticket category is not configured correctly. Please contact staff.", ephemeral=True)
         existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
         if existing:
             return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True, embed_links=True),
-        }
-        for role_id in MCWV_TICKET_STAFF_ROLE_IDS:
-            role = guild.get_role(role_id)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True, manage_messages=True)
-        safe_name = normalize_ticket_key(interaction.user.display_name or interaction.user.name)[:24] or str(interaction.user.id)
-        channel = await guild.create_text_channel(
-            name=f"⭐-ticket-{safe_name}",
-            category=category,
-            topic=f"mcwv-ticket-owner:{interaction.user.id}",
-            overwrites=overwrites,
-            reason=f"MCWV application opened by {interaction.user}",
-        )
-        ticket_id = f"app-{channel.id}"
-        db_create_mcwv_ticket(ticket_id, channel.id, guild.id, interaction.user.id)
-        db_ticket_log(ticket_id, interaction.user.id, "ticket/opened", "Application ticket opened")
-        embed = discord.Embed(
-            title="Thank you for applying for MCWV!",
-            description=(
-                "Please send the following screenshots of your:\n\n"
-                "• Pets\n"
-                "• Rank\n"
-                "• Masteries\n"
-                "• Enchants\n"
-                "• Game-passes\n"
-                "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
-                "**Make sure the screenshots are NON-CROPPED!**\n\n"
-                "When ready, press **Submit Application** below."
-            ),
-            color=discord.Color.from_rgb(52, 211, 153),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_footer(text="MCWV Applications")
-        await channel.send(content=interaction.user.mention, embed=embed, view=TicketWelcomeView(ticket_id))
-        await interaction.response.send_message(f"✅ Application ticket created: {channel.mention}", ephemeral=True)
+        await interaction.response.send_modal(ApplicationModal(interaction.user))
 
 
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
-async def ticket_panel_send(interaction: discord.Interaction, channel: discord.TextChannel = None):
+@app_commands.describe(
+    channel="Channel to send the panel in. Defaults to configured panel channel.",
+    title="Panel title",
+    description="Panel description",
+    button_label="Text on the application button"
+)
+async def ticket_panel_send(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None,
+    title: str = "MCWV Applications",
+    description: str = "Ready to apply for MCWV? Open a private application ticket below.",
+    button_label: str = "Open Application",
+):
     if not has_mcwv_ticket_staff_permission(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
     target_channel = channel or interaction.guild.get_channel(MCWV_TICKET_PANEL_CHANNEL_ID)
     if not isinstance(target_channel, discord.TextChannel):
         return await interaction.response.send_message("❌ Ticket panel channel is not configured correctly.", ephemeral=True)
     embed = discord.Embed(
-        title="MCWV Applications",
-        description=(
-            "Ready to apply for **MCWV**? Open a private application ticket below.\n\n"
-            "Inside the ticket, you’ll send screenshots and submit your Roblox details for staff review."
-        ),
+        title=str(title or "MCWV Applications")[:256],
+        description=str(description or "Ready to apply for MCWV? Open a private application ticket below.")[:4000],
         color=discord.Color.from_rgb(52, 211, 153),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(
         name="Before opening",
-        value="Please be ready to provide non-cropped screenshots of pets, rank, masteries, enchants, game-passes, and player profile.",
+        value="Be ready to answer the application questions and provide non-cropped screenshots once your ticket opens.",
         inline=False,
     )
     embed.set_footer(text="MCWV Applications")
-    await target_channel.send(embed=embed, view=MCWVTicketPanelView())
+    await target_channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
     await interaction.response.send_message(f"✅ Ticket panel sent in {target_channel.mention}.", ephemeral=True)
 
 
