@@ -419,6 +419,231 @@ async def _send_signup_verification_dm(discord_id, username, code):
     return {"success": True, "sent": True, "discord_id": str(user_id)}
 
 
+
+
+def _ticket_row_to_payload(row):
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "ticketId": row[1],
+        "channelId": str(row[2]) if row[2] else None,
+        "guildId": str(row[3]) if row[3] else None,
+        "openerDiscordId": str(row[4]) if row[4] else None,
+        "robloxId": row[5],
+        "robloxUsername": row[6],
+        "status": row[7],
+        "claimedBy": str(row[8]) if row[8] else None,
+        "createdAt": row[9].isoformat() if row[9] else None,
+        "updatedAt": row[10].isoformat() if row[10] else None,
+        "acceptedAt": row[11].isoformat() if row[11] else None,
+        "acceptedBy": str(row[12]) if row[12] else None,
+        "rejectedAt": row[13].isoformat() if row[13] else None,
+        "rejectedBy": str(row[14]) if row[14] else None,
+        "rejectReason": row[15],
+        "closedAt": row[16].isoformat() if row[16] else None,
+        "closedBy": str(row[17]) if row[17] else None,
+        "closeReason": row[18],
+    }
+
+
+def _ticket_application_payload(row):
+    if not row:
+        return None
+    return {
+        "robloxUsername": row[0],
+        "robloxId": row[1],
+        "afk247": row[2],
+        "activity": row[3],
+        "liquidGems": row[4],
+        "whyAccept": row[5],
+        "submittedAt": row[6].isoformat() if row[6] else None,
+    }
+
+
+def _ticket_action_payload(row):
+    return {
+        "id": row[0],
+        "ticketId": row[1],
+        "actorDiscordId": str(row[2]) if row[2] else None,
+        "action": row[3],
+        "message": row[4],
+        "metadata": row[5] or {},
+        "createdAt": row[6].isoformat() if row[6] else None,
+    }
+
+
+def db_admin_list_mcwv_tickets():
+    db_ensure_mcwv_ticket_tables()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
+                   status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
+                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason
+            FROM mcwv_tickets
+            ORDER BY updated_at DESC
+            LIMIT 200
+        """)
+        rows = cur.fetchall()
+    return [_ticket_row_to_payload(row) for row in rows]
+
+
+def db_admin_get_mcwv_ticket(ticket_id):
+    db_ensure_mcwv_ticket_tables()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
+                   status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
+                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason
+            FROM mcwv_tickets
+            WHERE ticket_id = %s OR channel_id::text = %s OR id::text = %s
+            LIMIT 1
+        """, (str(ticket_id), str(ticket_id), str(ticket_id)))
+        ticket = cur.fetchone()
+        if not ticket:
+            return None
+        canonical = ticket[1]
+        cur.execute("""
+            SELECT roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at
+            FROM mcwv_ticket_applications
+            WHERE ticket_id = %s
+            LIMIT 1
+        """, (canonical,))
+        app_row = cur.fetchone()
+        cur.execute("""
+            SELECT id, ticket_id, actor_discord_id, action, message, metadata, created_at
+            FROM mcwv_ticket_actions
+            WHERE ticket_id = %s
+            ORDER BY created_at DESC
+            LIMIT 50
+        """, (canonical,))
+        actions = cur.fetchall()
+        cur.execute("""
+            SELECT transcript_text, created_at
+            FROM mcwv_ticket_transcripts
+            WHERE ticket_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (canonical,))
+        transcript = cur.fetchone()
+    payload = _ticket_row_to_payload(ticket)
+    payload["application"] = _ticket_application_payload(app_row)
+    payload["actions"] = [_ticket_action_payload(row) for row in actions]
+    payload["transcript"] = {"text": transcript[0], "createdAt": transcript[1].isoformat()} if transcript else None
+    return payload
+
+
+async def _admin_ticket_accept(ticket_id, actor_id):
+    ticket = db_admin_get_mcwv_ticket(ticket_id)
+    if not ticket:
+        raise ValueError("Ticket not found")
+    app = ticket.get("application")
+    if not app:
+        raise ValueError("Ticket has no application")
+    guild = bot.get_guild(int(ticket["guildId"])) if ticket.get("guildId") else broadcast_primary_guild()
+    if not guild:
+        raise ValueError("Guild not available")
+    channel = guild.get_channel(int(ticket["channelId"])) if ticket.get("channelId") else None
+    if channel is None and ticket.get("channelId"):
+        channel = await guild.fetch_channel(int(ticket["channelId"]))
+    applicant = guild.get_member(int(ticket["openerDiscordId"])) if ticket.get("openerDiscordId") else None
+    if applicant is None and ticket.get("openerDiscordId"):
+        applicant = await guild.fetch_member(int(ticket["openerDiscordId"]))
+    if applicant is None:
+        raise ValueError("Applicant not found in server")
+    ok, db_msg = db_add(app["robloxId"], applicant.id, app["robloxUsername"])
+    if not ok:
+        raise ValueError(f"Could not link Roblox account: {db_msg}")
+    if channel:
+        db_set_ticket_channel(applicant.id, channel.id)
+    role = guild.get_role(MCWV_TICKET_MEMBER_ROLE_ID)
+    if role:
+        await applicant.add_roles(role, reason=f"MCWV application accepted from Hub by {actor_id}")
+    db_update_ticket_status(ticket["ticketId"], "accepted", actor_id, accepted_at=datetime.now(timezone.utc), accepted_by=actor_id)
+    embed = discord.Embed(
+        title="Accepted into MCWV",
+        description=f"Welcome to **MCWV**, {applicant.mention}!\nRoblox account linked as **{app['robloxUsername']}**. This ticket will stay open for next steps.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if channel:
+        await channel.send(embed=embed)
+    await log_ticket_event(guild, embed)
+    return db_admin_get_mcwv_ticket(ticket["ticketId"])
+
+
+async def _admin_ticket_close(ticket_id, actor_id, reason):
+    ticket = db_admin_get_mcwv_ticket(ticket_id)
+    if not ticket:
+        raise ValueError("Ticket not found")
+    guild = bot.get_guild(int(ticket["guildId"])) if ticket.get("guildId") else broadcast_primary_guild()
+    channel = guild.get_channel(int(ticket["channelId"])) if guild and ticket.get("channelId") else None
+    if channel is None and guild and ticket.get("channelId"):
+        channel = await guild.fetch_channel(int(ticket["channelId"]))
+    transcript = await build_ticket_transcript(channel) if channel else "Channel unavailable"
+    db_save_ticket_transcript(ticket["ticketId"], int(ticket["channelId"] or 0), transcript)
+    db_update_ticket_status(ticket["ticketId"], "closed", actor_id, closed_at=datetime.now(timezone.utc), closed_by=actor_id, close_reason=reason)
+    if channel:
+        embed = discord.Embed(title="Ticket Closed", description=f"Reason: {reason}\nChannel will delete in {MCWV_TICKET_DELETE_DELAY_SECONDS}s.", color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc))
+        await channel.send(embed=embed)
+        await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
+        await channel.delete(reason=f"MCWV ticket closed from Hub: {reason}")
+    return {"success": True}
+
+
+@app.route("/admin/tickets", methods=["GET"])
+@require_admin_api_key
+def admin_tickets_list():
+    try:
+        tickets = db_admin_list_mcwv_tickets()
+        metrics = {
+            "total": len(tickets),
+            "open": sum(1 for ticket in tickets if ticket.get("status") in ("open", "pending")),
+            "pending": sum(1 for ticket in tickets if ticket.get("status") == "pending"),
+            "accepted": sum(1 for ticket in tickets if ticket.get("status") == "accepted"),
+            "closed": sum(1 for ticket in tickets if ticket.get("status") == "closed"),
+        }
+        return jsonify({"success": True, "tickets": tickets, "metrics": metrics})
+    except Exception as exc:
+        return jsonify({"error": str(exc), "tickets": []}), 500
+
+
+@app.route("/admin/tickets/<ticket_id>", methods=["GET"])
+@require_admin_api_key
+def admin_ticket_detail(ticket_id):
+    try:
+        ticket = db_admin_get_mcwv_ticket(ticket_id)
+        if not ticket:
+            return jsonify({"error": "Ticket not found"}), 404
+        return jsonify({"success": True, "ticket": ticket})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/tickets/accept", methods=["POST"])
+@require_admin_api_key
+def admin_ticket_accept():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_ticket_accept(body.get("ticket_id") or body.get("ticketId"), body.get("actor_id") or 0))
+        ticket = future.result(timeout=25)
+        return jsonify({"success": True, "ticket": ticket})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/tickets/close", methods=["POST"])
+@require_admin_api_key
+def admin_ticket_close():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_ticket_close(body.get("ticket_id") or body.get("ticketId"), body.get("actor_id") or 0, body.get("reason") or "Closed from Hub"))
+        payload = future.result(timeout=35)
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/admin/broadcast/access", methods=["POST"])
 @require_admin_api_key
 def admin_broadcast_access():
