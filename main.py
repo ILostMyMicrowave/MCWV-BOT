@@ -2387,6 +2387,221 @@ def db_set_setting(key, value):
         conn.rollback()
 
 
+def db_ensure_mcwv_ticket_tables():
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_tickets (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT UNIQUE NOT NULL,
+                    channel_id BIGINT UNIQUE,
+                    guild_id BIGINT,
+                    opener_discord_id BIGINT NOT NULL,
+                    roblox_id TEXT,
+                    roblox_username TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    claimed_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    accepted_at TIMESTAMPTZ,
+                    accepted_by BIGINT,
+                    rejected_at TIMESTAMPTZ,
+                    rejected_by BIGINT,
+                    reject_reason TEXT,
+                    closed_at TIMESTAMPTZ,
+                    closed_by BIGINT,
+                    close_reason TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_applications (
+                    ticket_id TEXT PRIMARY KEY,
+                    roblox_username TEXT,
+                    roblox_id TEXT,
+                    afk_247 TEXT,
+                    activity TEXT,
+                    liquid_gems TEXT,
+                    why_accept TEXT,
+                    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_actions (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT,
+                    actor_discord_id BIGINT,
+                    action TEXT NOT NULL,
+                    message TEXT,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_transcripts (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT,
+                    channel_id BIGINT,
+                    transcript_text TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    except Exception as e:
+        print("db_ensure_mcwv_ticket_tables error:", e)
+        conn.rollback()
+
+
+def db_ticket_log(ticket_id, actor_id, action, message="", metadata=None):
+    if not db_enabled():
+        return
+    try:
+        import json
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_ticket_actions (ticket_id, actor_discord_id, action, message, metadata)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
+            """, (str(ticket_id), int(actor_id) if actor_id else None, str(action), str(message or ""), json.dumps(metadata or {})))
+        conn.commit()
+    except Exception as e:
+        print("db_ticket_log error:", e)
+        conn.rollback()
+
+
+def db_create_mcwv_ticket(ticket_id, channel_id, guild_id, opener_id):
+    if not db_enabled():
+        return False
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_tickets (ticket_id, channel_id, guild_id, opener_discord_id, status, updated_at)
+                VALUES (%s, %s, %s, %s, 'open', NOW())
+                ON CONFLICT (ticket_id)
+                DO UPDATE SET channel_id = EXCLUDED.channel_id, updated_at = NOW()
+            """, (str(ticket_id), int(channel_id), int(guild_id), int(opener_id)))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("db_create_mcwv_ticket error:", e)
+        conn.rollback()
+        return False
+
+
+def db_get_ticket_by_channel(channel_id):
+    if not db_enabled():
+        return None
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username, status, claimed_by
+                FROM mcwv_tickets
+                WHERE channel_id = %s
+                LIMIT 1
+            """, (int(channel_id),))
+            return cur.fetchone()
+    except Exception as e:
+        print("db_get_ticket_by_channel error:", e)
+        return None
+
+
+def db_save_ticket_application(ticket_id, roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept):
+    if not db_enabled():
+        return False
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_ticket_applications (ticket_id, roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (ticket_id)
+                DO UPDATE SET
+                    roblox_username = EXCLUDED.roblox_username,
+                    roblox_id = EXCLUDED.roblox_id,
+                    afk_247 = EXCLUDED.afk_247,
+                    activity = EXCLUDED.activity,
+                    liquid_gems = EXCLUDED.liquid_gems,
+                    why_accept = EXCLUDED.why_accept,
+                    submitted_at = NOW()
+            """, (str(ticket_id), roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept))
+            cur.execute("""
+                UPDATE mcwv_tickets
+                SET roblox_username = %s, roblox_id = %s, status = 'pending', updated_at = NOW()
+                WHERE ticket_id = %s
+            """, (roblox_username, roblox_id, str(ticket_id)))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("db_save_ticket_application error:", e)
+        conn.rollback()
+        return False
+
+
+def db_get_ticket_application(ticket_id):
+    if not db_enabled():
+        return None
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at
+                FROM mcwv_ticket_applications
+                WHERE ticket_id = %s
+                LIMIT 1
+            """, (str(ticket_id),))
+            return cur.fetchone()
+    except Exception as e:
+        print("db_get_ticket_application error:", e)
+        return None
+
+
+def db_update_ticket_status(ticket_id, status, actor_id=None, **fields):
+    if not db_enabled():
+        return False
+    db_ensure_mcwv_ticket_tables()
+    allowed = {
+        'accepted_at', 'accepted_by', 'rejected_at', 'rejected_by', 'reject_reason',
+        'closed_at', 'closed_by', 'close_reason', 'claimed_by'
+    }
+    assignments = ["status = %s", "updated_at = NOW()"]
+    values = [str(status)]
+    for key, value in fields.items():
+        if key in allowed:
+            assignments.append(f"{key} = %s")
+            values.append(value)
+    values.append(str(ticket_id))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE mcwv_tickets SET {', '.join(assignments)} WHERE ticket_id = %s", values)
+        conn.commit()
+        db_ticket_log(ticket_id, actor_id, f"ticket/{status}", status, fields)
+        return True
+    except Exception as e:
+        print("db_update_ticket_status error:", e)
+        conn.rollback()
+        return False
+
+
+def db_save_ticket_transcript(ticket_id, channel_id, transcript_text):
+    if not db_enabled():
+        return False
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_ticket_transcripts (ticket_id, channel_id, transcript_text)
+                VALUES (%s, %s, %s)
+            """, (str(ticket_id), int(channel_id), transcript_text))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("db_save_ticket_transcript error:", e)
+        conn.rollback()
+        return False
+
+
 def db_set_user_status(rid, status):
     if not db_enabled():
         return
@@ -3693,6 +3908,13 @@ TICKET_IGNORE_ROLE_IDS = (
 TICKET_IGNORE_ROLE_IDS.add(TICKET_STAFF_ROLE_ID)
 TICKET_IGNORE_ROLE_IDS.add(1502339420207059066)
 
+MCWV_TICKET_CATEGORY_ID = int(os.environ.get("MCWV_TICKET_CATEGORY_ID", "1503106486392328333"))
+MCWV_TICKET_PANEL_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_PANEL_CHANNEL_ID", "1501613434364760174"))
+MCWV_TICKET_LOG_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_LOG_CHANNEL_ID", "1501997396610125876"))
+MCWV_TICKET_MEMBER_ROLE_ID = int(os.environ.get("MCWV_TICKET_MEMBER_ROLE_ID", str(CLAN_MEMBER_ROLE_ID)))
+MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROLE_IDS")) or {ALLOWED_ROLE_ID}
+MCWV_TICKET_DELETE_DELAY_SECONDS = max(5, int(os.environ.get("MCWV_TICKET_DELETE_DELAY_SECONDS", "20") or "20"))
+
 
 def get_broadcast_allowed_user_ids():
     saved = _safe_call("db_get_setting", "", "broadcast_allowed_user_ids") or ""
@@ -4805,6 +5027,372 @@ class OfficerGuideView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=15 * 60)
         self.add_item(OfficerGuideSelect())
+
+
+
+def has_mcwv_ticket_staff_permission(member):
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild and member.guild.owner_id == member.id:
+        return True
+    role_ids = {getattr(role, "id", 0) for role in getattr(member, "roles", [])}
+    return bool(role_ids.intersection(MCWV_TICKET_STAFF_ROLE_IDS)) or has_officer_guide_permission(member)
+
+
+async def resolve_roblox_username_basic(username):
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    async with session.post(
+        "https://users.roblox.com/v1/usernames/users",
+        json={"usernames": [username], "excludeBannedUsers": False},
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as res:
+        if res.status != 200:
+            return None
+        payload = await res.json(content_type=None)
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    if not data:
+        return None
+    return {"id": str(data[0]["id"]), "name": str(data[0]["name"])}
+
+
+def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None):
+    embed = discord.Embed(
+        title="MCWV Application Review",
+        description=f"Application submitted by {applicant.mention}",
+        color=discord.Color.from_rgb(52, 211, 153),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
+    embed.add_field(name="Roblox", value=f"**{roblox_name}**\n`{roblox_id}`", inline=True)
+    embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
+    embed.add_field(name="AFK 24/7 on Windows?", value=afk_247[:1024] or "—", inline=False)
+    embed.add_field(name="Discord + in-game activity", value=activity[:1024] or "—", inline=False)
+    embed.add_field(name="Liquid gems per war", value=liquid_gems[:1024] or "—", inline=False)
+    embed.add_field(name="Why should we accept you?", value=why_accept[:1024] or "—", inline=False)
+    embed.add_field(
+        name="Checks",
+        value="✅ Roblox account found\n✅ Application saved\n⚠️ Staff must manually verify screenshots/requirements",
+        inline=False,
+    )
+    if claimed_by:
+        embed.set_footer(text=f"Claimed by {claimed_by}")
+    else:
+        embed.set_footer(text="Pending staff review")
+    return embed
+
+
+async def log_ticket_event(guild, embed):
+    channel = guild.get_channel(MCWV_TICKET_LOG_CHANNEL_ID) if guild else None
+    if channel:
+        try:
+            await channel.send(embed=embed)
+        except Exception as exc:
+            print("ticket log send error:", exc)
+
+
+async def build_ticket_transcript(channel, limit=250):
+    lines = []
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=True):
+            stamp = msg.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            content = msg.content or ""
+            if msg.embeds:
+                content += " " + " ".join(f"[embed: {e.title or 'no title'}]" for e in msg.embeds)
+            if msg.attachments:
+                content += " " + " ".join(a.url for a in msg.attachments)
+            lines.append(f"[{stamp}] {msg.author} ({msg.author.id}): {content}".strip())
+    except Exception as exc:
+        lines.append(f"Transcript failed: {exc}")
+    return "\n".join(lines)[-150000:]
+
+
+async def accept_application_ticket(interaction, ticket_row):
+    guild = interaction.guild
+    channel = interaction.channel
+    applicant_id = int(ticket_row[3])
+    applicant = guild.get_member(applicant_id) if guild else None
+    if applicant is None and guild:
+        try:
+            applicant = await guild.fetch_member(applicant_id)
+        except Exception:
+            applicant = None
+    if applicant is None:
+        return await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
+
+    app = db_get_ticket_application(ticket_row[0])
+    if not app:
+        return await interaction.response.send_message("❌ No submitted application found yet.", ephemeral=True)
+    roblox_name, roblox_id = str(app[0]), str(app[1])
+
+    ok, db_msg = db_add(roblox_id, applicant.id, roblox_name)
+    if not ok:
+        return await interaction.response.send_message(f"❌ Could not link Roblox account: {db_msg}", ephemeral=True)
+
+    db_set_ticket_channel(applicant.id, channel.id)
+
+    role = guild.get_role(MCWV_TICKET_MEMBER_ROLE_ID) if guild else None
+    if role:
+        try:
+            await applicant.add_roles(role, reason=f"MCWV application accepted by {interaction.user}")
+        except Exception as exc:
+            await channel.send(f"⚠️ Accepted, but I could not assign member role: `{exc}`")
+
+    db_update_ticket_status(
+        ticket_row[0],
+        "accepted",
+        interaction.user.id,
+        accepted_at=datetime.now(timezone.utc),
+        accepted_by=interaction.user.id,
+    )
+
+    embed = discord.Embed(
+        title="Accepted into MCWV",
+        description=f"Welcome to **MCWV**, {applicant.mention}!\nRoblox account linked as **{roblox_name}**. This ticket will stay open for next steps.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    await channel.send(embed=embed)
+    await log_ticket_event(guild, embed)
+    await interaction.response.send_message("✅ Applicant accepted, linked, ticket saved, and role assigned.", ephemeral=True)
+
+
+class ApplicationModal(discord.ui.Modal, title="MCWV Application"):
+    roblox_username = discord.ui.TextInput(label="Roblox username", placeholder="Your Roblox username", max_length=32)
+    afk_247 = discord.ui.TextInput(label="Can you AFK 24/7 on Windows?", style=discord.TextStyle.paragraph, max_length=500)
+    activity = discord.ui.TextInput(label="Discord + in-game active hours", style=discord.TextStyle.paragraph, max_length=500)
+    liquid_gems = discord.ui.TextInput(label="Liquid gems you can spend per war", style=discord.TextStyle.paragraph, max_length=500)
+    why_accept = discord.ui.TextInput(label="Why should we accept you?", style=discord.TextStyle.paragraph, max_length=900)
+
+    def __init__(self, ticket_id, opener):
+        super().__init__()
+        self.ticket_id = ticket_id
+        self.opener = opener
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        resolved = await resolve_roblox_username_basic(str(self.roblox_username.value).strip())
+        if not resolved:
+            return await interaction.followup.send("❌ Roblox username not found. Please check spelling and submit again.", ephemeral=True)
+        saved = db_save_ticket_application(
+            self.ticket_id,
+            resolved["name"],
+            resolved["id"],
+            str(self.afk_247.value),
+            str(self.activity.value),
+            str(self.liquid_gems.value),
+            str(self.why_accept.value),
+        )
+        if not saved:
+            return await interaction.followup.send("❌ Could not save application. Please contact staff.", ephemeral=True)
+        db_ticket_log(self.ticket_id, interaction.user.id, "application/submitted", f"Application submitted for {resolved['name']}", {"robloxId": resolved["id"]})
+        embed = build_application_review_embed(
+            self.ticket_id,
+            interaction.user,
+            resolved["name"],
+            resolved["id"],
+            str(self.afk_247.value),
+            str(self.activity.value),
+            str(self.liquid_gems.value),
+            str(self.why_accept.value),
+        )
+        await interaction.channel.send(embed=embed, view=ApplicationReviewView(self.ticket_id))
+        await interaction.followup.send("✅ Application submitted. Staff will review it here.", ephemeral=True)
+
+
+class TicketWelcomeView(discord.ui.View):
+    def __init__(self, ticket_id):
+        super().__init__(timeout=None)
+        self.ticket_id = ticket_id
+
+    @discord.ui.button(label="Submit Application", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_submit_application")
+    async def submit_application(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        if interaction.user.id != int(row[3]):
+            return await interaction.response.send_message("Only the ticket opener can submit this application.", ephemeral=True)
+        await interaction.response.send_modal(ApplicationModal(row[0], interaction.user))
+
+
+class RejectModal(discord.ui.Modal, title="Reject Application"):
+    reason = discord.ui.TextInput(label="Reason", style=discord.TextStyle.paragraph, max_length=900)
+    def __init__(self, ticket_id):
+        super().__init__()
+        self.ticket_id = ticket_id
+    async def on_submit(self, interaction: discord.Interaction):
+        db_update_ticket_status(self.ticket_id, "rejected", interaction.user.id, rejected_at=datetime.now(timezone.utc), rejected_by=interaction.user.id, reject_reason=str(self.reason.value))
+        embed = discord.Embed(title="Application Rejected", description=str(self.reason.value), color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+        await interaction.channel.send(embed=embed)
+        await log_ticket_event(interaction.guild, embed)
+        await interaction.response.send_message("✅ Application rejected.", ephemeral=True)
+
+
+class NoteModal(discord.ui.Modal, title="Staff Note"):
+    note = discord.ui.TextInput(label="Note", style=discord.TextStyle.paragraph, max_length=900)
+    def __init__(self, ticket_id):
+        super().__init__()
+        self.ticket_id = ticket_id
+    async def on_submit(self, interaction: discord.Interaction):
+        db_ticket_log(self.ticket_id, interaction.user.id, "staff/note", str(self.note.value))
+        await interaction.channel.send(f"📝 **Staff note by {interaction.user.mention}:**\n{self.note.value}")
+        await interaction.response.send_message("✅ Staff note saved.", ephemeral=True)
+
+
+class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
+    reason = discord.ui.TextInput(label="Close reason", style=discord.TextStyle.paragraph, max_length=900)
+    def __init__(self, ticket_id):
+        super().__init__()
+        self.ticket_id = ticket_id
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        transcript = await build_ticket_transcript(interaction.channel)
+        db_save_ticket_transcript(self.ticket_id, interaction.channel.id, transcript)
+        db_update_ticket_status(self.ticket_id, "closed", interaction.user.id, closed_at=datetime.now(timezone.utc), closed_by=interaction.user.id, close_reason=str(self.reason.value))
+        embed = discord.Embed(title="Ticket Closed", description=f"Reason: {self.reason.value}\nChannel will delete in {MCWV_TICKET_DELETE_DELAY_SECONDS}s.", color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc))
+        await interaction.channel.send(embed=embed)
+        await log_ticket_event(interaction.guild, embed)
+        await interaction.followup.send("✅ Transcript saved. Deleting ticket shortly.", ephemeral=True)
+        await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
+        try:
+            await interaction.channel.delete(reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
+        except Exception as exc:
+            print("ticket delete error:", exc)
+
+
+class ApplicationReviewView(discord.ui.View):
+    def __init__(self, ticket_id):
+        super().__init__(timeout=None)
+        self.ticket_id = ticket_id
+
+    def staff_ok(self, interaction):
+        return has_mcwv_ticket_staff_permission(interaction.user)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_accept")
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        await accept_application_ticket(interaction, row)
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_reject")
+    async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        await interaction.response.send_modal(RejectModal(self.ticket_id))
+
+    @discord.ui.button(label="Request Info", style=discord.ButtonStyle.secondary, custom_id="mcwv_ticket_more_info")
+    async def info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        db_ticket_log(self.ticket_id, interaction.user.id, "request/info", "Staff requested more info")
+        await interaction.channel.send("ℹ️ Staff need a little more information before reviewing this application. Please reply below with anything requested.")
+        await interaction.response.send_message("✅ Request posted.", ephemeral=True)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_claim")
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        db_update_ticket_status(self.ticket_id, "pending", interaction.user.id, claimed_by=interaction.user.id)
+        await interaction.response.send_message(f"✅ Claimed by {interaction.user.mention}.", ephemeral=True)
+        await interaction.channel.send(f"🛡️ {interaction.user.mention} claimed this application.")
+
+    @discord.ui.button(label="Staff Note", style=discord.ButtonStyle.secondary, custom_id="mcwv_ticket_note")
+    async def note_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        await interaction.response.send_modal(NoteModal(self.ticket_id))
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_close")
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        await interaction.response.send_modal(CloseTicketModal(self.ticket_id))
+
+
+class MCWVTicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Application", style=discord.ButtonStyle.success, custom_id="mcwv_open_application_ticket")
+    async def open_application(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            return await interaction.response.send_message("This must be used in the server.", ephemeral=True)
+        category = guild.get_channel(MCWV_TICKET_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.response.send_message("Ticket category is not configured correctly. Please contact staff.", ephemeral=True)
+        existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
+        if existing:
+            return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True, embed_links=True),
+        }
+        for role_id in MCWV_TICKET_STAFF_ROLE_IDS:
+            role = guild.get_role(role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True, manage_messages=True)
+        safe_name = normalize_ticket_key(interaction.user.display_name or interaction.user.name)[:24] or str(interaction.user.id)
+        channel = await guild.create_text_channel(
+            name=f"⭐-ticket-{safe_name}",
+            category=category,
+            topic=f"mcwv-ticket-owner:{interaction.user.id}",
+            overwrites=overwrites,
+            reason=f"MCWV application opened by {interaction.user}",
+        )
+        ticket_id = f"app-{channel.id}"
+        db_create_mcwv_ticket(ticket_id, channel.id, guild.id, interaction.user.id)
+        db_ticket_log(ticket_id, interaction.user.id, "ticket/opened", "Application ticket opened")
+        embed = discord.Embed(
+            title="Thank you for applying for MCWV!",
+            description=(
+                "Please send the following screenshots of your:\n\n"
+                "• Pets\n"
+                "• Rank\n"
+                "• Masteries\n"
+                "• Enchants\n"
+                "• Game-passes\n"
+                "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
+                "**Make sure the screenshots are NON-CROPPED!**\n\n"
+                "When ready, press **Submit Application** below."
+            ),
+            color=discord.Color.from_rgb(52, 211, 153),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="MCWV Applications")
+        await channel.send(content=interaction.user.mention, embed=embed, view=TicketWelcomeView(ticket_id))
+        await interaction.response.send_message(f"✅ Application ticket created: {channel.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
+async def ticket_panel_send(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    target_channel = channel or interaction.guild.get_channel(MCWV_TICKET_PANEL_CHANNEL_ID)
+    if not isinstance(target_channel, discord.TextChannel):
+        return await interaction.response.send_message("❌ Ticket panel channel is not configured correctly.", ephemeral=True)
+    embed = discord.Embed(
+        title="MCWV Applications",
+        description=(
+            "Ready to apply for **MCWV**? Open a private application ticket below.\n\n"
+            "Inside the ticket, you’ll send screenshots and submit your Roblox details for staff review."
+        ),
+        color=discord.Color.from_rgb(52, 211, 153),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Before opening",
+        value="Please be ready to provide non-cropped screenshots of pets, rank, masteries, enchants, game-passes, and player profile.",
+        inline=False,
+    )
+    embed.set_footer(text="MCWV Applications")
+    await target_channel.send(embed=embed, view=MCWVTicketPanelView())
+    await interaction.response.send_message(f"✅ Ticket panel sent in {target_channel.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="guide", description="Officer tutorial for MCWV-BOT and Hub tools", guild=guild_obj)
@@ -8151,6 +8739,14 @@ async def on_ready():
         return
 
     bot._ready_done = True
+
+    try:
+        bot.add_view(MCWVTicketPanelView())
+        bot.add_view(TicketWelcomeView("persistent"))
+        bot.add_view(ApplicationReviewView("persistent"))
+        print("✅ MCWV ticket views registered")
+    except Exception as e:
+        print(f"❌ Failed to register ticket views: {e}")
 
     # ---------------- SYNC COMMANDS ----------------
     try:
