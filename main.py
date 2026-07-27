@@ -3914,6 +3914,18 @@ MCWV_TICKET_LOG_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_LOG_CHANNEL_ID", "1
 MCWV_TICKET_MEMBER_ROLE_ID = int(os.environ.get("MCWV_TICKET_MEMBER_ROLE_ID", str(CLAN_MEMBER_ROLE_ID)))
 MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROLE_IDS")) or {ALLOWED_ROLE_ID}
 MCWV_TICKET_DELETE_DELAY_SECONDS = max(5, int(os.environ.get("MCWV_TICKET_DELETE_DELAY_SECONDS", "20") or "20"))
+PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
+PS99_IMPORTANT_GAMEPASSES = {
+    257811346: "VIP",
+    257803774: "Ultra Lucky",
+    655859720: "+15 Eggs",
+    264808140: "Huge Hunter",
+    690997523: "Super Drops",
+    258567677: "Magic Eggs",
+    259437976: "+15 Pets",
+    975558264: "Super Shiny Hunter",
+    720275150: "Double Stars",
+}
 
 
 def get_broadcast_allowed_user_ids():
@@ -5059,27 +5071,92 @@ async def resolve_roblox_username_basic(username):
 
 def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None):
     embed = discord.Embed(
-        title="MCWV Application Review",
-        description=f"Application submitted by {applicant.mention}",
+        title="MCWV Application Ready for Review",
+        description=(
+            f"{applicant.mention} submitted an application. Staff can use **Staff Info** for answers, checks, and gamepass verification."
+        ),
         color=discord.Color.from_rgb(52, 211, 153),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
     embed.add_field(name="Roblox", value=f"**{roblox_name}**\n`{roblox_id}`", inline=True)
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
-    embed.add_field(name="AFK 24/7 on Windows?", value=afk_247[:1024] or "—", inline=False)
-    embed.add_field(name="Discord + in-game activity", value=activity[:1024] or "—", inline=False)
-    embed.add_field(name="Liquid gems per war", value=liquid_gems[:1024] or "—", inline=False)
-    embed.add_field(name="Why should we accept you?", value=why_accept[:1024] or "—", inline=False)
     embed.add_field(
-        name="Checks",
-        value="✅ Roblox account found\n✅ Application saved\n⚠️ Staff must manually verify screenshots/requirements",
+        name="Next step",
+        value="Review screenshots and application answers, then **Accept** if they meet MCWV requirements.",
         inline=False,
     )
-    if claimed_by:
-        embed.set_footer(text=f"Claimed by {claimed_by}")
-    else:
-        embed.set_footer(text="Pending staff review")
+    embed.set_footer(text=f"Claimed by {claimed_by}" if claimed_by else "Pending staff review")
+    return embed
+
+
+async def check_ps99_gamepasses(roblox_id):
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    results = []
+    timeout = aiohttp.ClientTimeout(total=15)
+    for pass_id, label in PS99_IMPORTANT_GAMEPASSES.items():
+        url = f"https://inventory.roblox.com/v1/users/{roblox_id}/items/GamePass/{pass_id}/is-owned"
+        try:
+            async with session.get(url, timeout=timeout) as res:
+                if res.status == 200:
+                    owned = await res.json(content_type=None)
+                    results.append({"id": pass_id, "label": label, "owned": bool(owned), "unknown": False})
+                else:
+                    results.append({"id": pass_id, "label": label, "owned": False, "unknown": True})
+        except Exception:
+            results.append({"id": pass_id, "label": label, "owned": False, "unknown": True})
+        await asyncio.sleep(0.08)
+
+    return results
+
+
+def format_gamepass_results(results):
+    if not results:
+        return "No gamepasses configured."
+    lines = []
+    for item in results:
+        if item.get("unknown"):
+            icon = "⚠️"
+            suffix = "unknown"
+        elif item.get("owned"):
+            icon = "✅"
+            suffix = "owned"
+        else:
+            icon = "❌"
+            suffix = "not owned"
+        lines.append(f"{icon} **{item['label']}** — {suffix}")
+    return "\n".join(lines)[:1024]
+
+
+async def build_staff_info_embed(ticket_row):
+    ticket_id = str(ticket_row[0])
+    opener_id = int(ticket_row[3])
+    app = db_get_ticket_application(ticket_id)
+    embed = discord.Embed(
+        title="MCWV Application Staff Info",
+        color=discord.Color.from_rgb(96, 165, 250),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Applicant", value=f"<@{opener_id}>\n`{opener_id}`", inline=True)
+    embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
+
+    if not app:
+        embed.description = "No submitted application answers found yet."
+        return embed
+
+    roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at = app
+    embed.add_field(name="Roblox", value=f"**{roblox_username}**\n`{roblox_id}`", inline=True)
+    embed.add_field(name="AFK 24/7 on Windows?", value=str(afk_247 or "—")[:1024], inline=False)
+    embed.add_field(name="Discord + in-game active hours", value=str(activity or "—")[:1024], inline=False)
+    embed.add_field(name="Liquid gems per war", value=str(liquid_gems or "—")[:1024], inline=False)
+    embed.add_field(name="Why should we accept you?", value=str(why_accept or "—")[:1024], inline=False)
+
+    gamepasses = await check_ps99_gamepasses(str(roblox_id))
+    embed.add_field(name="Gamepass check", value=format_gamepass_results(gamepasses), inline=False)
+    embed.set_footer(text="Only staff can see this panel.")
     return embed
 
 
@@ -5267,7 +5344,7 @@ class TicketWelcomeView(discord.ui.View):
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if interaction.user.id != int(row[3]):
             return await interaction.response.send_message("Only the ticket opener can submit this application.", ephemeral=True)
-        await interaction.response.send_modal(ApplicationModal(row[0], interaction.user))
+        await interaction.response.send_modal(ApplicationModal(interaction.user))
 
 
 class RejectModal(discord.ui.Modal, title="Reject Application"):
@@ -5331,6 +5408,16 @@ class ApplicationReviewView(discord.ui.View):
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         await accept_application_ticket(interaction, row)
+
+    @discord.ui.button(label="Staff Info", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_staff_info")
+    async def staff_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.staff_ok(interaction):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        embed = await build_staff_info_embed(row)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
