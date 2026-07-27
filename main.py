@@ -4593,115 +4593,184 @@ def officer_guide_embed(section="overview"):
 
     if section == "overview":
         embed.description = (
-            "Welcome to the officer tools. This guide gives you the short version of what I do and how to use me safely.\n\n"
-            "Use the menu below to jump between topics. Most tools are also mirrored on the MCWV Hub website."
+            "A quick officer tutorial for MCWV-BOT. This guide only covers tools officers can use — "
+            "owner-only website actions are intentionally left out."
         )
         embed.add_field(
-            name="What I help with",
+            name="How to use this guide",
             value=(
-                "• Tracking Roblox links and alts\n"
-                "• Checking presence and in-game status\n"
-                "• War/Battle HQ data collection\n"
-                "• Broadcasts by DM or ticket\n"
-                "• Giveaways and invite events\n"
-                "• Admin logs and safe officer actions"
+                "Use the dropdown below to jump between command groups.\n"
+                "Most commands are slash commands. Some are public info commands, but the management tools require officer permissions."
             ),
             inline=False,
         )
         embed.add_field(
-            name="Golden rule",
-            value="If a command affects members, preview/check first. If unsure, ask the owner before running destructive actions.",
+            name="Safe officer workflow",
+            value=(
+                "1. Check info first.\n"
+                "2. Preview broadcasts before sending.\n"
+                "3. Use ticket delivery for individual nudges.\n"
+                "4. Be careful with cleanup/unlink-style tools."
+            ),
             inline=False,
         )
+
     elif section == "war":
-        embed.description = "War tools keep MCWV's live tracking and Battle HQ useful."
+        embed.description = "War, leaderboard, profile, and status commands."
         embed.add_field(
-            name="Key commands / tools",
+            name="War commands",
             value=(
-                "• `/guide` — this help menu\n"
-                "• Hub Battle HQ — live clan race, targets, threats, snapshots\n"
-                "• Hub Leaderboard — member points, profile cards, PPH, history\n"
-                "• Admin → Sync War — force a fresh war sync if data looks stale"
+                "`/warinfo` — shows current PS99 war details.\n"
+                "`/leaderboard` — posts the current MCWV contribution leaderboard.\n"
+                "`/mystats <roblox_username>` — shows one Roblox user's war contribution stats.\n"
+                "`/profile <roblox_username>` — opens a linked user's profile dashboard.\n"
+                "`/clanstats` — shows MCWV clan overview, level, gems, members, and battle history.\n"
+                "`/compare <member1> <member2>` — compares two linked members in the current war."
             ),
             inline=False,
         )
         embed.add_field(
-            name="What to watch",
+            name="Presence/status commands",
             value=(
-                "• Current rank and battle points\n"
-                "• Next target and closest threat\n"
-                "• Points last hour\n"
-                "• Members with 0 points\n"
-                "• Snapshot history warming up after war start"
+                "`/status <member>` — checks a linked member's Roblox presence.\n"
+                "`/offlinelist` — lists tracked users currently offline and how long.\n"
+                "`/toggleoffline` — turns offline ping alerts on/off.\n"
+                "`/testreminder` — sends an offline reminder immediately for testing."
             ),
             inline=False,
         )
+
+    elif section == "members":
+        embed.description = "Commands for Roblox links, alts, profiles, and ticket acceptance."
+        embed.add_field(
+            name="Linking and roster commands",
+            value=(
+                "`/add <member> <roblox_username>` — links a Discord member to a Roblox account.\n"
+                "`/list` — shows all tracked users.\n"
+                "`/refreshprofile <roblox_id>` — clears/refreshes cached profile data for a Roblox user.\n"
+                "`/accept <member>` — accepts an applicant in a ticket and saves their ticket channel.\n"
+                "`/memberedit <member> <roblox_username> [alts] [channel]` — fixes main Roblox username, alts, and optional ticket channel."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Alt commands",
+            value=(
+                "`/addalt <member> <roblox_username>` — adds an alt Roblox account to a member.\n"
+                "`/listalts <member>` — lists a member's main and alt Roblox accounts.\n"
+                "`/removealt <member> <alt>` — removes one alt from a member."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Cleanup command",
+            value="`/cleanup <target> [reason]` — removes clan role/unlinks tracking for a target. Use carefully and only when you're sure.",
+            inline=False,
+        )
+
     elif section == "broadcast":
-        embed.description = "Broadcast tools let staff message the right members without pinging everyone."
+        embed.description = "Broadcast commands and ticket-delivery tools."
         embed.add_field(
-            name="Main command",
-            value="`/broadcast` lets you target members by points, rank group, role, or custom users.",
+            name="Broadcast commands",
+            value=(
+                "`/broadcast` — sends a staff broadcast by DM or saved ticket. Supports filters like everyone, below/above points, zero points, top/bottom N, role, custom users.\n"
+                "`/broadcast_ticket_sync [category] [scan_all] [send_menus] [name_fallback]` — scans tickets and saves ticket channels for linked members.\n"
+                "`/broadcast_ticket_link <member> [channel]` — manually saves one member's ticket channel."
+            ),
             inline=False,
         )
         embed.add_field(
-            name="Useful variables",
+            name="Broadcast variables",
             value=(
-                "`{ping}` — mentions the user\n"
+                "`{ping}` / `{mention}` — mention the user\n"
                 "`{username}` — Roblox username\n"
                 "`{points}` — current war points\n"
                 "`{pph}` — points gained in the last hour\n"
                 "`{change5m}` — points gained in the last 5 minutes\n"
                 "`{rank}` — current broadcast rank\n"
-                "`{ticket}` — saved ticket channel mention"
+                "`{ticket}` — saved ticket channel mention\n"
+                "`{roblox_id}`, `{discord_id}`, `{role}` — IDs/role metadata"
             ),
             inline=False,
         )
         embed.add_field(
-            name="Safe workflow",
-            value="Preview first, check matched recipients, then send. For ticket delivery, run ticket sync first.",
+            name="Recommended process",
+            value="Preview first, check matched/missing recipients, then send. For ticket delivery, run `/broadcast_ticket_sync` first.",
             inline=False,
         )
-    elif section == "tickets":
-        embed.description = "Ticket links are used so broadcasts can be delivered into member tickets."
+
+    elif section == "events":
+        embed.description = "Giveaway and invite-event commands."
         embed.add_field(
-            name="Commands",
+            name="Giveaway commands",
             value=(
-                "• `/broadcast_ticket_sync` — scans ticket channels and saves matches\n"
-                "• `/broadcast_ticket_link member:@user` — manually link the current ticket\n"
-                "• `/broadcast_ticket_link member:@user channel:#ticket` — manually link another ticket"
+                "`/giveaway_start` — starts a giveaway with prize, winners, invite requirement, and optional image.\n"
+                "`/giveaway_edit` — edits the active giveaway settings.\n"
+                "`/giveaway_end` — ends the active giveaway and picks winners."
             ),
             inline=False,
         )
         embed.add_field(
-            name="How sync works",
+            name="Invite event commands",
             value=(
-                "I look for the clan member in ticket overwrites, ignoring staff roles and bots. "
-                "If I cannot tell who owns a ticket, I can send a resolver menu inside that ticket."
+                "`/host_invite_event <duration_hours>` — starts an invite competition.\n"
+                "`/end_invite_event` — ends the invite event.\n"
+                "`/inviteleaderboard` — shows the invite leaderboard.\n"
+                "`/invite_snapshot_refresh` — refreshes invite snapshots.\n"
+                "`/invite_debug` — shows invite system debug info.\n"
+                "`/invite_simulate <amount>` — simulates invite progress for testing.\n"
+                "`/invite_full_test` — runs a full invite-system test."
             ),
             inline=False,
         )
+
+    elif section == "settings":
+        embed.description = "Settings, reminders, and diagnostics commands."
+        embed.add_field(
+            name="Settings/reminder commands",
+            value=(
+                "`/settings` — shows current bot settings.\n"
+                "`/setreminderinterval <minutes>` — changes offline reminder interval.\n"
+                "`/setreminderchannel <channel>` — sets where offline reminders are sent.\n"
+                "`/clanwar` — toggles clan war tracking on/off."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Diagnostics commands",
+            value=(
+                "`/ping` — quick bot response test.\n"
+                "`/dbtest` — checks DB/user tracking health.\n"
+                "`/statstest` — shows a sample tracked user row.\n"
+                "`/guide` — opens this officer guide."
+            ),
+            inline=False,
+        )
+
     elif section == "safety":
-        embed.description = "Important safety notes for officers."
+        embed.description = "Officer safety notes."
         embed.add_field(
             name="Do",
             value=(
-                "• Preview broadcasts before sending\n"
-                "• Use ticket delivery for individual nudges\n"
-                "• Keep Roblox links tidy\n"
-                "• Check Admin Logs if something looks wrong"
+                "• Preview broadcasts before sending.\n"
+                "• Prefer ticket delivery for individual reminders.\n"
+                "• Double-check member links before editing.\n"
+                "• Use `/broadcast_ticket_link` for one-off ticket fixes.\n"
+                "• Ask another officer if you're unsure."
             ),
             inline=False,
         )
         embed.add_field(
-            name="Do not",
+            name="Avoid",
             value=(
-                "• Spam broad audiences\n"
-                "• Remove/unlink accounts unless you are certain\n"
-                "• Use owner-only tools without permission\n"
-                "• Share admin API keys or bot tokens"
+                "• Spamming broad audiences.\n"
+                "• Running cleanup unless you are certain.\n"
+                "• Sharing bot/API secrets.\n"
+                "• Guessing ticket owners when the resolver menu can confirm them."
             ),
             inline=False,
         )
+
     else:
         embed.description = "Unknown guide section. Pick a topic from the menu below."
 
@@ -4716,10 +4785,12 @@ class OfficerGuideSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label="Overview", value="overview", emoji="🏠", description="What the bot does"),
-                discord.SelectOption(label="War Tracking", value="war", emoji="⚔️", description="Battle HQ and leaderboard tracking"),
-                discord.SelectOption(label="Broadcasts", value="broadcast", emoji="📢", description="DM/ticket broadcasts and variables"),
-                discord.SelectOption(label="Tickets", value="tickets", emoji="🎫", description="Ticket sync and manual linking"),
+                discord.SelectOption(label="Overview", value="overview", emoji="🏠", description="How to use the officer guide"),
+                discord.SelectOption(label="War + Stats", value="war", emoji="⚔️", description="War info, leaderboard, profiles, comparisons"),
+                discord.SelectOption(label="Members + Links", value="members", emoji="👥", description="Roblox links, alts, accept, cleanup"),
+                discord.SelectOption(label="Broadcasts + Tickets", value="broadcast", emoji="📢", description="Broadcasts, variables, ticket sync/link"),
+                discord.SelectOption(label="Giveaways + Invites", value="events", emoji="🎉", description="Giveaway and invite event commands"),
+                discord.SelectOption(label="Settings + Tests", value="settings", emoji="⚙️", description="Settings, reminders, diagnostics"),
                 discord.SelectOption(label="Safety", value="safety", emoji="🛡️", description="Officer safety rules"),
             ],
         )
