@@ -620,6 +620,44 @@ def admin_ticket_detail(ticket_id):
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/admin/tickets/panel/send", methods=["POST"])
+@require_admin_api_key
+def admin_ticket_panel_send():
+    body = request.get_json(silent=True) or {}
+    try:
+        channel_id = body.get("channel_id") or body.get("channelId") or MCWV_TICKET_PANEL_CHANNEL_ID
+        title = str(body.get("title") or "MCWV Applications")[:256]
+        description = str(body.get("description") or "Ready to apply for MCWV? Open a private application ticket below.")[:4000]
+        button_label = str(body.get("button_label") or body.get("buttonLabel") or "Open Application")[:80]
+        future = _run_on_bot_loop(_admin_send_ticket_panel(channel_id, title, description, button_label))
+        payload = future.result(timeout=15)
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+async def _admin_send_ticket_panel(channel_id, title, description, button_label):
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        channel = await bot.fetch_channel(int(channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        raise ValueError("Panel channel must be a text channel")
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.from_rgb(52, 211, 153),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Before opening",
+        value="Be ready to answer the application questions and provide non-cropped screenshots once your ticket opens.",
+        inline=False,
+    )
+    embed.set_footer(text="MCWV Applications")
+    message = await channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
+    return {"success": True, "channel_id": str(channel.id), "message_id": str(message.id)}
+
+
 @app.route("/admin/tickets/accept", methods=["POST"])
 @require_admin_api_key
 def admin_ticket_accept():
