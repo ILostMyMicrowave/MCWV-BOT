@@ -45,6 +45,7 @@ ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
 HUB_BASE_URL = (os.environ.get("MCWV_HUB_URL") or os.environ.get("HUB_URL") or "").rstrip("/")
 WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "")
 WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "1") or "1"))
+OFFICER_GUIDE_ROLE_ID = int(os.environ.get("OFFICER_GUIDE_ROLE_ID", "1501986357516701827"))
 STARTED_AT = time.time()
 LAST_HEARTBEAT = datetime.now(timezone.utc).isoformat()
 COMMANDS_EXECUTED = 0
@@ -4571,6 +4572,180 @@ async def send_ticket_resolve_menu(channel):
     except Exception as exc:
         print(f"[ticket sync] failed to send resolver in #{getattr(channel, 'name', channel.id)}: {exc}")
         return False
+
+
+
+def has_officer_guide_permission(member):
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild and member.guild.owner_id == member.id:
+        return True
+    return any(getattr(role, "id", 0) == OFFICER_GUIDE_ROLE_ID for role in getattr(member, "roles", []))
+
+
+def officer_guide_embed(section="overview"):
+    section = str(section or "overview")
+    embed = discord.Embed(
+        title="MCWV Officer Guide",
+        color=discord.Color.from_rgb(52, 211, 153),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if section == "overview":
+        embed.description = (
+            "Welcome to the officer tools. This guide gives you the short version of what I do and how to use me safely.\n\n"
+            "Use the menu below to jump between topics. Most tools are also mirrored on the MCWV Hub website."
+        )
+        embed.add_field(
+            name="What I help with",
+            value=(
+                "• Tracking Roblox links and alts\n"
+                "• Checking presence and in-game status\n"
+                "• War/Battle HQ data collection\n"
+                "• Broadcasts by DM or ticket\n"
+                "• Giveaways and invite events\n"
+                "• Admin logs and safe officer actions"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Golden rule",
+            value="If a command affects members, preview/check first. If unsure, ask the owner before running destructive actions.",
+            inline=False,
+        )
+    elif section == "war":
+        embed.description = "War tools keep MCWV's live tracking and Battle HQ useful."
+        embed.add_field(
+            name="Key commands / tools",
+            value=(
+                "• `/guide` — this help menu\n"
+                "• Hub Battle HQ — live clan race, targets, threats, snapshots\n"
+                "• Hub Leaderboard — member points, profile cards, PPH, history\n"
+                "• Admin → Sync War — force a fresh war sync if data looks stale"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="What to watch",
+            value=(
+                "• Current rank and battle points\n"
+                "• Next target and closest threat\n"
+                "• Points last hour\n"
+                "• Members with 0 points\n"
+                "• Snapshot history warming up after war start"
+            ),
+            inline=False,
+        )
+    elif section == "broadcast":
+        embed.description = "Broadcast tools let staff message the right members without pinging everyone."
+        embed.add_field(
+            name="Main command",
+            value="`/broadcast` lets you target members by points, rank group, role, or custom users.",
+            inline=False,
+        )
+        embed.add_field(
+            name="Useful variables",
+            value=(
+                "`{ping}` — mentions the user\n"
+                "`{username}` — Roblox username\n"
+                "`{points}` — current war points\n"
+                "`{pph}` — points gained in the last hour\n"
+                "`{change5m}` — points gained in the last 5 minutes\n"
+                "`{rank}` — current broadcast rank\n"
+                "`{ticket}` — saved ticket channel mention"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Safe workflow",
+            value="Preview first, check matched recipients, then send. For ticket delivery, run ticket sync first.",
+            inline=False,
+        )
+    elif section == "tickets":
+        embed.description = "Ticket links are used so broadcasts can be delivered into member tickets."
+        embed.add_field(
+            name="Commands",
+            value=(
+                "• `/broadcast_ticket_sync` — scans ticket channels and saves matches\n"
+                "• `/broadcast_ticket_link member:@user` — manually link the current ticket\n"
+                "• `/broadcast_ticket_link member:@user channel:#ticket` — manually link another ticket"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="How sync works",
+            value=(
+                "I look for the clan member in ticket overwrites, ignoring staff roles and bots. "
+                "If I cannot tell who owns a ticket, I can send a resolver menu inside that ticket."
+            ),
+            inline=False,
+        )
+    elif section == "safety":
+        embed.description = "Important safety notes for officers."
+        embed.add_field(
+            name="Do",
+            value=(
+                "• Preview broadcasts before sending\n"
+                "• Use ticket delivery for individual nudges\n"
+                "• Keep Roblox links tidy\n"
+                "• Check Admin Logs if something looks wrong"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Do not",
+            value=(
+                "• Spam broad audiences\n"
+                "• Remove/unlink accounts unless you are certain\n"
+                "• Use owner-only tools without permission\n"
+                "• Share admin API keys or bot tokens"
+            ),
+            inline=False,
+        )
+    else:
+        embed.description = "Unknown guide section. Pick a topic from the menu below."
+
+    embed.set_footer(text="MCWV-BOT Officer Guide • Use /guide anytime")
+    return embed
+
+
+class OfficerGuideSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Choose a guide topic",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Overview", value="overview", emoji="🏠", description="What the bot does"),
+                discord.SelectOption(label="War Tracking", value="war", emoji="⚔️", description="Battle HQ and leaderboard tracking"),
+                discord.SelectOption(label="Broadcasts", value="broadcast", emoji="📢", description="DM/ticket broadcasts and variables"),
+                discord.SelectOption(label="Tickets", value="tickets", emoji="🎫", description="Ticket sync and manual linking"),
+                discord.SelectOption(label="Safety", value="safety", emoji="🛡️", description="Officer safety rules"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not has_officer_guide_permission(interaction.user):
+            return await interaction.response.send_message("❌ You do not have permission to use the officer guide.", ephemeral=True)
+        await interaction.response.edit_message(embed=officer_guide_embed(self.values[0]), view=self.view)
+
+
+class OfficerGuideView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=15 * 60)
+        self.add_item(OfficerGuideSelect())
+
+
+@bot.tree.command(name="guide", description="Officer tutorial for MCWV-BOT and Hub tools", guild=guild_obj)
+async def guide(interaction: discord.Interaction):
+    if not has_officer_guide_permission(interaction.user):
+        return await interaction.response.send_message("❌ This guide is for officers only.", ephemeral=True)
+
+    await interaction.response.send_message(
+        embed=officer_guide_embed("overview"),
+        view=OfficerGuideView(),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="broadcast_ticket_link", description="Save a member's broadcast ticket channel", guild=guild_obj)
