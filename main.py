@@ -505,7 +505,7 @@ def admin_status():
             "trackedPlayers": _tracked_players(),
             "activeGiveaway": bool(active_giveaway and active_giveaway.get("active")),
             "activeInviteEvent": bool(active_invite and active_invite.get("active")),
-            "currentWar": globals().get("CLAN_NAME", "MCWV"),
+            "currentWar": globals().get("PS99_CURRENT_WAR_NAME") if globals().get("ps99_war_active") else None,
         },
         "bot": {
             **summary,
@@ -7871,12 +7871,13 @@ async def reminder_loop():
 # ---------------- PS99 WAR POLL ----------------
 ps99_first_check = True
 ps99_war_active = False
+PS99_CURRENT_WAR_NAME = None
 
 ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
 
 @tasks.loop(minutes=20)
 async def war_poll_loop():
-    global bot_enabled, ps99_war_active, ps99_first_check, session
+    global bot_enabled, ps99_war_active, ps99_first_check, PS99_CURRENT_WAR_NAME, session
 
     try:
         if session is None or session.closed:
@@ -7900,6 +7901,7 @@ async def war_poll_loop():
         print("📦 War API response:", data)
 
         config = data.get("data", {}).get("configData", {})
+        PS99_CURRENT_WAR_NAME = config.get("Title") or config.get("configName") or data.get("data", {}).get("configName")
         start = config.get("StartTime")
         finish = config.get("FinishTime")
         now = datetime.now(timezone.utc).timestamp()
