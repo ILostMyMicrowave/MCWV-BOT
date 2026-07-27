@@ -5596,65 +5596,107 @@ async def accept_application_ticket(interaction, ticket_row):
         return await interaction.response.send_message("❌ No submitted application found yet.", ephemeral=True)
     roblox_name, roblox_id = str(app[0]), str(app[1])
 
-    ok, db_msg = db_add(roblox_id, applicant.id, roblox_name)
-    if not ok:
-        return await interaction.response.send_message(f"❌ Could not link Roblox account: {db_msg}", ephemeral=True)
+    actions = []
+    errors = []
 
-    db_set_ticket_channel(applicant.id, channel.id)
+    ok, db_msg = db_add(roblox_id, applicant.id, roblox_name)
+    if ok:
+        actions.append("Roblox account linked")
+    else:
+        errors.append(f"Could not link Roblox account: {db_msg}")
+
+    if ok:
+        if db_set_ticket_channel(applicant.id, channel.id):
+            actions.append("Ticket saved for broadcasts")
+        else:
+            errors.append("Could not save ticket channel for broadcasts")
 
     role = guild.get_role(MCWV_TICKET_MEMBER_ROLE_ID) if guild else None
-    if role:
+    if role and ok:
         try:
             await applicant.add_roles(role, reason=f"MCWV application accepted by {interaction.user}")
+            actions.append(f"Member role added: {role.name}")
         except Exception as exc:
-            await channel.send(f"⚠️ Accepted, but I could not assign member role: `{exc}`")
+            errors.append(f"Could not assign member role: {exc}")
+    elif ok:
+        errors.append("Member role not found")
 
-    db_update_ticket_status(
-        ticket_row[0],
-        "accepted",
-        interaction.user.id,
-        accepted_at=datetime.now(timezone.utc),
-        accepted_by=interaction.user.id,
-    )
+    if ok:
+        db_update_ticket_status(
+            ticket_row[0],
+            "accepted",
+            interaction.user.id,
+            accepted_at=datetime.now(timezone.utc),
+            accepted_by=interaction.user.id,
+        )
+        actions.append("Ticket marked accepted")
+        actions.append("Website signup is ready")
 
-    embed = discord.Embed(
-        title="Accepted into MCWV",
-        description=f"Welcome to **MCWV**, {applicant.mention}!\nRoblox account linked as **{roblox_name}**. This ticket will stay open for next steps.",
-        color=discord.Color.green(),
+    status_embed = discord.Embed(
+        title="Application Accepted" if ok else "Application Accept Failed",
+        description=(
+            f"Applicant: {applicant.mention}\n"
+            f"Roblox: **{roblox_name}** (`{roblox_id}`)\n"
+            f"Accepted by: {interaction.user.mention}"
+        ),
+        color=discord.Color.green() if ok else discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
-    await channel.send(embed=embed)
-    await log_ticket_event(guild, embed)
-    await interaction.response.send_message("✅ Applicant accepted, linked, ticket saved, and role assigned.", ephemeral=True)
-
-
-class ScreenshotUploadedView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="I've uploaded my screenshots", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_screenshots_uploaded")
-    async def uploaded_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_channel(interaction.channel.id)
-        if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        if interaction.user.id != int(row[3]):
-            return await interaction.response.send_message("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
-
-        staff_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS))
-        db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
-
-        await interaction.response.send_message("✅ Thank you — staff have been notified.", ephemeral=True)
-        await interaction.channel.send(
-            f"✅ Thanks {interaction.user.mention}! {staff_mentions} will review your application soon.",
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+    status_embed.add_field(
+        name="Completed",
+        value="\n".join(f"✅ {item}" for item in actions) or "—",
+        inline=False,
+    )
+    if errors:
+        status_embed.add_field(
+            name="Needs attention",
+            value="\n".join(f"⚠️ {item}" for item in errors)[:1024],
+            inline=False,
         )
+    status_embed.add_field(
+        name="Hub Profile",
+        value=f"https://mcwv-hub.vercel.app/profile/{roblox_id}",
+        inline=False,
+    )
+    status_embed.add_field(
+        name="Hub Signup",
+        value="https://mcwv-hub.vercel.app/signup",
+        inline=False,
+    )
+    status_embed.set_footer(text="Ticket stays open for next steps")
 
+    await channel.send(embed=status_embed)
+    await log_ticket_event(guild, status_embed)
+
+    if ok:
         try:
-            for child in self.children:
-                child.disabled = True
-            await interaction.message.edit(view=self)
+            dm_embed = discord.Embed(
+                title="Welcome to MCWV!",
+                description=(
+                    f"You have been accepted into **MCWV**, {applicant.mention}!\n\n"
+                    f"Your Roblox account has been linked as **{roblox_name}**.\n"
+                    "You can now create your MCWV Hub login using the link below."
+                ),
+                color=discord.Color.green(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            dm_embed.add_field(name="Create your Hub account", value="https://mcwv-hub.vercel.app/signup", inline=False)
+            dm_embed.set_footer(text="Your ticket will stay open for next steps.")
+            await applicant.send(embed=dm_embed)
+            actions.append("Applicant DM sent")
         except Exception:
-            pass
+            await channel.send("⚠️ I could not DM the applicant their Hub signup link. They may have DMs disabled.")
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            "✅ Applicant accepted and saved." if ok else "❌ Accept failed. Check the ticket for details.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "✅ Applicant accepted and saved." if ok else "❌ Accept failed. Check the ticket for details.",
+            ephemeral=True,
+        )
 
 
 class ApplicationModal(discord.ui.Modal):
@@ -5828,6 +5870,47 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             print("ticket delete error:", exc)
 
 
+class AcceptConfirmView(discord.ui.View):
+    def __init__(self, ticket_id, requester_id):
+        super().__init__(timeout=60)
+        self.ticket_id = ticket_id
+        self.requester_id = int(requester_id)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the officer who clicked Accept can confirm this.", ephemeral=True)
+            return False
+        if not has_mcwv_ticket_staff_permission(interaction.user):
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, accept applicant", style=discord.ButtonStyle.success)
+    async def confirm_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        if str(row[0]) != str(self.ticket_id):
+            return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
+
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        await accept_application_ticket(interaction, row)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Accept cancelled.", view=self)
+        self.stop()
+
+
 class ApplicationReviewView(discord.ui.View):
     def __init__(self, ticket_id):
         super().__init__(timeout=None)
@@ -5843,7 +5926,14 @@ class ApplicationReviewView(discord.ui.View):
         row = db_get_ticket_by_channel(interaction.channel.id)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        await accept_application_ticket(interaction, row)
+        if str(row[6] or "").lower() == "accepted":
+            return await interaction.response.send_message("This application is already accepted.", ephemeral=True)
+
+        await interaction.response.send_message(
+            "⚠️ Are you sure you want to accept this applicant? This will link their Roblox account, save this ticket for broadcasts, and give the member role.",
+            view=AcceptConfirmView(row[0], interaction.user.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Staff Info", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_staff_info")
     async def staff_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
