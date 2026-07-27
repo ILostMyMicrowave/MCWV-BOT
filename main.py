@@ -8113,6 +8113,13 @@ def start_bot_loops():
     if not war_poll_loop.is_running():
         war_poll_loop.start()
 
+    if HUB_BASE_URL and not hub_war_collect_loop.is_running():
+        hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
+        hub_war_collect_loop.start()
+        print(f"✅ Hub war collector loop started ({WAR_COLLECT_INTERVAL_MINUTES}m) -> {HUB_BASE_URL}")
+    elif not HUB_BASE_URL:
+        print("⚠️ Hub war collector loop not started: HUB_BASE_URL is empty")
+
     if not clan_leave_loop.is_running():
         clan_leave_loop.start()
 
