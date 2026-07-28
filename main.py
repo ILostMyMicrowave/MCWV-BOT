@@ -2738,6 +2738,13 @@ def sanitize_ticket_settings(raw):
     messages["welcomeDescription"] = str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"])[:4000]
     settings["messages"] = messages
 
+    raw_colors = settings.get("embedColors", {}) if isinstance(settings.get("embedColors"), dict) else {}
+    default_colors = DEFAULT_MCWV_TICKET_SETTINGS["embedColors"]
+    embed_colors = {}
+    for key, default_value in default_colors.items():
+        embed_colors[key] = parse_hex_color(raw_colors.get(key, default_value), default_value)
+    settings["embedColors"] = embed_colors
+
     questions = settings.get("questions") if isinstance(settings.get("questions"), list) else []
     defaults = DEFAULT_MCWV_TICKET_SETTINGS["questions"]
     cleaned = []
@@ -2779,6 +2786,15 @@ def save_mcwv_ticket_settings(settings):
     cleaned = sanitize_ticket_settings(settings)
     _safe_call("db_set_setting", None, "mcwv_ticket_settings", json.dumps(cleaned))
     return cleaned
+
+
+def get_ticket_embed_color(key, default=0x34D399):
+    try:
+        settings = get_mcwv_ticket_settings()
+        colors = settings.get("embedColors", {}) if isinstance(settings.get("embedColors"), dict) else {}
+        return parse_hex_color(colors.get(key, default), default)
+    except Exception:
+        return int(default)
 
 
 def db_ensure_mcwv_ticket_tables():
@@ -4390,6 +4406,15 @@ DEFAULT_MCWV_TICKET_SETTINGS = {
             "**Make sure the screenshots are NON-CROPPED!**"
         ),
     },
+    "embedColors": {
+        "banner": 0x34D399,
+        "ticketInstructions": 0x34D399,
+        "review": 0x34D399,
+        "staffInfo": 0x60A5FA,
+        "accepted": 0x22C55E,
+        "closed": 0x22C55E,
+        "reminder": 0xF59E0B,
+    },
     "questions": [
         {"key": "roblox_username", "label": "Roblox username", "placeholder": "Your Roblox username", "style": "short", "required": True, "maxLength": 32},
         {"key": "afk_247", "label": "Can you AFK 24/7 on Windows?", "placeholder": "Yes/No + details", "style": "paragraph", "required": True, "maxLength": 500},
@@ -5584,7 +5609,7 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
         description=(
             f"{applicant.mention} submitted an application. Staff can use **Staff Info** for answers, checks, and gamepass verification."
         ),
-        color=discord.Color.from_rgb(52, 211, 153),
+        color=discord.Color(get_ticket_embed_color("review", 0x34D399)),
         timestamp=datetime.now(timezone.utc),
     )
     if avatar_url:
@@ -6074,7 +6099,7 @@ async def build_staff_info_embed(ticket_row):
     app = db_get_ticket_application(ticket_id)
     embed = discord.Embed(
         title="MCWV Application Staff Info",
-        color=discord.Color.from_rgb(96, 165, 250),
+        color=discord.Color(get_ticket_embed_color("staffInfo", 0x60A5FA)),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Applicant", value=f"<@{opener_id}>\n`{opener_id}`", inline=True)
@@ -6115,7 +6140,7 @@ async def send_ticket_application_banner(channel, mention=None):
     try:
         if MCWV_TICKET_BANNER_PATH and os.path.exists(MCWV_TICKET_BANNER_PATH):
             filename = "clan_application_banner.png"
-            embed = discord.Embed(color=discord.Color.from_rgb(52, 211, 153))
+            embed = discord.Embed(color=discord.Color(get_ticket_embed_color("banner", 0x34D399)))
             embed.set_image(url=f"attachment://{filename}")
             await channel.send(
                 content=mention or None,
@@ -6280,7 +6305,7 @@ async def accept_application_ticket(interaction, ticket_row):
             f"Roblox: **{roblox_name}** (`{roblox_id}`)\n"
             f"Accepted by: {interaction.user.mention}"
         ),
-        color=discord.Color.green() if ok else discord.Color.red(),
+        color=discord.Color(get_ticket_embed_color("accepted", 0x22C55E)) if ok else discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
     status_embed.add_field(
@@ -6486,7 +6511,7 @@ class ApplicationModal(discord.ui.Modal):
         screenshot_embed = discord.Embed(
             title=str(messages.get("welcomeTitle") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeTitle"]),
             description=welcome_description,
-            color=discord.Color.from_rgb(52, 211, 153),
+            color=discord.Color(get_ticket_embed_color("ticketInstructions", 0x34D399)),
             timestamp=datetime.now(timezone.utc),
         )
         screenshot_embed.set_footer(text="MCWV Applications")
@@ -6608,7 +6633,7 @@ def transcript_file(transcript_text, ticket_id):
 def ticket_closed_embed(ticket_id, opener_id, closer_id, opened_at, reason, for_user=False):
     embed = discord.Embed(
         title="Ticket Closed",
-        color=discord.Color.green() if not for_user else discord.Color.blurple(),
+        color=discord.Color(get_ticket_embed_color("closed", 0x22C55E)) if not for_user else discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="🎫 Ticket ID", value=str(ticket_id), inline=True)
@@ -10257,7 +10282,7 @@ async def ticket_screenshot_reminder_loop():
                     "Please upload your **non-cropped** screenshots for your MCWV application, then press "
                     "**Screenshots uploaded** so staff know your application is ready."
                 ),
-                color=discord.Color.orange(),
+                color=discord.Color(get_ticket_embed_color("reminder", 0xF59E0B)),
                 timestamp=datetime.now(timezone.utc),
             )
             embed.add_field(
