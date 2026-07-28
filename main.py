@@ -10820,109 +10820,158 @@ def rounded_mask(size, radius):
 
 
 async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
-    W, H = 1080, 560
+    # Designed to mirror the reference #placement cards: deep navy glass,
+    # glowing blue border, top-right status pill, large rank transition bar,
+    # and yellow contribution total.
+    S = 2
+    W, H = 1080 * S, 560 * S
     improved = int(new_rank) < int(old_rank)
     diff = abs(int(old_rank) - int(new_rank))
-    accent = (95, 235, 155) if improved else (255, 96, 101)
-    accent_dark = (31, 112, 91) if improved else (128, 56, 80)
-    fonts = _load_card_fonts()
+    accent = (98, 238, 157) if improved else (255, 94, 101)
+    accent_soft = (65, 190, 145) if improved else (180, 70, 102)
+    accent_deep = (16, 88, 84) if improved else (83, 43, 67)
+
+    def sc(value):
+        return int(round(value * S))
+
+    def color(rgb, alpha=255):
+        return (*rgb, alpha)
+
+    fonts = {
+        "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(72)),
+        "pill": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(38)),
+        "rank": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(106)),
+        "label": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", sc(52)),
+        "points": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(58)),
+        "logo": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(30)),
+    }
 
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    card = Image.new("RGBA", (W-70, H-55), (12, 20, 61, 255))
-    draw = ImageDraw.Draw(card)
-    cw, ch = card.size
+    card_xy = (sc(34), sc(27), sc(1046), sc(533))
+    cw, ch = card_xy[2] - card_xy[0], card_xy[3] - card_xy[1]
 
-    # background gradient and subtle diagonal shine
+    # Card base gradient.
+    card = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(card)
     for y in range(ch):
-        for x in range(cw):
-            t = (x / cw) * 0.55 + (y / ch) * 0.25
-            r = int(14 + 10 * t)
-            g = int(22 + 15 * t)
-            b = int(68 + 28 * t)
-            card.putpixel((x, y), (r, g, b, 255))
-    glow = Image.new("RGBA", card.size, (0, 0, 0, 0))
+        yy = y / max(ch - 1, 1)
+        for x in range(0, cw, sc(2)):
+            xx = x / max(cw - 1, 1)
+            t = xx * 0.55 + yy * 0.20
+            r = int(10 + 12 * t)
+            g = int(18 + 13 * t)
+            b = int(58 + 28 * t)
+            cd.rectangle((x, y, min(x + sc(2), cw), y + 1), fill=(r, g, b, 255))
+
+    # Diagonal blue panels / light streaks.
+    panel = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(panel)
+    pd.polygon([(sc(410), 0), (sc(540), 0), (sc(365), ch), (sc(235), ch)], fill=(34, 52, 130, 46))
+    pd.polygon([(sc(650), 0), (sc(810), 0), (sc(610), ch), (sc(455), ch)], fill=(28, 48, 118, 34))
+    glow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
-    gd.ellipse((560, -150, 1180, 430), fill=(70, 110, 255, 34))
-    glow = glow.filter(ImageFilter.GaussianBlur(46))
+    gd.ellipse((sc(500), sc(-190), sc(1170), sc(420)), fill=(63, 99, 255, 52))
+    gd.ellipse((sc(-140), sc(230), sc(250), sc(670)), fill=(45, 75, 210, 28))
+    glow = glow.filter(ImageFilter.GaussianBlur(sc(42)))
+    card.alpha_composite(panel)
     card.alpha_composite(glow)
 
-    # central bar
-    bar = (38, 190, cw - 36, 385)
-    draw.rounded_rectangle(bar, radius=34, fill=(31, 44, 115, 210), outline=(65, 84, 174, 80), width=2)
-    # right gradient overlay
-    overlay = Image.new("RGBA", card.size, (0,0,0,0))
-    od = ImageDraw.Draw(overlay)
-    for i in range(520):
-        a = int(30 + (i / 520) * 125)
-        od.line((bar[0]+390+i, bar[1], bar[0]+390+i, bar[3]), fill=(*accent, min(a, 145)))
-    overlay.putalpha(rounded_mask(card.size, 0))
-    card.alpha_composite(overlay)
-    draw = ImageDraw.Draw(card)
+    mask = rounded_mask((cw, ch), sc(54))
+    shaped = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    shaped.paste(card, (0, 0), mask)
 
-    # chevrons
-    chevron = [(420, 190), (545, 287), (420, 385), (515, 385), (640, 287), (515, 190)]
-    draw.polygon(chevron, fill=(*accent, 55))
-    draw.polygon([(515,190),(640,287),(515,385),(610,385),(735,287),(610,190)], fill=(*accent, 35))
+    # Outer glow and border.
+    shadow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle((0, 0, cw - 1, ch - 1), radius=sc(54), fill=(48, 75, 205, 130))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(11)))
+    img.alpha_composite(shadow, (card_xy[0], card_xy[1]))
+    img.alpha_composite(shaped, (card_xy[0], card_xy[1]))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle(card_xy, radius=sc(54), outline=(81, 105, 220, 255), width=sc(3))
+    d.rounded_rectangle((card_xy[0]+sc(5), card_xy[1]+sc(5), card_xy[2]-sc(5), card_xy[3]-sc(5)), radius=sc(49), outline=(255, 255, 255, 38), width=sc(1))
 
-    # logo circle
-    draw.ellipse((32, 28, 154, 150), fill=(22, 30, 84, 235), outline=(76, 106, 205, 255), width=4)
+    ox, oy = card_xy[0], card_xy[1]
+
+    # Logo ring.
+    logo_box = (ox + sc(34), oy + sc(29), ox + sc(154), oy + sc(149))
+    d.ellipse(logo_box, fill=(21, 31, 86, 235), outline=(76, 105, 205, 255), width=sc(4))
+    d.ellipse((logo_box[0]+sc(9), logo_box[1]+sc(9), logo_box[2]-sc(9), logo_box[3]-sc(9)), outline=(33, 54, 125, 255), width=sc(2))
     asset_id = extract_asset_id(icon_value)
     icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
     if icon_bytes:
         try:
-            icon = Image.open(BytesIO(icon_bytes)).convert("RGBA").resize((96, 96), Image.Resampling.LANCZOS)
-            mask = Image.new("L", (96, 96), 0)
-            ImageDraw.Draw(mask).ellipse((0,0,96,96), fill=255)
-            card.paste(icon, (45, 41), mask)
+            icon = Image.open(BytesIO(icon_bytes)).convert("RGBA").resize((sc(94), sc(94)), Image.Resampling.LANCZOS)
+            imask = Image.new("L", icon.size, 0)
+            ImageDraw.Draw(imask).ellipse((0, 0, icon.size[0]-1, icon.size[1]-1), fill=255)
+            img.paste(icon, (ox + sc(47), oy + sc(42)), imask)
         except Exception:
-            draw.text((56, 76), "MCWV", font=fonts["logo"], fill=(172, 82, 255, 255))
+            draw_text_shadow(d, (ox + sc(55), oy + sc(74)), "MCWV", fonts["logo"], (174, 86, 255, 255), offset=(sc(2), sc(2)))
     else:
-        draw.text((56, 76), "MCWV", font=fonts["logo"], fill=(172, 82, 255, 255))
+        draw_text_shadow(d, (ox + sc(55), oy + sc(74)), "MCWV", fonts["logo"], (174, 86, 255, 255), offset=(sc(2), sc(2)))
 
-    # title and pill
-    draw_text_shadow(draw, (205, 67), f"[{CLAN_NAME}]", fonts["title"], (246, 248, 255, 255))
+    # Title.
+    draw_text_shadow(d, (ox + sc(205), oy + sc(61)), f"[{CLAN_NAME}]", fonts["title"], (247, 249, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(4), sc(5)))
+
+    # Status pill.
     pill_text = f"Position {'Increased' if improved else 'Decreased'} by {diff}"
-    pill_w = draw.textbbox((0,0), pill_text, font=fonts["pill"])[2] + 58
-    pill = (cw - pill_w - 36, 40, cw - 36, 104)
-    draw.rounded_rectangle(pill, radius=22, fill=(*accent_dark, 105), outline=(*accent, 145), width=3)
-    draw_text_shadow(draw, (pill[0]+28, pill[1]+11), pill_text, fonts["pill"], (*accent, 255), shadow=(0,0,0,180), offset=(3,3))
+    pill_bbox = d.textbbox((0, 0), pill_text, font=fonts["pill"])
+    pill_w = (pill_bbox[2] - pill_bbox[0]) + sc(56)
+    pill_h = sc(62)
+    pill = (ox + cw - pill_w - sc(36), oy + sc(38), ox + cw - sc(36), oy + sc(38) + pill_h)
+    d.rounded_rectangle(pill, radius=sc(20), fill=(*accent_deep, 150), outline=(*accent, 125), width=sc(3))
+    d.rounded_rectangle((pill[0]+sc(3), pill[1]+sc(3), pill[2]-sc(3), pill[3]-sc(3)), radius=sc(17), outline=(255, 255, 255, 28), width=sc(1))
+    draw_text_shadow(d, (pill[0] + sc(28), pill[1] + sc(8)), pill_text, fonts["pill"], color(accent), shadow=(0, 0, 0, 170), offset=(sc(3), sc(3)))
 
-    # ranks
-    draw_text_shadow(draw, (85, 240), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255))
+    # Rank transition bar.
+    bar = (ox + sc(36), oy + sc(181), ox + cw - sc(36), oy + sc(367))
+    bar_w, bar_h = bar[2] - bar[0], bar[3] - bar[1]
+    bar_layer = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(bar_layer)
+    for x in range(bar_w):
+        t = x / max(bar_w - 1, 1)
+        if t < 0.38:
+            rgb = (31, 44, 115)
+            a = 236
+        else:
+            mix = (t - 0.38) / 0.62
+            rgb = tuple(int((1 - mix) * b + mix * a) for b, a in zip((31, 44, 115), accent_soft))
+            a = int(190 + 22 * mix)
+        bd.line((x, 0, x, bar_h), fill=(*rgb, a))
+    bar_mask = rounded_mask((bar_w, bar_h), sc(34))
+    img.paste(bar_layer, (bar[0], bar[1]), bar_mask)
+    d.rounded_rectangle(bar, radius=sc(34), outline=(72, 91, 180, 72), width=sc(2))
+
+    # Chevrons inside bar.
+    c1 = [(ox+sc(435), bar[1]), (ox+sc(560), oy+sc(274)), (ox+sc(435), bar[3]), (ox+sc(515), bar[3]), (ox+sc(640), oy+sc(274)), (ox+sc(515), bar[1])]
+    c2 = [(ox+sc(515), bar[1]), (ox+sc(640), oy+sc(274)), (ox+sc(515), bar[3]), (ox+sc(595), bar[3]), (ox+sc(720), oy+sc(274)), (ox+sc(595), bar[1])]
+    d.polygon(c1, fill=(*accent, 45))
+    d.polygon(c2, fill=(*accent, 28))
+
+    # Rank numbers.
+    draw_text_shadow(d, (ox + sc(83), oy + sc(233)), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255), shadow=(0, 0, 0, 155), offset=(sc(5), sc(6)))
     new_text = f"#{new_rank}"
-    new_w = draw.textbbox((0,0), new_text, font=fonts["rank"])[2]
-    draw_text_shadow(draw, (cw - 95 - new_w, 240), new_text, fonts["rank"], (*accent, 255))
+    new_bbox = d.textbbox((0, 0), new_text, font=fonts["rank"])
+    new_w = new_bbox[2] - new_bbox[0]
+    draw_text_shadow(d, (ox + cw - sc(95) - new_w, oy + sc(233)), new_text, fonts["rank"], color(accent), shadow=(0, 0, 0, 165), offset=(sc(5), sc(6)))
 
-    # contributions
+    # Contributions bottom line.
     label = "Contributions"
     pts = format_compact_points(points)
-    label_w = draw.textbbox((0,0), label, font=fonts["label"])[2]
-    pts_w = draw.textbbox((0,0), pts, font=fonts["points"])[2]
-    start_x = (cw - label_w - 28 - pts_w) // 2
-    draw_text_shadow(draw, (start_x, 425), label, fonts["label"], (220, 224, 241, 235), shadow=(0,0,0,120), offset=(2,3))
-    draw_text_shadow(draw, (start_x + label_w + 28, 419), pts, fonts["points"], (255, 211, 87, 255), shadow=(0,0,0,155), offset=(3,4))
+    label_bbox = d.textbbox((0, 0), label, font=fonts["label"])
+    pts_bbox = d.textbbox((0, 0), pts, font=fonts["points"])
+    label_w = label_bbox[2] - label_bbox[0]
+    pts_w = pts_bbox[2] - pts_bbox[0]
+    start_x = ox + (cw - label_w - sc(28) - pts_w) // 2
+    draw_text_shadow(d, (start_x, oy + sc(408)), label, fonts["label"], (224, 228, 242, 235), shadow=(0, 0, 0, 120), offset=(sc(2), sc(3)))
+    draw_text_shadow(d, (start_x + label_w + sc(28), oy + sc(401)), pts, fonts["points"], (255, 211, 87, 255), shadow=(0, 0, 0, 160), offset=(sc(3), sc(4)))
 
-    # border/glow
-    mask = rounded_mask(card.size, 54)
-    framed = Image.new("RGBA", card.size, (0,0,0,0))
-    framed.paste(card, (0,0), mask)
-    border = Image.new("RGBA", card.size, (0,0,0,0))
-    bd = ImageDraw.Draw(border)
-    bd.rounded_rectangle((2,2,cw-3,ch-3), radius=54, outline=(79,104,221,255), width=3)
-    bd.rounded_rectangle((8,8,cw-9,ch-9), radius=48, outline=(255,255,255,45), width=1)
-    framed.alpha_composite(border)
-
-    shadow = Image.new("RGBA", card.size, (0,0,0,0))
-    ImageDraw.Draw(shadow).rounded_rectangle((0,0,cw-1,ch-1), radius=54, fill=(38,63,190,160))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
-    img.alpha_composite(shadow, (35,28))
-    img.alpha_composite(framed, (35,25))
-
+    # Downsample for anti-aliased edges/text.
+    img = img.resize((1080, 560), Image.Resampling.LANCZOS)
     out = BytesIO()
     img.save(out, format="PNG")
     out.seek(0)
     return out
-
 
 async def send_placement_alert(snapshot, old_rank):
     channel_id = get_placement_channel_id()
