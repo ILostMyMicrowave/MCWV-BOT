@@ -4387,8 +4387,7 @@ DEFAULT_MCWV_TICKET_SETTINGS = {
             "• Enchants\n"
             "• Game-passes\n"
             "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
-            "**Make sure the screenshots are NON-CROPPED!**\n\n"
-            "After uploading them in this ticket, press **Screenshots uploaded** below."
+            "**Make sure the screenshots are NON-CROPPED!**"
         ),
     },
     "questions": [
@@ -6475,8 +6474,14 @@ class ApplicationModal(discord.ui.Modal):
 
         messages = self.settings.get("messages", DEFAULT_MCWV_TICKET_SETTINGS["messages"])
         welcome_description = str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"])
-        if "uploaded my screenshots" not in welcome_description.lower():
-            welcome_description += "\n\nAfter uploading them in this ticket, press **Screenshots uploaded** below."
+        # The upload confirmation prompt/button is sent separately below, so remove
+        # any old saved copy of this line from the screenshot instructions embed.
+        welcome_description = re.sub(
+            r"\n*After uploading them in this ticket,\s*press\s*\*\*Screenshots uploaded\*\*\s*below\.?\s*",
+            "",
+            welcome_description,
+            flags=re.IGNORECASE,
+        ).strip()
 
         screenshot_embed = discord.Embed(
             title=str(messages.get("welcomeTitle") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeTitle"]),
