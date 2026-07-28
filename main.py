@@ -651,14 +651,15 @@ def admin_ticket_panel_send():
         title = str(body.get("title") or "MCWV Applications")[:256]
         description = str(body.get("description") or "Ready to apply for MCWV? Open a private application ticket below.")[:4000]
         button_label = str(body.get("button_label") or body.get("buttonLabel") or "Open Application")[:80]
-        future = _run_on_bot_loop(_admin_send_ticket_panel(channel_id, title, description, button_label))
+        accent_color = body.get("accent_color") or body.get("accentColor") or body.get("hex_color") or body.get("hexColor")
+        future = _run_on_bot_loop(_admin_send_ticket_panel(channel_id, title, description, button_label, accent_color))
         payload = future.result(timeout=15)
         return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
-async def _admin_send_ticket_panel(channel_id, title, description, button_label):
+async def _admin_send_ticket_panel(channel_id, title, description, button_label, accent_color=None):
     channel = bot.get_channel(int(channel_id))
     if channel is None:
         channel = await bot.fetch_channel(int(channel_id))
@@ -669,16 +670,12 @@ async def _admin_send_ticket_panel(channel_id, title, description, button_label)
     title = title or panel.get("title") or "MCWV Applications"
     description = description or panel.get("description") or "Ready to apply for MCWV? Open a private application ticket below."
     button_label = button_label or panel.get("buttonLabel") or "Open Application"
+    color_value = parse_hex_color(accent_color if accent_color is not None else panel.get("accentColor"), panel.get("accentColor", 0x34D399))
     embed = discord.Embed(
         title=title,
         description=description,
-        color=discord.Color.from_rgb(52, 211, 153),
+        color=discord.Color(color_value),
         timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(
-        name="Before opening",
-        value="Be ready to answer the application questions and provide non-cropped screenshots once your ticket opens.",
-        inline=False,
     )
     embed.set_footer(text="MCWV Applications")
     message = await channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
@@ -6348,7 +6345,8 @@ class MCWVTicketPanelView(discord.ui.View):
     channel="Channel to send the panel in. Defaults to configured panel channel.",
     title="Panel title",
     description="Panel description",
-    button_label="Text on the application button"
+    button_label="Text on the application button",
+    hex_color="Embed colour as a hex value, for example #34D399"
 )
 async def ticket_panel_send(
     interaction: discord.Interaction,
@@ -6356,22 +6354,19 @@ async def ticket_panel_send(
     title: str = "MCWV Applications",
     description: str = "Ready to apply for MCWV? Open a private application ticket below.",
     button_label: str = "Open Application",
+    hex_color: str = None,
 ):
     if not has_mcwv_ticket_staff_permission(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
     target_channel = channel or interaction.guild.get_channel(MCWV_TICKET_PANEL_CHANNEL_ID)
     if not isinstance(target_channel, discord.TextChannel):
         return await interaction.response.send_message("❌ Ticket panel channel is not configured correctly.", ephemeral=True)
+    settings_panel = get_mcwv_ticket_settings().get("panel", {})
     embed = discord.Embed(
         title=str(title or "MCWV Applications")[:256],
         description=str(description or "Ready to apply for MCWV? Open a private application ticket below.")[:4000],
-        color=discord.Color.from_rgb(52, 211, 153),
+        color=discord.Color(parse_hex_color(hex_color, settings_panel.get("accentColor", 0x34D399))),
         timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(
-        name="Before opening",
-        value="Be ready to answer the application questions and provide non-cropped screenshots once your ticket opens.",
-        inline=False,
     )
     embed.set_footer(text="MCWV Applications")
     await target_channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
