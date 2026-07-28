@@ -4641,6 +4641,10 @@ MCWV_TICKET_BANNER_PATH = os.environ.get(
 MCWV_PLACEMENT_CHANNEL_ID = int(os.environ.get("MCWV_PLACEMENT_CHANNEL_ID", "0") or "0")
 MCWV_PLACEMENT_ALERTS_ENABLED_DEFAULT = os.environ.get("MCWV_PLACEMENT_ALERTS_ENABLED", "1") != "0"
 MCWV_PLACEMENT_MIN_SECONDS = max(10, int(os.environ.get("MCWV_PLACEMENT_MIN_SECONDS", "45") or "45"))
+MCWV_PLACEMENT_BG_PATH = os.environ.get(
+    "MCWV_PLACEMENT_BG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "placement_card_bg.webp"),
+)
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
 PS99_IMPORTANT_GAMEPASSES = {
     257811346: "VIP",
@@ -10827,9 +10831,9 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     W, H = 1080 * S, 560 * S
     improved = int(new_rank) < int(old_rank)
     diff = abs(int(old_rank) - int(new_rank))
-    accent = (98, 238, 157) if improved else (255, 94, 101)
-    accent_soft = (65, 190, 145) if improved else (180, 70, 102)
-    accent_deep = (16, 88, 84) if improved else (83, 43, 67)
+    accent = (116, 255, 178) if improved else (255, 112, 118)
+    accent_soft = (98, 226, 184) if improved else (232, 112, 142)
+    accent_deep = (22, 116, 105) if improved else (112, 54, 82)
 
     def sc(value):
         return int(round(value * S))
@@ -10850,24 +10854,39 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     card_xy = (sc(34), sc(27), sc(1046), sc(533))
     cw, ch = card_xy[2] - card_xy[0], card_xy[3] - card_xy[1]
 
-    # Card base gradient.
-    card = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    # Card base: use the uploaded purple galaxy banner as the card background,
+    # cropped/fitted into the rounded card, with a dark navy wash for readability.
+    if MCWV_PLACEMENT_BG_PATH and os.path.exists(MCWV_PLACEMENT_BG_PATH):
+        try:
+            bg = Image.open(MCWV_PLACEMENT_BG_PATH).convert("RGBA")
+            bw, bh = bg.size
+            scale = max(cw / bw, ch / bh)
+            resized = bg.resize((int(bw * scale), int(bh * scale)), Image.Resampling.LANCZOS)
+            left = max(0, (resized.size[0] - cw) // 2)
+            top = max(0, (resized.size[1] - ch) // 2)
+            card = resized.crop((left, top, left + cw, top + ch))
+            wash = Image.new("RGBA", (cw, ch), (5, 12, 42, 118))
+            card.alpha_composite(wash)
+        except Exception as exc:
+            print(f"[placement] background load failed: {exc}")
+            card = Image.new("RGBA", (cw, ch), (12, 20, 61, 255))
+    else:
+        card = Image.new("RGBA", (cw, ch), (12, 20, 61, 255))
+
     cd = ImageDraw.Draw(card)
+    # extra directional tint matching the original blue card style
     for y in range(ch):
         yy = y / max(ch - 1, 1)
-        for x in range(0, cw, sc(2)):
+        for x in range(0, cw, sc(3)):
             xx = x / max(cw - 1, 1)
-            t = xx * 0.55 + yy * 0.20
-            r = int(10 + 12 * t)
-            g = int(18 + 13 * t)
-            b = int(58 + 28 * t)
-            cd.rectangle((x, y, min(x + sc(2), cw), y + 1), fill=(r, g, b, 255))
+            a = int(42 + 46 * (1 - xx) + 18 * yy)
+            cd.rectangle((x, y, min(x + sc(3), cw), y + 1), fill=(8, 18, 68, min(128, a)))
 
     # Diagonal blue panels / light streaks.
     panel = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     pd = ImageDraw.Draw(panel)
-    pd.polygon([(sc(410), 0), (sc(540), 0), (sc(365), ch), (sc(235), ch)], fill=(34, 52, 130, 46))
-    pd.polygon([(sc(650), 0), (sc(810), 0), (sc(610), ch), (sc(455), ch)], fill=(28, 48, 118, 34))
+    pd.polygon([(sc(410), 0), (sc(540), 0), (sc(365), ch), (sc(235), ch)], fill=(70, 82, 190, 34))
+    pd.polygon([(sc(650), 0), (sc(810), 0), (sc(610), ch), (sc(455), ch)], fill=(105, 58, 180, 25))
     glow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     gd.ellipse((sc(500), sc(-190), sc(1170), sc(420)), fill=(63, 99, 255, 52))
@@ -10889,7 +10908,7 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     img.alpha_composite(shadow, (card_xy[0], card_xy[1]))
     img.alpha_composite(shaped, (card_xy[0], card_xy[1]))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle(card_xy, radius=sc(54), outline=(81, 105, 220, 255), width=sc(3))
+    d.rounded_rectangle(card_xy, radius=sc(54), outline=(112, 132, 255, 255), width=sc(3))
     d.rounded_rectangle((card_xy[0]+sc(5), card_xy[1]+sc(5), card_xy[2]-sc(5), card_xy[3]-sc(5)), radius=sc(49), outline=(255, 255, 255, 38), width=sc(1))
 
     ox, oy = card_xy[0], card_xy[1]
@@ -10943,13 +10962,13 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
         else:
             mix = (t - 0.55) / 0.45
             # Keep the right side muted like the reference card, not neon-solid.
-            target = tuple(int(v * 0.42) for v in accent_soft)
+            target = tuple(int(v * 0.62) for v in accent_soft)
             rgb = tuple(int((1 - mix) * b + mix * a) for b, a in zip((31, 44, 115), target))
             a = int(188 + 18 * mix)
         bd.line((x, 0, x, bar_h), fill=(*rgb, a))
     bar_mask = rounded_mask((bar_w, bar_h), sc(34))
     img.paste(bar_layer, (bar[0], bar[1]), bar_mask)
-    d.rounded_rectangle(bar, radius=sc(34), outline=(88, 109, 210, 92), width=sc(2))
+    d.rounded_rectangle(bar, radius=sc(34), outline=(122, 145, 255, 110), width=sc(2))
     # subtle top glass highlight and inner bottom shade
     d.arc((bar[0]+sc(5), bar[1]+sc(4), bar[2]-sc(5), bar[1]+sc(68)), 180, 360, fill=(255, 255, 255, 34), width=sc(2))
     d.line((bar[0]+sc(40), bar[3]-sc(2), bar[2]-sc(40), bar[3]-sc(2)), fill=(0, 0, 0, 52), width=sc(2))
@@ -10957,8 +10976,8 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     # Chevrons inside bar.
     c1 = [(ox+sc(430), bar[1]), (ox+sc(545), oy+sc(274)), (ox+sc(430), bar[3]), (ox+sc(505), bar[3]), (ox+sc(620), oy+sc(274)), (ox+sc(505), bar[1])]
     c2 = [(ox+sc(505), bar[1]), (ox+sc(620), oy+sc(274)), (ox+sc(505), bar[3]), (ox+sc(578), bar[3]), (ox+sc(690), oy+sc(274)), (ox+sc(578), bar[1])]
-    d.polygon(c1, fill=(*accent, 8))
-    d.polygon(c2, fill=(*accent, 5))
+    d.polygon(c1, fill=(*accent, 18))
+    d.polygon(c2, fill=(*accent, 11))
 
     # Rank numbers.
     draw_text_shadow(d, (ox + sc(82), oy + sc(232)), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255), shadow=(0, 0, 0, 128), offset=(sc(4), sc(5)))
