@@ -4638,6 +4638,9 @@ MCWV_TICKET_BANNER_PATH = os.environ.get(
     "MCWV_TICKET_BANNER_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "clan_application_banner.png"),
 )
+MCWV_PLACEMENT_CHANNEL_ID = int(os.environ.get("MCWV_PLACEMENT_CHANNEL_ID", "0") or "0")
+MCWV_PLACEMENT_ALERTS_ENABLED_DEFAULT = os.environ.get("MCWV_PLACEMENT_ALERTS_ENABLED", "1") != "0"
+MCWV_PLACEMENT_MIN_SECONDS = max(10, int(os.environ.get("MCWV_PLACEMENT_MIN_SECONDS", "45") or "45"))
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
 PS99_IMPORTANT_GAMEPASSES = {
     257811346: "VIP",
@@ -7235,6 +7238,58 @@ class MCWVTicketPanelView(discord.ui.View):
         if existing:
             return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
         await interaction.response.send_modal(ApplicationModal(interaction.user))
+
+
+@bot.tree.command(name="setup", description="Set up MCWV bot systems in a channel", guild=guild_obj)
+@app_commands.describe(
+    system="Which system to set up",
+    channel="Channel to use for that system"
+)
+@app_commands.choices(system=[
+    app_commands.Choice(name="Placement alerts", value="placement_alerts"),
+])
+async def setup(interaction: discord.Interaction, system: app_commands.Choice[str], channel: discord.TextChannel):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    if system.value == "placement_alerts":
+        set_placement_channel_id(channel.id)
+        db_set_setting("mcwv_placement_alerts_enabled", "1")
+        embed = discord.Embed(
+            title="Placement alerts configured",
+            description=(
+                f"MCWV placement cards will be posted in {channel.mention} during active wars only.\n\n"
+                "The bot saves the current placement first, then alerts only when the placement changes."
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    await interaction.followup.send("❌ Unknown setup option.", ephemeral=True)
+
+
+@bot.tree.command(name="placement_test", description="Preview a placement alert card", guild=guild_obj)
+@app_commands.describe(channel="Optional channel to send the test card in", improved="True for green increase, false for red decrease")
+async def placement_test(interaction: discord.Interaction, channel: discord.TextChannel = None, improved: bool = True):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.followup.send("❌ Pick a text channel.", ephemeral=True)
+    snapshot = await get_mcwv_placement_snapshot()
+    icon = snapshot.get("icon") if snapshot else None
+    points = snapshot.get("points") if snapshot else 579370
+    if improved:
+        old_rank, new_rank = 24, 23
+    else:
+        old_rank, new_rank = 25, 26
+    image = await generate_placement_card(old_rank, new_rank, points, icon)
+    await target.send(file=discord.File(image, filename="mcwv-placement-test.png"))
+    await interaction.followup.send(f"✅ Sent test placement card in {target.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
@@ -10595,6 +10650,332 @@ async def ticket_screenshot_reminder_loop():
             print(f"ticket_screenshot_reminder_loop error for {ticket_id}: {exc}")
 
 
+# ---------------- PLACEMENT ALERTS ----------------
+def placement_setting_key(battle_id):
+    return f"mcwv_placement_state:{battle_id}"
+
+
+def placement_alerts_enabled():
+    raw = db_get_setting("mcwv_placement_alerts_enabled", "1" if MCWV_PLACEMENT_ALERTS_ENABLED_DEFAULT else "0")
+    return str(raw).lower() not in ("0", "false", "off", "no")
+
+
+def get_placement_channel_id():
+    saved = db_get_setting("mcwv_placement_channel_id", None)
+    try:
+        return int(saved or MCWV_PLACEMENT_CHANNEL_ID or 0)
+    except Exception:
+        return int(MCWV_PLACEMENT_CHANNEL_ID or 0)
+
+
+def set_placement_channel_id(channel_id):
+    db_set_setting("mcwv_placement_channel_id", int(channel_id))
+
+
+def load_placement_state(battle_id):
+    raw = db_get_setting(placement_setting_key(battle_id), "")
+    try:
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def save_placement_state(battle_id, rank, points, announced=False):
+    state = {
+        "battleId": str(battle_id),
+        "rank": int(rank),
+        "points": int(points or 0),
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "lastAnnouncedAt": time.time() if announced else (load_placement_state(battle_id) or {}).get("lastAnnouncedAt"),
+    }
+    db_set_setting(placement_setting_key(battle_id), json.dumps(state))
+    return state
+
+
+def format_compact_points(value):
+    try:
+        value = float(value or 0)
+    except Exception:
+        value = 0
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}b"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}m"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}k"
+    return str(int(value))
+
+
+def extract_asset_id(value):
+    match = re.search(r"(\d+)", str(value or ""))
+    return match.group(1) if match else None
+
+
+async def fetch_image_bytes(url):
+    global session
+    if not url:
+        return None
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as res:
+            if res.status == 200:
+                return await res.read()
+    except Exception as exc:
+        print(f"[placement] image fetch failed: {exc}")
+    return None
+
+
+async def get_active_battle_id_for_placement():
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.get(ACTIVE_BATTLE_API, timeout=aiohttp.ClientTimeout(total=15)) as res:
+            if res.status != 200:
+                return None
+            payload = await res.json(content_type=None)
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        config = data.get("configData", {}) if isinstance(data, dict) else {}
+        battle_id = data.get("configName") or config.get("Title") or config.get("_id")
+        start = config.get("StartTime") or data.get("startTime")
+        finish = config.get("FinishTime") or data.get("finishTime")
+        now = datetime.now(timezone.utc).timestamp()
+        if start and finish and not (float(start) <= now <= float(finish)):
+            return None
+        return str(battle_id) if battle_id else None
+    except Exception as exc:
+        print(f"[placement] active battle fetch failed: {exc}")
+        return None
+
+
+async def get_mcwv_placement_snapshot():
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        return None
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.get(CLAN_API, timeout=aiohttp.ClientTimeout(total=15)) as res:
+            if res.status != 200:
+                return None
+            payload = await res.json(content_type=None)
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        battles = data.get("Battles") or {}
+        battle = battles.get(battle_id) or battles.get(str(battle_id))
+        if not battle and battles:
+            norm = str(battle_id).lower()
+            battle = next((value for key, value in battles.items() if str(key).lower() == norm), None)
+        if not isinstance(battle, dict):
+            return None
+        rank = battle.get("Place") or battle.get("place")
+        points = battle.get("Points") or battle.get("points") or 0
+        if not rank:
+            return None
+        return {
+            "battleId": battle_id,
+            "rank": int(rank),
+            "points": int(points or 0),
+            "icon": data.get("Icon"),
+            "name": data.get("Name") or CLAN_NAME,
+        }
+    except Exception as exc:
+        print(f"[placement] clan placement fetch failed: {exc}")
+        return None
+
+
+def _load_card_fonts():
+    def font(size, bold=True):
+        paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ]
+        for path in paths:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+    return {
+        "title": font(74),
+        "pill": font(38),
+        "rank": font(106),
+        "label": font(52, False),
+        "points": font(58),
+        "logo": font(34),
+    }
+
+
+def draw_text_shadow(draw, xy, text, font, fill, shadow=(0, 0, 0, 150), offset=(4, 5)):
+    x, y = xy
+    draw.text((x + offset[0], y + offset[1]), text, font=font, fill=shadow)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def rounded_mask(size, radius):
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0]-1, size[1]-1), radius=radius, fill=255)
+    return mask
+
+
+async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
+    W, H = 1080, 560
+    improved = int(new_rank) < int(old_rank)
+    diff = abs(int(old_rank) - int(new_rank))
+    accent = (95, 235, 155) if improved else (255, 96, 101)
+    accent_dark = (31, 112, 91) if improved else (128, 56, 80)
+    fonts = _load_card_fonts()
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    card = Image.new("RGBA", (W-70, H-55), (12, 20, 61, 255))
+    draw = ImageDraw.Draw(card)
+    cw, ch = card.size
+
+    # background gradient and subtle diagonal shine
+    for y in range(ch):
+        for x in range(cw):
+            t = (x / cw) * 0.55 + (y / ch) * 0.25
+            r = int(14 + 10 * t)
+            g = int(22 + 15 * t)
+            b = int(68 + 28 * t)
+            card.putpixel((x, y), (r, g, b, 255))
+    glow = Image.new("RGBA", card.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((560, -150, 1180, 430), fill=(70, 110, 255, 34))
+    glow = glow.filter(ImageFilter.GaussianBlur(46))
+    card.alpha_composite(glow)
+
+    # central bar
+    bar = (38, 190, cw - 36, 385)
+    draw.rounded_rectangle(bar, radius=34, fill=(31, 44, 115, 210), outline=(65, 84, 174, 80), width=2)
+    # right gradient overlay
+    overlay = Image.new("RGBA", card.size, (0,0,0,0))
+    od = ImageDraw.Draw(overlay)
+    for i in range(520):
+        a = int(30 + (i / 520) * 125)
+        od.line((bar[0]+390+i, bar[1], bar[0]+390+i, bar[3]), fill=(*accent, min(a, 145)))
+    overlay.putalpha(rounded_mask(card.size, 0))
+    card.alpha_composite(overlay)
+    draw = ImageDraw.Draw(card)
+
+    # chevrons
+    chevron = [(420, 190), (545, 287), (420, 385), (515, 385), (640, 287), (515, 190)]
+    draw.polygon(chevron, fill=(*accent, 55))
+    draw.polygon([(515,190),(640,287),(515,385),(610,385),(735,287),(610,190)], fill=(*accent, 35))
+
+    # logo circle
+    draw.ellipse((32, 28, 154, 150), fill=(22, 30, 84, 235), outline=(76, 106, 205, 255), width=4)
+    asset_id = extract_asset_id(icon_value)
+    icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
+    if icon_bytes:
+        try:
+            icon = Image.open(BytesIO(icon_bytes)).convert("RGBA").resize((96, 96), Image.Resampling.LANCZOS)
+            mask = Image.new("L", (96, 96), 0)
+            ImageDraw.Draw(mask).ellipse((0,0,96,96), fill=255)
+            card.paste(icon, (45, 41), mask)
+        except Exception:
+            draw.text((56, 76), "MCWV", font=fonts["logo"], fill=(172, 82, 255, 255))
+    else:
+        draw.text((56, 76), "MCWV", font=fonts["logo"], fill=(172, 82, 255, 255))
+
+    # title and pill
+    draw_text_shadow(draw, (205, 67), f"[{CLAN_NAME}]", fonts["title"], (246, 248, 255, 255))
+    pill_text = f"Position {'Increased' if improved else 'Decreased'} by {diff}"
+    pill_w = draw.textbbox((0,0), pill_text, font=fonts["pill"])[2] + 58
+    pill = (cw - pill_w - 36, 40, cw - 36, 104)
+    draw.rounded_rectangle(pill, radius=22, fill=(*accent_dark, 105), outline=(*accent, 145), width=3)
+    draw_text_shadow(draw, (pill[0]+28, pill[1]+11), pill_text, fonts["pill"], (*accent, 255), shadow=(0,0,0,180), offset=(3,3))
+
+    # ranks
+    draw_text_shadow(draw, (85, 240), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255))
+    new_text = f"#{new_rank}"
+    new_w = draw.textbbox((0,0), new_text, font=fonts["rank"])[2]
+    draw_text_shadow(draw, (cw - 95 - new_w, 240), new_text, fonts["rank"], (*accent, 255))
+
+    # contributions
+    label = "Contributions"
+    pts = format_compact_points(points)
+    label_w = draw.textbbox((0,0), label, font=fonts["label"])[2]
+    pts_w = draw.textbbox((0,0), pts, font=fonts["points"])[2]
+    start_x = (cw - label_w - 28 - pts_w) // 2
+    draw_text_shadow(draw, (start_x, 425), label, fonts["label"], (220, 224, 241, 235), shadow=(0,0,0,120), offset=(2,3))
+    draw_text_shadow(draw, (start_x + label_w + 28, 419), pts, fonts["points"], (255, 211, 87, 255), shadow=(0,0,0,155), offset=(3,4))
+
+    # border/glow
+    mask = rounded_mask(card.size, 54)
+    framed = Image.new("RGBA", card.size, (0,0,0,0))
+    framed.paste(card, (0,0), mask)
+    border = Image.new("RGBA", card.size, (0,0,0,0))
+    bd = ImageDraw.Draw(border)
+    bd.rounded_rectangle((2,2,cw-3,ch-3), radius=54, outline=(79,104,221,255), width=3)
+    bd.rounded_rectangle((8,8,cw-9,ch-9), radius=48, outline=(255,255,255,45), width=1)
+    framed.alpha_composite(border)
+
+    shadow = Image.new("RGBA", card.size, (0,0,0,0))
+    ImageDraw.Draw(shadow).rounded_rectangle((0,0,cw-1,ch-1), radius=54, fill=(38,63,190,160))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
+    img.alpha_composite(shadow, (35,28))
+    img.alpha_composite(framed, (35,25))
+
+    out = BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+
+async def send_placement_alert(snapshot, old_rank):
+    channel_id = get_placement_channel_id()
+    if not channel_id:
+        return False
+    channel = await _maybe_get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"[placement] channel not found/not text: {channel_id}")
+        return False
+    image = await generate_placement_card(old_rank, snapshot["rank"], snapshot["points"], snapshot.get("icon"))
+    await channel.send(file=discord.File(image, filename="mcwv-placement.png"))
+    return True
+
+
+@tasks.loop(minutes=1)
+async def placement_alert_loop():
+    await bot.wait_until_ready()
+    if not placement_alerts_enabled():
+        return
+    snapshot = await get_mcwv_placement_snapshot()
+    if not snapshot:
+        return
+    battle_id = snapshot["battleId"]
+    rank = int(snapshot["rank"])
+    points = int(snapshot.get("points") or 0)
+    previous = load_placement_state(battle_id)
+    if not previous:
+        save_placement_state(battle_id, rank, points, announced=False)
+        print(f"[placement] initial state saved {battle_id}: rank={rank} points={points}")
+        return
+    old_rank = int(previous.get("rank") or rank)
+    last_announced = float(previous.get("lastAnnouncedAt") or 0)
+    if rank == old_rank:
+        save_placement_state(battle_id, rank, points, announced=False)
+        return
+    if time.time() - last_announced < MCWV_PLACEMENT_MIN_SECONDS:
+        save_placement_state(battle_id, rank, points, announced=False)
+        return
+    try:
+        if await send_placement_alert(snapshot, old_rank):
+            save_placement_state(battle_id, rank, points, announced=True)
+            print(f"[placement] alert sent {battle_id}: {old_rank}->{rank} points={points}")
+        else:
+            save_placement_state(battle_id, rank, points, announced=False)
+    except Exception as exc:
+        print(f"[placement] alert failed: {exc}")
+
+
+@placement_alert_loop.before_loop
+async def before_placement_alert_loop():
+    await bot.wait_until_ready()
+
+
 # ---------------- HUB WAR COLLECTOR LOOP ----------------
 @tasks.loop(minutes=WAR_COLLECT_INTERVAL_MINUTES)
 async def hub_war_collect_loop():
@@ -10653,6 +11034,9 @@ def start_bot_loops():
 
     if not ticket_screenshot_reminder_loop.is_running():
         ticket_screenshot_reminder_loop.start()
+
+    if not placement_alert_loop.is_running():
+        placement_alert_loop.start()
 
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
         hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
