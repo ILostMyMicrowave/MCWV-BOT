@@ -4342,6 +4342,11 @@ KNOWN_PS99_BATTLE_IDS = [
 ]
 PLAYER_WAR_HISTORY_CACHE = {}
 PLAYER_WAR_HISTORY_TTL_SECONDS = 30 * 60
+TOP_CLAN_HISTORY_CACHE = {}
+TOP_CLAN_HISTORY_BUILD_TASK = None
+TOP_CLAN_HISTORY_LIMIT = max(10, min(int(os.environ.get("PS99_TOP_CLAN_HISTORY_LIMIT", "100") or "100"), 100))
+TOP_CLAN_HISTORY_TTL_SECONDS = max(10 * 60, int(os.environ.get("PS99_TOP_CLAN_HISTORY_TTL_SECONDS", str(60 * 60)) or str(60 * 60)))
+TOP_CLAN_HISTORY_CONCURRENCY = max(2, min(int(os.environ.get("PS99_TOP_CLAN_HISTORY_CONCURRENCY", "10") or "10"), 20))
 
 DEFAULT_MCWV_TICKET_SETTINGS = {
     "panel": {
@@ -5600,7 +5605,7 @@ def _friendly_battle_name(battle_id):
 
 
 def _battle_sort_key(item):
-    return int(item.get("startTime") or 0), str(item.get("battleId") or "")
+    return int(item.get("startTime") or 0), int(item.get("battleOrder") or 0), str(item.get("battleId") or "")
 
 
 async def _ps99_json(url, timeout_seconds=15):
@@ -5642,6 +5647,149 @@ async def fetch_known_battle_ids_for_history():
     return cleaned[:30], clan_payload
 
 
+async def fetch_top_clan_names_for_history(limit=None):
+    limit = int(limit or TOP_CLAN_HISTORY_LIMIT)
+    payload = await _ps99_json(f"{PS99_API}/api/clans?page=1&pageSize={limit}&sort=Points&sortOrder=desc", timeout_seconds=20)
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    names = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("Name") or row.get("name") or "").strip().upper()
+            if name and re.fullmatch(r"[A-Z0-9_]{1,8}", name):
+                names.append(name)
+    if CLAN_NAME.upper() not in names:
+        names.append(CLAN_NAME.upper())
+    seen = set()
+    cleaned = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    return cleaned[:limit] if CLAN_NAME.upper() in cleaned[:limit] else cleaned[:limit] + [CLAN_NAME.upper()]
+
+
+async def fetch_legacy_clan_payload(clan_name):
+    clan_name = str(clan_name or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]{1,8}", clan_name):
+        return clan_name, None
+    return clan_name, await _ps99_json(f"{PS99_API}/api/clan/{clan_name}", timeout_seconds=20)
+
+
+def _legacy_clan_battles(payload):
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    battles = data.get("Battles") or data.get("battles") or {}
+    return battles if isinstance(battles, dict) else {}
+
+
+async def build_top_clan_history_index():
+    started = time.time()
+    clan_names = await fetch_top_clan_names_for_history(TOP_CLAN_HISTORY_LIMIT)
+    semaphore = asyncio.Semaphore(TOP_CLAN_HISTORY_CONCURRENCY)
+
+    async def limited_fetch(name):
+        async with semaphore:
+            return await fetch_legacy_clan_payload(name)
+
+    fetched = await asyncio.gather(*(limited_fetch(name) for name in clan_names), return_exceptions=True)
+    battle_entries = {}
+    scanned = []
+    failed = []
+
+    for fetch_index, result in enumerate(fetched):
+        if isinstance(result, Exception):
+            failed.append(str(result))
+            continue
+        clan_name, payload = result
+        battles = _legacy_clan_battles(payload or {})
+        if not battles:
+            failed.append(clan_name)
+            continue
+        scanned.append(clan_name)
+        for battle_index, (battle_id, battle) in enumerate(battles.items()):
+            if not isinstance(battle, dict):
+                continue
+            battle_id = str(battle.get("BattleID") or battle.get("battleId") or battle_id or "").strip()
+            if not battle_id:
+                continue
+            contributions = battle.get("PointContributions") or battle.get("pointContributions") or []
+            if not isinstance(contributions, list):
+                continue
+            bucket = battle_entries.setdefault(battle_id, {})
+            clan_place = battle.get("Place") or battle.get("place")
+            earned_medal = bool(battle.get("EarnedMedal") or battle.get("earnedMedal"))
+            battle_order = (fetch_index * 10000) + battle_index
+            for item in contributions:
+                if not isinstance(item, dict):
+                    continue
+                user_id = str(item.get("UserID") or item.get("userId") or item.get("UserId") or "").strip()
+                points = _safe_int(item.get("Points") or item.get("points"))
+                if not user_id or points <= 0:
+                    continue
+                previous = bucket.get(user_id)
+                if previous and _safe_int(previous.get("points")) >= points:
+                    continue
+                bucket[user_id] = {
+                    "userId": user_id,
+                    "battleId": battle_id,
+                    "title": _friendly_battle_name(battle_id),
+                    "clan": clan_name,
+                    "points": points,
+                    "clanPlace": clan_place,
+                    "earnedMedal": earned_medal,
+                    "startTime": _safe_int(battle.get("StartTime") or battle.get("startTime")),
+                    "battleOrder": battle_order,
+                    "source": f"Top {TOP_CLAN_HISTORY_LIMIT} clan scan",
+                }
+
+    players = {}
+    battle_meta = {}
+    for battle_id, by_user in battle_entries.items():
+        ranked = sorted(by_user.values(), key=lambda row: _safe_int(row.get("points")), reverse=True)
+        total = len(ranked)
+        battle_meta[battle_id] = {"totalContributors": total}
+        for rank, row in enumerate(ranked, start=1):
+            user_id = str(row.get("userId") or "").strip()
+            if not user_id:
+                continue
+            better = max(0.0, ((total - rank) / total) * 100) if total else 0.0
+            player_row = dict(row)
+            player_row.update({"rank": rank, "total": total, "betterThan": better})
+            players.setdefault(user_id, []).append(player_row)
+
+    for rows in players.values():
+        rows.sort(key=_battle_sort_key, reverse=True)
+
+    return {
+        "builtAt": datetime.now(timezone.utc).isoformat(),
+        "scanSeconds": round(time.time() - started, 2),
+        "limit": TOP_CLAN_HISTORY_LIMIT,
+        "clansScanned": scanned,
+        "failedClans": failed[:25],
+        "battleCount": len(battle_entries),
+        "playerCount": len(players),
+        "players": players,
+        "battleMeta": battle_meta,
+    }
+
+
+async def get_top_clan_history_index(force=False):
+    global TOP_CLAN_HISTORY_BUILD_TASK
+    now_ts = time.time()
+    cached = TOP_CLAN_HISTORY_CACHE.get("index")
+    if not force and cached and cached.get("expires", 0) > now_ts:
+        return cached.get("data") or {}
+
+    if TOP_CLAN_HISTORY_BUILD_TASK and not TOP_CLAN_HISTORY_BUILD_TASK.done():
+        return await TOP_CLAN_HISTORY_BUILD_TASK
+
+    TOP_CLAN_HISTORY_BUILD_TASK = asyncio.create_task(build_top_clan_history_index())
+    data = await TOP_CLAN_HISTORY_BUILD_TASK
+    TOP_CLAN_HISTORY_CACHE["index"] = {"expires": now_ts + TOP_CLAN_HISTORY_TTL_SECONDS, "data": data}
+    return data
+
+
 def _mcwv_history_from_clan_payload(roblox_id, clan_payload):
     data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
     battles = data.get("Battles") or data.get("battles") or {}
@@ -5674,6 +5822,7 @@ def _mcwv_history_from_clan_payload(roblox_id, clan_payload):
                 "total": total,
                 "betterThan": better,
                 "clanPlace": battle.get("Place") or battle.get("place"),
+                "earnedMedal": bool(battle.get("EarnedMedal") or battle.get("earnedMedal")),
                 "startTime": _safe_int(battle.get("StartTime") or battle.get("startTime")),
                 "source": "MCWV exact",
             })
@@ -5723,32 +5872,60 @@ async def fetch_ps99_player_war_history(roblox_id):
     if cached and cached.get("expires", 0) > now_ts:
         return cached.get("data") or {}
 
-    summary_payload = await _ps99_json(f"{PS99_API}/v1/clans/players/{cache_key}")
+    summary_payload, top_index = await asyncio.gather(
+        _ps99_json(f"{PS99_API}/v1/clans/players/{cache_key}"),
+        get_top_clan_history_index(),
+        return_exceptions=True,
+    )
+    if isinstance(summary_payload, Exception):
+        summary_payload = None
+    if isinstance(top_index, Exception):
+        print(f"[ticket war history] top clan index failed: {top_index}")
+        top_index = {}
+
     summary_data = summary_payload.get("data", {}) if isinstance(summary_payload, dict) else {}
     summary = summary_data.get("player") if isinstance(summary_data, dict) else None
 
-    battle_ids, clan_payload = await fetch_known_battle_ids_for_history()
-    rows = _mcwv_history_from_clan_payload(cache_key, clan_payload or {})
-    existing_ids = {str(row.get("battleId")).lower() for row in rows}
+    player_rows = []
+    players_map = top_index.get("players", {}) if isinstance(top_index, dict) else {}
+    if isinstance(players_map, dict):
+        player_rows = [dict(row) for row in players_map.get(cache_key, []) if isinstance(row, dict)]
 
-    semaphore = asyncio.Semaphore(4)
+    # Fallback to the public v1 battle top-player sample for any manually known IDs
+    # not already covered by the top-clan legacy scan.
+    existing_ids = {str(row.get("battleId")).lower() for row in player_rows}
+    if len(player_rows) < 3:
+        battle_ids, clan_payload = await fetch_known_battle_ids_for_history()
+        for row in _mcwv_history_from_clan_payload(cache_key, clan_payload or {}):
+            if str(row.get("battleId")).lower() not in existing_ids:
+                player_rows.append(row)
+                existing_ids.add(str(row.get("battleId")).lower())
 
-    async def limited_lookup(battle_id):
-        async with semaphore:
-            return await _battle_history_lookup(battle_id, cache_key)
+        semaphore = asyncio.Semaphore(4)
+        async def limited_lookup(battle_id):
+            async with semaphore:
+                return await _battle_history_lookup(battle_id, cache_key)
+        lookups = await asyncio.gather(*(limited_lookup(battle_id) for battle_id in battle_ids if str(battle_id).lower() not in existing_ids), return_exceptions=True)
+        for item in lookups:
+            if isinstance(item, dict) and item and str(item.get("battleId")).lower() not in existing_ids:
+                player_rows.append(item)
+                existing_ids.add(str(item.get("battleId")).lower())
 
-    lookups = await asyncio.gather(*(limited_lookup(battle_id) for battle_id in battle_ids if str(battle_id).lower() not in existing_ids), return_exceptions=True)
-    for item in lookups:
-        if isinstance(item, dict) and item:
-            rows.append(item)
-
-    rows.sort(key=_battle_sort_key, reverse=True)
+    player_rows.sort(key=_battle_sort_key, reverse=True)
     result = {
         "summary": summary if isinstance(summary, dict) else None,
         "activeBattleId": summary_data.get("activeBattleId") if isinstance(summary_data, dict) else None,
         "sampledClans": summary_data.get("sampledClans") if isinstance(summary_data, dict) else None,
-        "battles": rows[:12],
-        "coverageNote": "PS99 clan history is sampled/capped. Missing battles do not prove the player was inactive or absent.",
+        "battles": player_rows[:13],
+        "scan": {
+            "mode": f"Top {top_index.get('limit', TOP_CLAN_HISTORY_LIMIT)} legacy clan scan" if isinstance(top_index, dict) else "Top clan scan",
+            "clansScanned": len(top_index.get("clansScanned", [])) if isinstance(top_index, dict) else 0,
+            "battleCount": top_index.get("battleCount") if isinstance(top_index, dict) else None,
+            "playerCount": top_index.get("playerCount") if isinstance(top_index, dict) else None,
+            "scanSeconds": top_index.get("scanSeconds") if isinstance(top_index, dict) else None,
+            "builtAt": top_index.get("builtAt") if isinstance(top_index, dict) else None,
+        },
+        "coverageNote": "Ranks are calculated from every contribution found in the scanned top-100 legacy clan records. Missing battles can still happen if a clan is outside the scan or API data is absent.",
     }
     PLAYER_WAR_HISTORY_CACHE[cache_key] = {"expires": now_ts + PLAYER_WAR_HISTORY_TTL_SECONDS, "data": result}
     return result
@@ -5757,26 +5934,69 @@ async def fetch_ps99_player_war_history(roblox_id):
 def format_player_war_history(history):
     summary = history.get("summary") if isinstance(history, dict) else None
     rows = history.get("battles", []) if isinstance(history, dict) else []
-    summary_lines = []
+    rows = rows if isinstance(rows, list) else []
+    scan = history.get("scan", {}) if isinstance(history, dict) and isinstance(history.get("scan"), dict) else {}
+
+    aggregate_total = _safe_int(summary.get("TotalBattles")) if isinstance(summary, dict) else 0
+    aggregate_medals = _safe_int(summary.get("EarnedMedals")) if isinstance(summary, dict) else 0
+    row_total = len(rows)
+    row_medals = sum(1 for row in rows if isinstance(row, dict) and row.get("earnedMedal"))
+    known_total = max(aggregate_total, row_total)
+    known_medals = max(aggregate_medals, row_medals)
+
+    numeric_places = []
+    better_values = []
+    clans_seen = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        clan_name = str(row.get("clan") or "").strip()
+        if clan_name and clan_name not in clans_seen:
+            clans_seen.append(clan_name)
+        try:
+            place = row.get("clanPlace")
+            if place not in (None, "", 0):
+                numeric_places.append(float(place))
+        except Exception:
+            pass
+        better = row.get("betterThan")
+        if isinstance(better, (int, float)):
+            better_values.append(float(better))
+
+    summary_lines = [f"Known battle rows found: **{known_total}**"]
+    summary_lines.append(f"Earned medals shown: **{known_medals}**")
+    if scan.get("clansScanned"):
+        summary_lines.append(f"Scan coverage: **{scan.get('clansScanned')} clans** • **{scan.get('battleCount') or 0} battles**")
+    if clans_seen:
+        summary_lines.append(f"Clans seen: **{', '.join(clans_seen[:8])}**")
+    if better_values:
+        summary_lines.append(f"Best percentile: **{max(better_values):.1f}%** • Avg: **{(sum(better_values) / len(better_values)):.1f}%**")
+
     if isinstance(summary, dict):
         clan = summary.get("Clan") if isinstance(summary.get("Clan"), dict) else {}
-        summary_lines.append(f"Known battles: **{_safe_int(summary.get('TotalBattles'))}**")
-        summary_lines.append(f"Earned medals: **{_safe_int(summary.get('EarnedMedals'))}**")
         avg_place = summary.get("AvgPlace")
         if avg_place is not None:
             try:
-                summary_lines.append(f"Avg clan place: **{float(avg_place):.1f}**")
+                summary_lines.append(f"Aggregate avg clan place: **{float(avg_place):.1f}**")
             except Exception:
                 pass
+        elif numeric_places:
+            summary_lines.append(f"Avg clan place from shown rows: **{sum(numeric_places) / len(numeric_places):.1f}**")
         summary_lines.append(f"Active battle points: **{format_points(_safe_int(summary.get('ActiveBattlePoints')))}**")
         if clan.get("Name"):
-            summary_lines.append(f"Sampled clan: **{clan.get('Name')}**")
+            summary_lines.append(f"Aggregate sampled clan: **{clan.get('Name')}**")
+        if aggregate_total == 0 and row_total > 0:
+            summary_lines.append("_Aggregate says 0, but the top-clan history scan found rows below._")
     else:
-        summary_lines.append("No aggregate player history found in the sampled PS99 clan data.")
+        if numeric_places:
+            summary_lines.append(f"Avg clan place from shown rows: **{sum(numeric_places) / len(numeric_places):.1f}**")
+        summary_lines.append("No aggregate player summary found in the sampled PS99 clan data.")
 
     if rows:
         battle_lines = []
         for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
             points = format_points(_safe_int(row.get("points")))
             rank = _safe_int(row.get("rank"))
             total = _safe_int(row.get("total"))
@@ -5785,12 +6005,15 @@ def format_player_war_history(history):
             better_text = f" • better than **{float(better):.1f}%**" if isinstance(better, (int, float)) else ""
             clan_place = row.get("clanPlace")
             place_text = f" • clan place **#{clan_place}**" if clan_place not in (None, "", 0) else ""
+            medal_text = " • medal" if row.get("earnedMedal") else ""
+            source = str(row.get("source") or "scan")
+            source_text = "top100" if source.startswith("Top") else ("exact" if source == "MCWV exact" else "sampled")
             battle_lines.append(
-                f"• **{_friendly_battle_name(row.get('battleId'))}** — {points} pts — **{row.get('clan') or '—'}** — {rank_text}{better_text}{place_text}"
+                f"• **{_friendly_battle_name(row.get('battleId'))}** — {points} pts — **{row.get('clan') or '—'}** — {rank_text}{better_text}{place_text}{medal_text} _({source_text})_"
             )
         history_text = "\n".join(battle_lines)
     else:
-        history_text = "No per-battle rows found from MCWV exact data or the PS99 sampled top-player battle data."
+        history_text = "No per-battle rows found from the top-clan history scan or PS99 sampled battle data."
 
     return "\n".join(summary_lines)[:1024], history_text[:1024]
 
@@ -6437,6 +6660,38 @@ class StaffInfoView(discord.ui.View):
             return False
         return True
 
+    @discord.ui.button(label="Backup History", style=discord.ButtonStyle.secondary)
+    async def backup_history(self, interaction: discord.Interaction, button: discord.ui.Button):
+        app = db_get_ticket_application(self.ticket_id)
+        if not app:
+            return await interaction.response.send_message("❌ No application data found for this ticket.", ephemeral=True)
+
+        roblox_username = str(app[0] or "").strip()
+        if not roblox_username:
+            return await interaction.response.send_message("❌ Roblox username is missing for this ticket.", ephemeral=True)
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("❌ I can only send the backup history command in a server text channel.", ephemeral=True)
+
+        try:
+            await interaction.channel.send(
+                f"!history {roblox_username}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            db_ticket_log(
+                self.ticket_id,
+                interaction.user.id,
+                "history/backup_requested",
+                f"Requested backup history for {roblox_username}",
+                {"robloxUsername": roblox_username, "channelId": str(interaction.channel.id)},
+            )
+            await interaction.response.send_message(
+                f"✅ Sent backup history command in {interaction.channel.mention}: `!history {roblox_username}`",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Failed to send backup history command: `{exc}`", ephemeral=True)
+
     @discord.ui.button(label="Blacklist applicant", style=discord.ButtonStyle.danger)
     async def blacklist_applicant(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
@@ -6555,8 +6810,9 @@ class ApplicationReviewView(discord.ui.View):
         row = db_get_ticket_by_ticket_id(ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         embed = await build_staff_info_embed(row)
-        await interaction.response.send_message(embed=embed, view=StaffInfoView(row[0], row[3]), ephemeral=True)
+        await interaction.followup.send(embed=embed, view=StaffInfoView(row[0], row[3]), ephemeral=True)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
