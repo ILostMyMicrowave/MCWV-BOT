@@ -462,6 +462,7 @@ def _ticket_row_to_payload(row):
         "closedAt": row[16].isoformat() if row[16] else None,
         "closedBy": str(row[17]) if row[17] else None,
         "closeReason": row[18],
+        "screenshotsUploaded": bool(row[19]) if len(row) > 19 else False,
     }
 
 
@@ -497,7 +498,12 @@ def db_admin_list_mcwv_tickets():
         cur.execute("""
             SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
                    status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
-                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason
+                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason,
+                   EXISTS (
+                     SELECT 1 FROM mcwv_ticket_actions a
+                     WHERE a.ticket_id = mcwv_tickets.ticket_id
+                       AND a.action = 'screenshots/uploaded'
+                   ) AS screenshots_uploaded
             FROM mcwv_tickets
             ORDER BY updated_at DESC
             LIMIT 200
@@ -512,7 +518,12 @@ def db_admin_get_mcwv_ticket(ticket_id):
         cur.execute("""
             SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
                    status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
-                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason
+                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason,
+                   EXISTS (
+                     SELECT 1 FROM mcwv_ticket_actions a
+                     WHERE a.ticket_id = mcwv_tickets.ticket_id
+                       AND a.action = 'screenshots/uploaded'
+                   ) AS screenshots_uploaded
             FROM mcwv_tickets
             WHERE ticket_id = %s OR channel_id::text = %s OR id::text = %s
             LIMIT 1
@@ -547,6 +558,7 @@ def db_admin_get_mcwv_ticket(ticket_id):
     payload = _ticket_row_to_payload(ticket)
     payload["application"] = _ticket_application_payload(app_row)
     payload["actions"] = [_ticket_action_payload(row) for row in actions]
+    payload["screenshotsUploaded"] = bool(payload.get("screenshotsUploaded")) or any(action.get("action") == "screenshots/uploaded" for action in payload["actions"])
     payload["transcript"] = {"text": transcript[0], "createdAt": transcript[1].isoformat()} if transcript else None
     return payload
 
