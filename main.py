@@ -577,6 +577,24 @@ async def _admin_ticket_accept(ticket_id, actor_id):
     role = guild.get_role(MCWV_TICKET_MEMBER_ROLE_ID)
     if role:
         await applicant.add_roles(role, reason=f"MCWV application accepted from Hub by {actor_id}")
+    if channel:
+        try:
+            safe_name = normalize_ticket_key(app["robloxUsername"])[:24] or str(applicant.id)
+            await channel.edit(name=f"⭐-ticket-{safe_name}", reason="MCWV application accepted from Hub")
+        except Exception as exc:
+            print(f"[ticket admin accept] rename failed for {ticket['ticketId']}: {exc}")
+        try:
+            accepted_category = get_available_category(guild)
+            if accepted_category:
+                await channel.edit(
+                    category=accepted_category,
+                    sync_permissions=False,
+                    reason="MCWV application accepted from Hub — moved to member ticket category",
+                )
+            else:
+                print(f"[ticket admin accept] no accepted category available for {ticket['ticketId']}")
+        except Exception as exc:
+            print(f"[ticket admin accept] category move failed for {ticket['ticketId']}: {exc}")
     db_update_ticket_status(ticket["ticketId"], "accepted", actor_id, accepted_at=datetime.now(timezone.utc), accepted_by=actor_id)
     embed = discord.Embed(
         title="Accepted into MCWV",
@@ -4312,6 +4330,10 @@ MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROL
 MCWV_TICKET_STAFF_ROLE_IDS.add(ALLOWED_ROLE_ID)
 MCWV_TICKET_STAFF_ROLE_IDS.add(1502339420207059066)
 MCWV_TICKET_DELETE_DELAY_SECONDS = max(5, int(os.environ.get("MCWV_TICKET_DELETE_DELAY_SECONDS", "20") or "20"))
+MCWV_TICKET_BANNER_PATH = os.environ.get(
+    "MCWV_TICKET_BANNER_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "clan_application_banner.png"),
+)
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
 PS99_IMPORTANT_GAMEPASSES = {
     257811346: "VIP",
@@ -5530,7 +5552,34 @@ async def resolve_roblox_username_basic(username):
     return {"id": str(data[0]["id"]), "name": str(data[0]["name"])}
 
 
-def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None):
+async def get_roblox_headshot_url(roblox_id):
+    global session
+    try:
+        user_id = int(str(roblox_id).strip())
+    except Exception:
+        return None
+
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    url = (
+        "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+        f"?userIds={user_id}&size=150x150&format=Png&isCircular=true"
+    )
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as res:
+            if res.status != 200:
+                return None
+            payload = await res.json(content_type=None)
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        if data and data[0].get("imageUrl"):
+            return str(data[0]["imageUrl"])
+    except Exception as exc:
+        print(f"[ticket] roblox headshot lookup failed for {roblox_id}: {exc}")
+    return None
+
+
+def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None, avatar_url=None):
     embed = discord.Embed(
         title="MCWV Application Ready for Review",
         description=(
@@ -5539,6 +5588,8 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
         color=discord.Color.from_rgb(52, 211, 153),
         timestamp=datetime.now(timezone.utc),
     )
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
     embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
     embed.add_field(name="Roblox", value=f"**{roblox_name}**\n`{roblox_id}`", inline=True)
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
@@ -6041,29 +6092,14 @@ async def build_staff_info_embed(ticket_row):
     embed.add_field(name="Liquid gems per war", value=str(liquid_gems or "—")[:1024], inline=False)
     embed.add_field(name="Why should we accept you?", value=str(why_accept or "—")[:1024], inline=False)
 
-    gamepasses, war_history = await asyncio.gather(
-        check_ps99_gamepasses(str(roblox_id)),
-        fetch_ps99_player_war_history(str(roblox_id)),
-        return_exceptions=True,
-    )
+    gamepasses = await check_ps99_gamepasses(str(roblox_id))
     embed.add_field(
         name="Gamepass check",
-        value=format_gamepass_results(gamepasses if isinstance(gamepasses, list) else []),
+        value=format_gamepass_results(gamepasses),
         inline=False,
     )
 
-    if isinstance(war_history, dict):
-        war_summary, war_rows = format_player_war_history(war_history)
-        embed.add_field(name="Known Clan War History", value=war_summary, inline=False)
-        embed.add_field(name="Recent Known Battles", value=war_rows, inline=False)
-    else:
-        embed.add_field(
-            name="Known Clan War History",
-            value="Could not load PS99 war history right now.",
-            inline=False,
-        )
-
-    embed.set_footer(text="Only staff can see this panel. PS99 war history is sampled/capped, so missing battles are not proof of no history.")
+    embed.set_footer(text="Only staff can see this panel.")
     return embed
 
 
@@ -6074,6 +6110,17 @@ async def log_ticket_event(guild, embed):
             await channel.send(embed=embed)
         except Exception as exc:
             print("ticket log send error:", exc)
+
+
+async def send_ticket_application_banner(channel):
+    try:
+        if MCWV_TICKET_BANNER_PATH and os.path.exists(MCWV_TICKET_BANNER_PATH):
+            await channel.send(file=discord.File(MCWV_TICKET_BANNER_PATH, filename="clan_application_banner.png"))
+            return True
+        print(f"[ticket] banner file missing: {MCWV_TICKET_BANNER_PATH}")
+    except Exception as exc:
+        print(f"[ticket] banner send failed in {getattr(channel, 'id', 'unknown')}: {exc}")
+    return False
 
 
 async def delete_ticket_control_message(guild, ticket_id=None, channel_id=None, message_id=None):
@@ -6193,6 +6240,20 @@ async def accept_application_ticket(interaction, ticket_row):
             actions.append("Ticket renamed as accepted")
         except Exception as exc:
             errors.append(f"Could not rename ticket: {exc}")
+
+        try:
+            accepted_category = get_available_category(guild)
+            if accepted_category:
+                await channel.edit(
+                    category=accepted_category,
+                    sync_permissions=False,
+                    reason="MCWV application accepted — moved to member ticket category",
+                )
+                actions.append(f"Ticket moved to {accepted_category.name}")
+            else:
+                errors.append("Accepted member ticket categories are full or unavailable")
+        except Exception as exc:
+            errors.append(f"Could not move ticket to accepted category: {exc}")
 
     if ok:
         db_update_ticket_status(
@@ -6397,6 +6458,7 @@ class ApplicationModal(discord.ui.Modal):
             activity,
             liquid_gems,
             why_accept,
+            avatar_url=roblox_avatar_url,
         )
         if not saved:
             return await interaction.followup.send("❌ Ticket created, but I could not save the application. Please contact staff.", ephemeral=True)
@@ -6417,6 +6479,7 @@ class ApplicationModal(discord.ui.Modal):
         )
         screenshot_embed.set_footer(text="MCWV Applications")
         try:
+            await send_ticket_application_banner(channel)
             await channel.send(content=interaction.user.mention, embed=screenshot_embed)
         except Exception as send_error:
             print(f"[ticket] screenshot embed send failed in {channel.id}: {send_error}")
@@ -6440,6 +6503,7 @@ class ApplicationModal(discord.ui.Modal):
             print(f"[ticket] screenshot confirmation button failed in {channel.id}: {button_error}")
             await channel.send("When your screenshots are uploaded, please tell staff: `Screenshots uploaded`.")
 
+        roblox_avatar_url = await get_roblox_headshot_url(resolved["id"])
         review_embed = build_application_review_embed(
             ticket_id,
             interaction.user,
@@ -6659,38 +6723,6 @@ class StaffInfoView(discord.ui.View):
             await interaction.response.send_message("❌ Staff only.", ephemeral=True)
             return False
         return True
-
-    @discord.ui.button(label="Backup History", style=discord.ButtonStyle.secondary)
-    async def backup_history(self, interaction: discord.Interaction, button: discord.ui.Button):
-        app = db_get_ticket_application(self.ticket_id)
-        if not app:
-            return await interaction.response.send_message("❌ No application data found for this ticket.", ephemeral=True)
-
-        roblox_username = str(app[0] or "").strip()
-        if not roblox_username:
-            return await interaction.response.send_message("❌ Roblox username is missing for this ticket.", ephemeral=True)
-
-        if not isinstance(interaction.channel, discord.TextChannel):
-            return await interaction.response.send_message("❌ I can only send the backup history command in a server text channel.", ephemeral=True)
-
-        try:
-            await interaction.channel.send(
-                f"!history {roblox_username}",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            db_ticket_log(
-                self.ticket_id,
-                interaction.user.id,
-                "history/backup_requested",
-                f"Requested backup history for {roblox_username}",
-                {"robloxUsername": roblox_username, "channelId": str(interaction.channel.id)},
-            )
-            await interaction.response.send_message(
-                f"✅ Sent backup history command in {interaction.channel.mention}: `!history {roblox_username}`",
-                ephemeral=True,
-            )
-        except Exception as exc:
-            await interaction.response.send_message(f"❌ Failed to send backup history command: `{exc}`", ephemeral=True)
 
     @discord.ui.button(label="Blacklist applicant", style=discord.ButtonStyle.danger)
     async def blacklist_applicant(self, interaction: discord.Interaction, button: discord.ui.Button):
