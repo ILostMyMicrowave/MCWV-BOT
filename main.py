@@ -570,6 +570,7 @@ async def _admin_ticket_accept(ticket_id, actor_id):
     if channel:
         await channel.send(embed=embed)
     await log_ticket_event(guild, embed)
+    await delete_ticket_control_message(guild, ticket_id=ticket["ticketId"])
     return db_admin_get_mcwv_ticket(ticket["ticketId"])
 
 
@@ -595,6 +596,7 @@ async def _admin_ticket_close(ticket_id, actor_id, reason):
         reason,
         transcript,
     )
+    await delete_ticket_control_message(guild, ticket_id=ticket["ticketId"])
     if channel:
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
         await channel.delete(reason=f"MCWV ticket closed from Hub: {reason}")
@@ -5591,6 +5593,48 @@ async def log_ticket_event(guild, embed):
             print("ticket log send error:", exc)
 
 
+async def delete_ticket_control_message(guild, ticket_id=None, channel_id=None, message_id=None):
+    """Delete the staff review/control message once an application is finished."""
+    if not guild:
+        return False
+
+    # Fast path: delete the exact message that contained the buttons.
+    if channel_id and message_id:
+        try:
+            channel = guild.get_channel(int(channel_id)) or await guild.fetch_channel(int(channel_id))
+            if isinstance(channel, discord.TextChannel):
+                message = await channel.fetch_message(int(message_id))
+                await message.delete()
+                return True
+        except discord.NotFound:
+            return True
+        except Exception as exc:
+            print(f"ticket control exact delete failed: {exc}")
+
+    # Fallback: search the configured review channel by Ticket field. This also
+    # lets Hub/admin accept-close actions clean up old control messages.
+    if ticket_id:
+        try:
+            review_channel = guild.get_channel(MCWV_TICKET_REVIEW_CHANNEL_ID) or await guild.fetch_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
+            if not isinstance(review_channel, discord.TextChannel):
+                return False
+            wanted = str(ticket_id).strip()
+            async for message in review_channel.history(limit=200):
+                for embed in message.embeds:
+                    if (embed.title or "") != "MCWV Application Ready for Review":
+                        continue
+                    for field in embed.fields:
+                        if str(field.name).lower() == "ticket" and str(field.value).replace("`", "").strip() == wanted:
+                            await message.delete()
+                            return True
+        except discord.NotFound:
+            return True
+        except Exception as exc:
+            print(f"ticket control fallback delete failed for {ticket_id}: {exc}")
+
+    return False
+
+
 async def build_ticket_transcript(channel, limit=250):
     lines = []
     try:
@@ -5625,11 +5669,13 @@ async def accept_application_ticket(interaction, ticket_row):
         except Exception:
             applicant = None
     if applicant is None:
-        return await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
+        await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
+        return False
 
     app = db_get_ticket_application(ticket_row[0])
     if not app:
-        return await interaction.response.send_message("❌ No submitted application found yet.", ephemeral=True)
+        await interaction.response.send_message("❌ No submitted application found yet.", ephemeral=True)
+        return False
     roblox_name, roblox_id = str(app[0]), str(app[1])
 
     actions = []
@@ -5709,7 +5755,8 @@ async def accept_application_ticket(interaction, ticket_row):
     )
     status_embed.set_footer(text="Ticket stays open for next steps")
 
-    await channel.send(embed=status_embed)
+    if channel:
+        await channel.send(embed=status_embed)
     await log_ticket_event(guild, status_embed)
 
     if ok:
@@ -5729,7 +5776,8 @@ async def accept_application_ticket(interaction, ticket_row):
             await applicant.send(embed=dm_embed)
             actions.append("Applicant DM sent")
         except Exception:
-            await channel.send("⚠️ I could not DM the applicant their Hub signup link. They may have DMs disabled.")
+            if channel:
+                await channel.send("⚠️ I could not DM the applicant their Hub signup link. They may have DMs disabled.")
 
     if interaction.response.is_done():
         await interaction.followup.send(
@@ -5741,6 +5789,8 @@ async def accept_application_ticket(interaction, ticket_row):
             "✅ Applicant accepted and saved." if ok else "❌ Accept failed. Check the ticket for details.",
             ephemeral=True,
         )
+
+    return bool(ok)
 
 
 class ScreenshotUploadedView(discord.ui.View):
@@ -6029,9 +6079,11 @@ async def send_ticket_close_outputs(guild, channel, ticket_id, opener_id, closer
 
 class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
     reason = discord.ui.TextInput(label="Close reason", style=discord.TextStyle.paragraph, max_length=900)
-    def __init__(self, ticket_id):
+    def __init__(self, ticket_id, control_channel_id=None, control_message_id=None):
         super().__init__()
         self.ticket_id = ticket_id
+        self.control_channel_id = control_channel_id
+        self.control_message_id = control_message_id
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
@@ -6049,7 +6101,13 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         db_save_ticket_transcript(self.ticket_id, ticket_channel.id, transcript)
         db_update_ticket_status(self.ticket_id, "closed", interaction.user.id, closed_at=datetime.now(timezone.utc), closed_by=interaction.user.id, close_reason=str(self.reason.value))
         await send_ticket_close_outputs(interaction.guild, ticket_channel, self.ticket_id, opener_id, interaction.user.id, opened_at, str(self.reason.value), transcript)
-        await interaction.followup.send("✅ Transcript saved and sent. Deleting ticket shortly.", ephemeral=True)
+        await delete_ticket_control_message(
+            interaction.guild,
+            ticket_id=self.ticket_id,
+            channel_id=self.control_channel_id,
+            message_id=self.control_message_id,
+        )
+        await interaction.followup.send("✅ Transcript saved, sent, and the control message was removed. Deleting ticket shortly.", ephemeral=True)
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
         try:
             await ticket_channel.delete(reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
@@ -6058,10 +6116,12 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
 
 
 class AcceptConfirmView(discord.ui.View):
-    def __init__(self, ticket_id, requester_id):
+    def __init__(self, ticket_id, requester_id, control_channel_id=None, control_message_id=None):
         super().__init__(timeout=60)
         self.ticket_id = ticket_id
         self.requester_id = int(requester_id)
+        self.control_channel_id = control_channel_id
+        self.control_message_id = control_message_id
 
     async def interaction_check(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester_id:
@@ -6087,7 +6147,14 @@ class AcceptConfirmView(discord.ui.View):
         except Exception:
             pass
 
-        await accept_application_ticket(interaction, row)
+        accepted = await accept_application_ticket(interaction, row)
+        if accepted:
+            await delete_ticket_control_message(
+                interaction.guild,
+                ticket_id=self.ticket_id,
+                channel_id=self.control_channel_id,
+                message_id=self.control_message_id,
+            )
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -6143,10 +6210,12 @@ class StaffInfoView(discord.ui.View):
 
 
 class CloseConfirmView(discord.ui.View):
-    def __init__(self, ticket_id, requester_id):
+    def __init__(self, ticket_id, requester_id, control_channel_id=None, control_message_id=None):
         super().__init__(timeout=60)
         self.ticket_id = str(ticket_id)
         self.requester_id = int(requester_id)
+        self.control_channel_id = control_channel_id
+        self.control_message_id = control_message_id
 
     async def interaction_check(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester_id:
@@ -6164,7 +6233,7 @@ class CloseConfirmView(discord.ui.View):
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[0]) != self.ticket_id:
             return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
-        await interaction.response.send_modal(CloseTicketModal(self.ticket_id))
+        await interaction.response.send_modal(CloseTicketModal(self.ticket_id, self.control_channel_id, self.control_message_id))
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -6214,7 +6283,7 @@ class ApplicationReviewView(discord.ui.View):
                 "• Their Roblox profile/history and requirements\n\n"
                 "Confirming will link their Roblox account, save this ticket for broadcasts, and give the member role."
             ),
-            view=AcceptConfirmView(row[0], interaction.user.id),
+            view=AcceptConfirmView(row[0], interaction.user.id, interaction.channel.id, interaction.message.id if interaction.message else None),
             ephemeral=True,
         )
 
@@ -6244,7 +6313,11 @@ class ApplicationReviewView(discord.ui.View):
             timestamp=datetime.now(timezone.utc),
         )
         ticket_id = self.resolved_ticket_id(interaction)
-        await interaction.response.send_message(embed=embed, view=CloseConfirmView(ticket_id, interaction.user.id), ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed,
+            view=CloseConfirmView(ticket_id, interaction.user.id, interaction.channel.id, interaction.message.id if interaction.message else None),
+            ephemeral=True,
+        )
 
 
 class MCWVTicketPanelView(discord.ui.View):
