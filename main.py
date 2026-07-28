@@ -6112,10 +6112,18 @@ async def log_ticket_event(guild, embed):
             print("ticket log send error:", exc)
 
 
-async def send_ticket_application_banner(channel):
+async def send_ticket_application_banner(channel, mention=None):
     try:
         if MCWV_TICKET_BANNER_PATH and os.path.exists(MCWV_TICKET_BANNER_PATH):
-            await channel.send(file=discord.File(MCWV_TICKET_BANNER_PATH, filename="clan_application_banner.png"))
+            filename = "clan_application_banner.png"
+            embed = discord.Embed(color=discord.Color.from_rgb(52, 211, 153))
+            embed.set_image(url=f"attachment://{filename}")
+            await channel.send(
+                content=mention or None,
+                embed=embed,
+                file=discord.File(MCWV_TICKET_BANNER_PATH, filename=filename),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
             return True
         print(f"[ticket] banner file missing: {MCWV_TICKET_BANNER_PATH}")
     except Exception as exc:
@@ -6480,14 +6488,18 @@ class ApplicationModal(discord.ui.Modal):
 
         # Banner is best-effort only. If Discord/file upload blocks or fails,
         # do not let it stop the actual ticket instructions from sending.
+        banner_sent = False
         try:
-            await asyncio.wait_for(send_ticket_application_banner(channel), timeout=8)
+            banner_sent = await asyncio.wait_for(
+                send_ticket_application_banner(channel, interaction.user.mention),
+                timeout=8,
+            )
         except Exception as banner_error:
             print(f"[ticket] banner skipped in {channel.id}: {banner_error}")
 
         try:
             await channel.send(
-                content=interaction.user.mention,
+                content=None if banner_sent else interaction.user.mention,
                 embed=screenshot_embed,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
             )
