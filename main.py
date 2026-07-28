@@ -668,6 +668,82 @@ async def _admin_ticket_clear(actor_id=0):
         raise ValueError(f"Failed to clear tickets: {exc}")
 
 
+async def _ticket_blacklist_payload_row(guild, row):
+    discord_id = int(row[0])
+    user = guild.get_member(discord_id) if guild else None
+    if user is None:
+        try:
+            user = await bot.fetch_user(discord_id)
+        except Exception:
+            user = None
+    return {
+        "discordId": str(discord_id),
+        "reason": row[1] or "",
+        "createdBy": str(row[2]) if row[2] else None,
+        "createdAt": row[3].isoformat() if row[3] else None,
+        "username": str(user) if user else None,
+        "displayName": getattr(user, "display_name", None) if user else None,
+        "avatarUrl": user.display_avatar.url if user else None,
+    }
+
+
+async def _admin_ticket_blacklist_list():
+    guild = broadcast_primary_guild()
+    rows = db_ticket_blacklist_list()
+    items = []
+    for row in rows:
+        items.append(await _ticket_blacklist_payload_row(guild, row))
+    return {"success": True, "blacklist": items}
+
+
+async def _admin_ticket_blacklist_add(discord_id, reason, actor_id=0):
+    guild = broadcast_primary_guild()
+    if not str(discord_id or "").isdigit():
+        raise ValueError("A valid Discord user ID is required")
+    if not db_ticket_blacklist_add(discord_id, reason, actor_id):
+        raise ValueError("Failed to save blacklist entry")
+    member = None
+    if guild:
+        member = guild.get_member(int(discord_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(discord_id))
+            except Exception:
+                member = None
+    if member and guild:
+        role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
+        if role:
+            try:
+                await member.add_roles(role, reason=f"Ticket blacklist from Hub by {actor_id}: {reason}")
+            except Exception as exc:
+                print(f"[ticket blacklist] role add failed for {discord_id}: {exc}")
+    row = db_ticket_blacklist_get(discord_id)
+    return {"success": True, "entry": await _ticket_blacklist_payload_row(guild, row)}
+
+
+async def _admin_ticket_blacklist_remove(discord_id, actor_id=0):
+    guild = broadcast_primary_guild()
+    if not str(discord_id or "").isdigit():
+        raise ValueError("A valid Discord user ID is required")
+    db_ticket_blacklist_remove(discord_id)
+    member = None
+    if guild:
+        member = guild.get_member(int(discord_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(discord_id))
+            except Exception:
+                member = None
+    if member and guild:
+        role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason=f"Ticket blacklist removed from Hub by {actor_id}")
+            except Exception as exc:
+                print(f"[ticket blacklist] role remove failed for {discord_id}: {exc}")
+    return {"success": True, "removed": str(discord_id)}
+
+
 @app.route("/admin/tickets/settings", methods=["GET", "POST"])
 @require_admin_api_key
 def admin_ticket_settings():
@@ -676,6 +752,26 @@ def admin_ticket_settings():
     body = request.get_json(silent=True) or {}
     settings = save_mcwv_ticket_settings(body.get("settings") if isinstance(body.get("settings"), dict) else body)
     return jsonify({"success": True, "settings": settings})
+
+
+@app.route("/admin/tickets/blacklist", methods=["GET", "POST"])
+@require_admin_api_key
+def admin_ticket_blacklist():
+    body = request.get_json(silent=True) or {}
+    try:
+        if request.method == "GET":
+            future = _run_on_bot_loop(_admin_ticket_blacklist_list())
+        else:
+            action = str(body.get("action") or "add").lower()
+            discord_id = body.get("discord_id") or body.get("discordId") or body.get("user_id") or body.get("userId")
+            if action in ("remove", "delete", "unblacklist"):
+                future = _run_on_bot_loop(_admin_ticket_blacklist_remove(discord_id, body.get("actor_id") or body.get("actorId") or 0))
+            else:
+                future = _run_on_bot_loop(_admin_ticket_blacklist_add(discord_id, body.get("reason") or "No reason provided", body.get("actor_id") or body.get("actorId") or 0))
+        payload = future.result(timeout=25)
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/admin/tickets", methods=["GET"])
@@ -2899,6 +2995,14 @@ def db_ensure_mcwv_ticket_tables():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_blacklist (
+                    discord_id BIGINT PRIMARY KEY,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
     except Exception as e:
         print("db_ensure_mcwv_ticket_tables error:", e)
@@ -3070,6 +3174,83 @@ def db_save_ticket_transcript(ticket_id, channel_id, transcript_text):
         print("db_save_ticket_transcript error:", e)
         conn.rollback()
         return False
+
+
+def db_ticket_blacklist_add(discord_id, reason="", actor_id=None):
+    if not db_enabled():
+        return False
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_ticket_blacklist (discord_id, reason, created_by, created_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (discord_id)
+                DO UPDATE SET reason = EXCLUDED.reason, created_by = EXCLUDED.created_by, created_at = NOW()
+            """, (int(discord_id), str(reason or ""), int(actor_id) if actor_id else None))
+        conn.commit()
+        return True
+    except Exception as exc:
+        print("db_ticket_blacklist_add error:", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def db_ticket_blacklist_remove(discord_id):
+    if not db_enabled():
+        return False
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM mcwv_ticket_blacklist WHERE discord_id = %s", (int(discord_id),))
+        conn.commit()
+        return True
+    except Exception as exc:
+        print("db_ticket_blacklist_remove error:", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def db_ticket_blacklist_list():
+    if not db_enabled():
+        return []
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT discord_id, reason, created_by, created_at
+                FROM mcwv_ticket_blacklist
+                ORDER BY created_at DESC
+                LIMIT 500
+            """)
+            return cur.fetchall()
+    except Exception as exc:
+        print("db_ticket_blacklist_list error:", exc)
+        return []
+
+
+def db_ticket_blacklist_get(discord_id):
+    if not db_enabled():
+        return None
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT discord_id, reason, created_by, created_at
+                FROM mcwv_ticket_blacklist
+                WHERE discord_id = %s
+                LIMIT 1
+            """, (int(discord_id),))
+            return cur.fetchone()
+    except Exception as exc:
+        print("db_ticket_blacklist_get error:", exc)
+        return None
 
 
 def db_set_user_status(rid, status):
@@ -6841,6 +7022,7 @@ class StaffInfoView(discord.ui.View):
 
         try:
             await member.add_roles(role, reason=f"Ticket blacklist by {interaction.user}")
+            db_ticket_blacklist_add(member.id, f"Blacklisted from Staff Info by {interaction.user}", interaction.user.id)
             db_ticket_log(self.ticket_id, interaction.user.id, "ticket/blacklist", f"Blacklisted {member} from opening application tickets", {"roleId": str(role.id)})
             await interaction.response.send_message(f"✅ {member.mention} has been given **{role.name}** and cannot open application tickets.", ephemeral=True)
             try:
@@ -6980,6 +7162,10 @@ class MCWVTicketPanelView(discord.ui.View):
         blacklist_role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
         if blacklist_role and isinstance(interaction.user, discord.Member) and blacklist_role in interaction.user.roles:
             return await interaction.response.send_message("❌ You are currently blocked from opening MCWV application tickets.", ephemeral=True)
+        blacklist_entry = db_ticket_blacklist_get(interaction.user.id)
+        if blacklist_entry:
+            reason = str(blacklist_entry[1] or "No reason provided")[:500]
+            return await interaction.response.send_message(f"❌ You are currently blocked from opening MCWV application tickets. Reason: {reason}", ephemeral=True)
         existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
         if existing:
             return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
