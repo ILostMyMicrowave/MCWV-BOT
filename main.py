@@ -10838,8 +10838,8 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
         return (*rgb, alpha)
 
     fonts = {
-        "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(72)),
-        "pill": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(38)),
+        "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(66)),
+        "pill": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(32)),
         "rank": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(106)),
         "label": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", sc(52)),
         "points": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(58)),
@@ -10911,17 +10911,17 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
         draw_text_shadow(d, (ox + sc(55), oy + sc(74)), "MCWV", fonts["logo"], (174, 86, 255, 255), offset=(sc(2), sc(2)))
 
     # Title.
-    draw_text_shadow(d, (ox + sc(205), oy + sc(61)), f"[{CLAN_NAME}]", fonts["title"], (247, 249, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(4), sc(5)))
+    draw_text_shadow(d, (ox + sc(205), oy + sc(70)), f"[{CLAN_NAME}]", fonts["title"], (247, 249, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(4), sc(5)))
 
     # Status pill.
     pill_text = f"Position {'Increased' if improved else 'Decreased'} by {diff}"
     pill_bbox = d.textbbox((0, 0), pill_text, font=fonts["pill"])
-    pill_w = (pill_bbox[2] - pill_bbox[0]) + sc(56)
-    pill_h = sc(62)
+    pill_w = (pill_bbox[2] - pill_bbox[0]) + sc(44)
+    pill_h = sc(58)
     pill = (ox + cw - pill_w - sc(36), oy + sc(38), ox + cw - sc(36), oy + sc(38) + pill_h)
     d.rounded_rectangle(pill, radius=sc(20), fill=(*accent_deep, 150), outline=(*accent, 125), width=sc(3))
     d.rounded_rectangle((pill[0]+sc(3), pill[1]+sc(3), pill[2]-sc(3), pill[3]-sc(3)), radius=sc(17), outline=(255, 255, 255, 28), width=sc(1))
-    draw_text_shadow(d, (pill[0] + sc(28), pill[1] + sc(8)), pill_text, fonts["pill"], color(accent), shadow=(0, 0, 0, 170), offset=(sc(3), sc(3)))
+    draw_text_shadow(d, (pill[0] + sc(22), pill[1] + sc(9)), pill_text, fonts["pill"], color(accent), shadow=(0, 0, 0, 170), offset=(sc(3), sc(3)))
 
     # Rank transition bar.
     bar = (ox + sc(36), oy + sc(181), ox + cw - sc(36), oy + sc(367))
@@ -10930,30 +10930,32 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     bd = ImageDraw.Draw(bar_layer)
     for x in range(bar_w):
         t = x / max(bar_w - 1, 1)
-        if t < 0.38:
+        if t < 0.55:
             rgb = (31, 44, 115)
             a = 236
         else:
-            mix = (t - 0.38) / 0.62
-            rgb = tuple(int((1 - mix) * b + mix * a) for b, a in zip((31, 44, 115), accent_soft))
-            a = int(190 + 22 * mix)
+            mix = (t - 0.55) / 0.45
+            # Keep the right side muted like the reference card, not neon-solid.
+            target = tuple(int(v * 0.72) for v in accent_soft)
+            rgb = tuple(int((1 - mix) * b + mix * a) for b, a in zip((31, 44, 115), target))
+            a = int(188 + 18 * mix)
         bd.line((x, 0, x, bar_h), fill=(*rgb, a))
     bar_mask = rounded_mask((bar_w, bar_h), sc(34))
     img.paste(bar_layer, (bar[0], bar[1]), bar_mask)
     d.rounded_rectangle(bar, radius=sc(34), outline=(72, 91, 180, 72), width=sc(2))
 
     # Chevrons inside bar.
-    c1 = [(ox+sc(435), bar[1]), (ox+sc(560), oy+sc(274)), (ox+sc(435), bar[3]), (ox+sc(515), bar[3]), (ox+sc(640), oy+sc(274)), (ox+sc(515), bar[1])]
-    c2 = [(ox+sc(515), bar[1]), (ox+sc(640), oy+sc(274)), (ox+sc(515), bar[3]), (ox+sc(595), bar[3]), (ox+sc(720), oy+sc(274)), (ox+sc(595), bar[1])]
-    d.polygon(c1, fill=(*accent, 45))
-    d.polygon(c2, fill=(*accent, 28))
+    c1 = [(ox+sc(430), bar[1]), (ox+sc(545), oy+sc(274)), (ox+sc(430), bar[3]), (ox+sc(505), bar[3]), (ox+sc(620), oy+sc(274)), (ox+sc(505), bar[1])]
+    c2 = [(ox+sc(505), bar[1]), (ox+sc(620), oy+sc(274)), (ox+sc(505), bar[3]), (ox+sc(578), bar[3]), (ox+sc(690), oy+sc(274)), (ox+sc(578), bar[1])]
+    d.polygon(c1, fill=(*accent, 30))
+    d.polygon(c2, fill=(*accent, 18))
 
     # Rank numbers.
     draw_text_shadow(d, (ox + sc(83), oy + sc(233)), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255), shadow=(0, 0, 0, 155), offset=(sc(5), sc(6)))
     new_text = f"#{new_rank}"
     new_bbox = d.textbbox((0, 0), new_text, font=fonts["rank"])
     new_w = new_bbox[2] - new_bbox[0]
-    draw_text_shadow(d, (ox + cw - sc(95) - new_w, oy + sc(233)), new_text, fonts["rank"], color(accent), shadow=(0, 0, 0, 165), offset=(sc(5), sc(6)))
+    draw_text_shadow(d, (ox + cw - sc(75) - new_w, oy + sc(233)), new_text, fonts["rank"], color(accent), shadow=(0, 0, 0, 165), offset=(sc(5), sc(6)))
 
     # Contributions bottom line.
     label = "Contributions"
