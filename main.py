@@ -116,6 +116,23 @@ def _safe_call(name, default=None, *args, **kwargs):
         return default
 
 
+def parse_hex_color(value, default=0x34D399):
+    if value is None or value == "":
+        return int(default)
+    try:
+        raw = str(value).strip().replace("#", "")
+        if raw.lower().startswith("0x"):
+            raw = raw[2:]
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", raw):
+            return int(default)
+        return int(raw, 16)
+    except Exception:
+        try:
+            return int(default)
+        except Exception:
+            return 0x34D399
+
+
 def _loop_status(name):
     loop_obj = globals().get(name)
     if loop_obj is None:
