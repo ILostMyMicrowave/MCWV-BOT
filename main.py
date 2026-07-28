@@ -4298,7 +4298,7 @@ DEFAULT_MCWV_TICKET_SETTINGS = {
             "• Game-passes\n"
             "• Player profile *(found in trading plaza, double tap on avatar)*\n\n"
             "**Make sure the screenshots are NON-CROPPED!**\n\n"
-            "After uploading them in this ticket, press **I've uploaded my screenshots** below."
+            "After uploading them in this ticket, press **Screenshots uploaded** below."
         ),
     },
     "questions": [
@@ -5476,7 +5476,7 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
     embed.add_field(
         name="Next step",
-        value="Review screenshots and application answers, then **Accept** if they meet MCWV requirements.",
+        value="Review screenshots, open **Staff Info** for answers/gamepasses, check Roblox history/requirements, then **Accept** if they meet MCWV requirements.",
         inline=False,
     )
     embed.set_footer(text=f"Claimed by {claimed_by}" if claimed_by else "Pending staff review")
@@ -5801,7 +5801,7 @@ class ApplicationModal(discord.ui.Modal):
         messages = self.settings.get("messages", DEFAULT_MCWV_TICKET_SETTINGS["messages"])
         welcome_description = str(messages.get("welcomeDescription") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeDescription"])
         if "uploaded my screenshots" not in welcome_description.lower():
-            welcome_description += "\n\nAfter uploading them in this ticket, press **I've uploaded my screenshots** below."
+            welcome_description += "\n\nAfter uploading them in this ticket, press **Screenshots uploaded** below."
 
         screenshot_embed = discord.Embed(
             title=str(messages.get("welcomeTitle") or DEFAULT_MCWV_TICKET_SETTINGS["messages"]["welcomeTitle"]),
@@ -5811,12 +5811,12 @@ class ApplicationModal(discord.ui.Modal):
         )
         screenshot_embed.set_footer(text="MCWV Applications")
         try:
-            await channel.send(content=interaction.user.mention, embed=screenshot_embed, view=ScreenshotUploadedView())
+            await channel.send(content=interaction.user.mention, embed=screenshot_embed)
         except Exception as send_error:
             print(f"[ticket] screenshot embed send failed in {channel.id}: {send_error}")
             try:
                 await channel.send(
-                    f"{interaction.user.mention} Thank you for applying for MCWV! Please upload your non-cropped screenshots, then press the screenshot button when staff resend it."
+                    f"{interaction.user.mention} Thank you for applying for MCWV! Please upload your non-cropped screenshots listed in the application instructions."
                 )
             except Exception as fallback_error:
                 print(f"[ticket] fallback send failed in {channel.id}: {fallback_error}")
@@ -5824,6 +5824,15 @@ class ApplicationModal(discord.ui.Modal):
                     f"⚠️ Ticket was created ({channel.mention}) but I cannot send messages there. Please check my channel permissions.",
                     ephemeral=True,
                 )
+
+        try:
+            await channel.send(
+                "Once every required screenshot is uploaded, press the button below so staff know your application is ready for review.",
+                view=ScreenshotUploadedView(),
+            )
+        except Exception as button_error:
+            print(f"[ticket] screenshot confirmation button failed in {channel.id}: {button_error}")
+            await channel.send("When your screenshots are uploaded, please tell staff: `Screenshots uploaded`.")
 
         review_embed = build_application_review_embed(
             ticket_id,
@@ -5968,7 +5977,14 @@ class ApplicationReviewView(discord.ui.View):
             return await interaction.response.send_message("This application is already accepted.", ephemeral=True)
 
         await interaction.response.send_message(
-            "⚠️ Are you sure you want to accept this applicant? This will link their Roblox account, save this ticket for broadcasts, and give the member role.",
+            (
+                "⚠️ **Are you sure you want to accept this applicant?**\n\n"
+                "Before confirming, make sure you have checked:\n"
+                "• Their full non-cropped screenshots\n"
+                "• Their application answers via **Staff Info**\n"
+                "• Their Roblox profile/history and requirements\n\n"
+                "Confirming will link their Roblox account, save this ticket for broadcasts, and give the member role."
+            ),
             view=AcceptConfirmView(row[0], interaction.user.id),
             ephemeral=True,
         )
