@@ -6458,7 +6458,6 @@ class ApplicationModal(discord.ui.Modal):
             activity,
             liquid_gems,
             why_accept,
-            avatar_url=roblox_avatar_url,
         )
         if not saved:
             return await interaction.followup.send("❌ Ticket created, but I could not save the application. Please contact staff.", ephemeral=True)
@@ -6478,9 +6477,20 @@ class ApplicationModal(discord.ui.Modal):
             timestamp=datetime.now(timezone.utc),
         )
         screenshot_embed.set_footer(text="MCWV Applications")
+
+        # Banner is best-effort only. If Discord/file upload blocks or fails,
+        # do not let it stop the actual ticket instructions from sending.
         try:
-            await send_ticket_application_banner(channel)
-            await channel.send(content=interaction.user.mention, embed=screenshot_embed)
+            await asyncio.wait_for(send_ticket_application_banner(channel), timeout=8)
+        except Exception as banner_error:
+            print(f"[ticket] banner skipped in {channel.id}: {banner_error}")
+
+        try:
+            await channel.send(
+                content=interaction.user.mention,
+                embed=screenshot_embed,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
         except Exception as send_error:
             print(f"[ticket] screenshot embed send failed in {channel.id}: {send_error}")
             try:
@@ -6513,6 +6523,7 @@ class ApplicationModal(discord.ui.Modal):
             activity,
             liquid_gems,
             why_accept,
+            avatar_url=roblox_avatar_url,
         )
         review_channel = guild.get_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
         try:
