@@ -563,6 +563,64 @@ def db_admin_get_mcwv_ticket(ticket_id):
     return payload
 
 
+async def enrich_ticket_last_message(ticket):
+    if not isinstance(ticket, dict) or not ticket.get("channelId"):
+        return ticket
+    try:
+        channel = await _maybe_get_channel(int(ticket["channelId"]))
+        last_at = None
+        if isinstance(channel, discord.TextChannel):
+            last_message_id = getattr(channel, "last_message_id", None)
+            if last_message_id:
+                try:
+                    message = await channel.fetch_message(int(last_message_id))
+                    last_at = message.created_at.astimezone(timezone.utc).isoformat()
+                except Exception:
+                    pass
+            if not last_at:
+                try:
+                    async for message in channel.history(limit=1):
+                        last_at = message.created_at.astimezone(timezone.utc).isoformat()
+                        break
+                except Exception:
+                    pass
+        if last_at:
+            ticket["lastMessageAt"] = last_at
+    except Exception as exc:
+        print(f"[tickets api] last message lookup failed for {ticket.get('ticketId')}: {exc}")
+    return ticket
+
+
+async def enrich_tickets_last_message(tickets):
+    semaphore = asyncio.Semaphore(8)
+
+    async def limited(ticket):
+        async with semaphore:
+            return await enrich_ticket_last_message(ticket)
+
+    return await asyncio.gather(*(limited(ticket) for ticket in tickets))
+
+
+async def _admin_tickets_list_payload():
+    tickets = db_admin_list_mcwv_tickets()
+    tickets = await enrich_tickets_last_message(tickets)
+    metrics = {
+        "total": len(tickets),
+        "open": sum(1 for ticket in tickets if ticket.get("status") in ("open", "pending")),
+        "pending": sum(1 for ticket in tickets if ticket.get("status") == "pending"),
+        "accepted": sum(1 for ticket in tickets if ticket.get("status") == "accepted"),
+        "closed": sum(1 for ticket in tickets if ticket.get("status") == "closed"),
+    }
+    return {"success": True, "tickets": tickets, "metrics": metrics}
+
+
+async def _admin_ticket_detail_payload(ticket_id):
+    ticket = db_admin_get_mcwv_ticket(ticket_id)
+    if not ticket:
+        return None
+    return await enrich_ticket_last_message(ticket)
+
+
 async def _admin_ticket_accept(ticket_id, actor_id):
     ticket = db_admin_get_mcwv_ticket(ticket_id)
     if not ticket:
@@ -790,15 +848,9 @@ def admin_ticket_blacklist():
 @require_admin_api_key
 def admin_tickets_list():
     try:
-        tickets = db_admin_list_mcwv_tickets()
-        metrics = {
-            "total": len(tickets),
-            "open": sum(1 for ticket in tickets if ticket.get("status") in ("open", "pending")),
-            "pending": sum(1 for ticket in tickets if ticket.get("status") == "pending"),
-            "accepted": sum(1 for ticket in tickets if ticket.get("status") == "accepted"),
-            "closed": sum(1 for ticket in tickets if ticket.get("status") == "closed"),
-        }
-        return jsonify({"success": True, "tickets": tickets, "metrics": metrics})
+        future = _run_on_bot_loop(_admin_tickets_list_payload())
+        payload = future.result(timeout=30)
+        return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": str(exc), "tickets": []}), 500
 
@@ -807,7 +859,8 @@ def admin_tickets_list():
 @require_admin_api_key
 def admin_ticket_detail(ticket_id):
     try:
-        ticket = db_admin_get_mcwv_ticket(ticket_id)
+        future = _run_on_bot_loop(_admin_ticket_detail_payload(ticket_id))
+        ticket = future.result(timeout=15)
         if not ticket:
             return jsonify({"error": "Ticket not found"}), 404
         return jsonify({"success": True, "ticket": ticket})
