@@ -5699,6 +5699,31 @@ async def accept_application_ticket(interaction, ticket_row):
         )
 
 
+class ScreenshotUploadedView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Screenshots uploaded", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_screenshots_uploaded")
+    async def uploaded_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        if interaction.user.id != int(row[3]):
+            return await interaction.response.send_message("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
+
+        staff_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS))
+        db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
+
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(content="✅ Screenshots confirmed. Staff have been notified.", view=self)
+        await interaction.channel.send(
+            f"✅ Thanks {interaction.user.mention}! {staff_mentions} will review your application soon.",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+        )
+
+
 class ApplicationModal(discord.ui.Modal):
     def __init__(self, opener):
         super().__init__(title="MCWV Application")
@@ -5958,6 +5983,39 @@ class AcceptConfirmView(discord.ui.View):
         self.stop()
 
 
+class CloseConfirmView(discord.ui.View):
+    def __init__(self, ticket_id, requester_id):
+        super().__init__(timeout=60)
+        self.ticket_id = str(ticket_id)
+        self.requester_id = int(requester_id)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the officer who clicked Close can confirm this.", ephemeral=True)
+            return False
+        if not has_mcwv_ticket_staff_permission(interaction.user):
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Continue to close", style=discord.ButtonStyle.danger)
+    async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+        if str(row[0]) != self.ticket_id:
+            return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
+        await interaction.response.send_modal(CloseTicketModal(self.ticket_id))
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Close cancelled.", embed=None, view=self)
+        self.stop()
+
+
 class ApplicationReviewView(discord.ui.View):
     def __init__(self, ticket_id):
         super().__init__(timeout=None)
@@ -6003,7 +6061,17 @@ class ApplicationReviewView(discord.ui.View):
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.staff_ok(interaction):
             return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        await interaction.response.send_modal(CloseTicketModal(self.ticket_id))
+        embed = discord.Embed(
+            title="Close this application ticket?",
+            description=(
+                "This will generate and save a transcript, mark the ticket as closed, "
+                f"and delete the channel after **{MCWV_TICKET_DELETE_DELAY_SECONDS}s**.\n\n"
+                "Only continue if the application is finished or no longer needed."
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.response.send_message(embed=embed, view=CloseConfirmView(self.ticket_id, interaction.user.id), ephemeral=True)
 
 
 class MCWVTicketPanelView(discord.ui.View):
@@ -9364,7 +9432,7 @@ async def ticket_screenshot_reminder_loop():
                 title="Screenshot reminder",
                 description=(
                     "Please upload your **non-cropped** screenshots for your MCWV application, then press "
-                    "**I've uploaded my screenshots** so staff know your application is ready."
+                    "**Screenshots uploaded** so staff know your application is ready."
                 ),
                 color=discord.Color.orange(),
                 timestamp=datetime.now(timezone.utc),
