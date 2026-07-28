@@ -5741,11 +5741,13 @@ class ApplicationModal(discord.ui.Modal):
         if not isinstance(category, discord.CategoryChannel):
             return await interaction.followup.send("❌ Ticket category is not configured correctly. Please contact staff.", ephemeral=True)
 
+        bot_member = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True, embed_links=True),
         }
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True, embed_links=True)
         for role_id in MCWV_TICKET_STAFF_ROLE_IDS:
             role = guild.get_role(role_id)
             if role:
@@ -5759,6 +5761,20 @@ class ApplicationModal(discord.ui.Modal):
             overwrites=overwrites,
             reason=f"MCWV application opened by {interaction.user}",
         )
+        if bot_member:
+            try:
+                await channel.set_permissions(
+                    bot_member,
+                    view_channel=True,
+                    send_messages=True,
+                    manage_channels=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                )
+            except Exception as perm_error:
+                print(f"[ticket] could not reinforce bot permissions: {perm_error}")
+
         ticket_id = f"app-{channel.id}"
         db_create_mcwv_ticket(ticket_id, channel.id, guild.id, interaction.user.id)
 
@@ -5794,7 +5810,20 @@ class ApplicationModal(discord.ui.Modal):
             timestamp=datetime.now(timezone.utc),
         )
         screenshot_embed.set_footer(text="MCWV Applications")
-        await channel.send(content=interaction.user.mention, embed=screenshot_embed, view=ScreenshotUploadedView())
+        try:
+            await channel.send(content=interaction.user.mention, embed=screenshot_embed, view=ScreenshotUploadedView())
+        except Exception as send_error:
+            print(f"[ticket] screenshot embed send failed in {channel.id}: {send_error}")
+            try:
+                await channel.send(
+                    f"{interaction.user.mention} Thank you for applying for MCWV! Please upload your non-cropped screenshots, then press the screenshot button when staff resend it."
+                )
+            except Exception as fallback_error:
+                print(f"[ticket] fallback send failed in {channel.id}: {fallback_error}")
+                return await interaction.followup.send(
+                    f"⚠️ Ticket was created ({channel.mention}) but I cannot send messages there. Please check my channel permissions.",
+                    ephemeral=True,
+                )
 
         review_embed = build_application_review_embed(
             ticket_id,
@@ -5806,7 +5835,16 @@ class ApplicationModal(discord.ui.Modal):
             liquid_gems,
             why_accept,
         )
-        await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
+        try:
+            await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
+        except Exception as review_error:
+            print(f"[ticket] review embed send failed in {channel.id}: {review_error}")
+            await interaction.followup.send(
+                f"⚠️ Ticket was created ({channel.mention}) but the staff review embed could not be sent. Check my permissions.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.followup.send(f"✅ Application ticket created: {channel.mention}", ephemeral=True)
 
 
