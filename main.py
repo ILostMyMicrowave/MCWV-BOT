@@ -4324,6 +4324,24 @@ PS99_IMPORTANT_GAMEPASSES = {
     975558264: "Super Shiny Hunter",
     720275150: "Double Stars",
 }
+KNOWN_PS99_BATTLE_IDS = [
+    "GummyBattle2026",
+    "LunarBattle2026",
+    "SoccerBattle2026",
+    "Backrooms2026",
+    "AngelBattle2026",
+    "StarryBattle",
+    "Spring2026",
+    "BlockPartyBattle",
+    "StrengthBattle",
+    "TowerBattle",
+    "BasketballBattle",
+    "BalloonCorgiBattle",
+    "PoisonTurtleBattle",
+    "AthenaBattle",
+]
+PLAYER_WAR_HISTORY_CACHE = {}
+PLAYER_WAR_HISTORY_TTL_SECONDS = 30 * 60
 
 DEFAULT_MCWV_TICKET_SETTINGS = {
     "panel": {
@@ -5569,6 +5587,214 @@ def format_gamepass_results(results):
     return "\n".join(lines)[:1024]
 
 
+def _safe_int(value, default=0):
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
+def _friendly_battle_name(battle_id):
+    text = str(battle_id or "Unknown Battle")
+    return re.sub(r'(\d+)', r' \1', re.sub(r'([a-z])([A-Z])', r'\1 \2', text)).strip()
+
+
+def _battle_sort_key(item):
+    return int(item.get("startTime") or 0), str(item.get("battleId") or "")
+
+
+async def _ps99_json(url, timeout_seconds=15):
+    global session
+    if session is None or getattr(session, "closed", False):
+        session = aiohttp.ClientSession()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as res:
+            if res.status != 200:
+                return None
+            return await res.json(content_type=None)
+    except Exception as exc:
+        print(f"[ticket war history] fetch failed {url}: {exc}")
+        return None
+
+
+def _extract_clan_battle_ids(clan_payload):
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    battles = data.get("Battles") or data.get("battles") or {}
+    if isinstance(battles, dict):
+        return list(battles.keys())
+    return []
+
+
+async def fetch_known_battle_ids_for_history():
+    ids = list(KNOWN_PS99_BATTLE_IDS)
+    clan_payload = await _ps99_json(CLAN_API)
+    ids.extend(_extract_clan_battle_ids(clan_payload or {}))
+    seen = set()
+    cleaned = []
+    for battle_id in ids:
+        battle_id = str(battle_id or "").strip()
+        if not battle_id or not re.fullmatch(r"[A-Za-z0-9_]+", battle_id):
+            continue
+        key = battle_id.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(battle_id)
+    return cleaned[:30], clan_payload
+
+
+def _mcwv_history_from_clan_payload(roblox_id, clan_payload):
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    battles = data.get("Battles") or data.get("battles") or {}
+    rows = []
+    if not isinstance(battles, dict):
+        return rows
+
+    target = str(roblox_id).strip()
+    for battle_id, battle in battles.items():
+        if not isinstance(battle, dict):
+            continue
+        contributions = battle.get("PointContributions") or battle.get("pointContributions") or []
+        if not isinstance(contributions, list):
+            continue
+        ranked = sorted(contributions, key=lambda item: _safe_int(item.get("Points") if isinstance(item, dict) else 0), reverse=True)
+        for index, item in enumerate(ranked, start=1):
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("UserID") or item.get("userId") or item.get("UserId") or "").strip()
+            if user_id != target:
+                continue
+            total = max(1, len(ranked))
+            better = max(0.0, ((total - index) / total) * 100) if total else 0.0
+            rows.append({
+                "battleId": str(battle_id),
+                "title": _friendly_battle_name(battle_id),
+                "clan": "MCWV",
+                "points": _safe_int(item.get("Points")),
+                "rank": index,
+                "total": total,
+                "betterThan": better,
+                "clanPlace": battle.get("Place") or battle.get("place"),
+                "startTime": _safe_int(battle.get("StartTime") or battle.get("startTime")),
+                "source": "MCWV exact",
+            })
+            break
+    return rows
+
+
+async def _battle_history_lookup(battle_id, roblox_id):
+    payload = await _ps99_json(f"{PS99_API}/v1/clans/battles/{battle_id}")
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        return None
+    players = data.get("topPlayers") or []
+    if not isinstance(players, list):
+        return None
+    target = str(roblox_id).strip()
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        if str(player.get("userId") or player.get("UserID") or "").strip() != target:
+            continue
+        stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        total = _safe_int(stats.get("totalContributors"), len(players)) or len(players)
+        rank = _safe_int(player.get("rank"), 0)
+        better = max(0.0, ((total - rank) / total) * 100) if total and rank else 0.0
+        clan = player.get("clan") if isinstance(player.get("clan"), dict) else {}
+        return {
+            "battleId": str(battle_id),
+            "title": str(meta.get("title") or _friendly_battle_name(battle_id)),
+            "clan": str(clan.get("name") or "—"),
+            "points": _safe_int(player.get("points")),
+            "rank": rank,
+            "total": total,
+            "betterThan": better,
+            "clanPlace": clan.get("place"),
+            "startTime": _safe_int(meta.get("startTime")),
+            "source": "Top-player sample",
+        }
+    return None
+
+
+async def fetch_ps99_player_war_history(roblox_id):
+    cache_key = str(roblox_id).strip()
+    now_ts = time.time()
+    cached = PLAYER_WAR_HISTORY_CACHE.get(cache_key)
+    if cached and cached.get("expires", 0) > now_ts:
+        return cached.get("data") or {}
+
+    summary_payload = await _ps99_json(f"{PS99_API}/v1/clans/players/{cache_key}")
+    summary_data = summary_payload.get("data", {}) if isinstance(summary_payload, dict) else {}
+    summary = summary_data.get("player") if isinstance(summary_data, dict) else None
+
+    battle_ids, clan_payload = await fetch_known_battle_ids_for_history()
+    rows = _mcwv_history_from_clan_payload(cache_key, clan_payload or {})
+    existing_ids = {str(row.get("battleId")).lower() for row in rows}
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def limited_lookup(battle_id):
+        async with semaphore:
+            return await _battle_history_lookup(battle_id, cache_key)
+
+    lookups = await asyncio.gather(*(limited_lookup(battle_id) for battle_id in battle_ids if str(battle_id).lower() not in existing_ids), return_exceptions=True)
+    for item in lookups:
+        if isinstance(item, dict) and item:
+            rows.append(item)
+
+    rows.sort(key=_battle_sort_key, reverse=True)
+    result = {
+        "summary": summary if isinstance(summary, dict) else None,
+        "activeBattleId": summary_data.get("activeBattleId") if isinstance(summary_data, dict) else None,
+        "sampledClans": summary_data.get("sampledClans") if isinstance(summary_data, dict) else None,
+        "battles": rows[:12],
+        "coverageNote": "PS99 clan history is sampled/capped. Missing battles do not prove the player was inactive or absent.",
+    }
+    PLAYER_WAR_HISTORY_CACHE[cache_key] = {"expires": now_ts + PLAYER_WAR_HISTORY_TTL_SECONDS, "data": result}
+    return result
+
+
+def format_player_war_history(history):
+    summary = history.get("summary") if isinstance(history, dict) else None
+    rows = history.get("battles", []) if isinstance(history, dict) else []
+    summary_lines = []
+    if isinstance(summary, dict):
+        clan = summary.get("Clan") if isinstance(summary.get("Clan"), dict) else {}
+        summary_lines.append(f"Known battles: **{_safe_int(summary.get('TotalBattles'))}**")
+        summary_lines.append(f"Earned medals: **{_safe_int(summary.get('EarnedMedals'))}**")
+        avg_place = summary.get("AvgPlace")
+        if avg_place is not None:
+            try:
+                summary_lines.append(f"Avg clan place: **{float(avg_place):.1f}**")
+            except Exception:
+                pass
+        summary_lines.append(f"Active battle points: **{format_points(_safe_int(summary.get('ActiveBattlePoints')))}**")
+        if clan.get("Name"):
+            summary_lines.append(f"Sampled clan: **{clan.get('Name')}**")
+    else:
+        summary_lines.append("No aggregate player history found in the sampled PS99 clan data.")
+
+    if rows:
+        battle_lines = []
+        for row in rows[:8]:
+            points = format_points(_safe_int(row.get("points")))
+            rank = _safe_int(row.get("rank"))
+            total = _safe_int(row.get("total"))
+            rank_text = f"#{rank}/{total}" if rank and total else "rank unknown"
+            better = row.get("betterThan")
+            better_text = f" • better than **{float(better):.1f}%**" if isinstance(better, (int, float)) else ""
+            clan_place = row.get("clanPlace")
+            place_text = f" • clan place **#{clan_place}**" if clan_place not in (None, "", 0) else ""
+            battle_lines.append(
+                f"• **{_friendly_battle_name(row.get('battleId'))}** — {points} pts — **{row.get('clan') or '—'}** — {rank_text}{better_text}{place_text}"
+            )
+        history_text = "\n".join(battle_lines)
+    else:
+        history_text = "No per-battle rows found from MCWV exact data or the PS99 sampled top-player battle data."
+
+    return "\n".join(summary_lines)[:1024], history_text[:1024]
+
+
 async def build_staff_info_embed(ticket_row):
     ticket_id = str(ticket_row[0])
     opener_id = int(ticket_row[3])
@@ -5592,9 +5818,29 @@ async def build_staff_info_embed(ticket_row):
     embed.add_field(name="Liquid gems per war", value=str(liquid_gems or "—")[:1024], inline=False)
     embed.add_field(name="Why should we accept you?", value=str(why_accept or "—")[:1024], inline=False)
 
-    gamepasses = await check_ps99_gamepasses(str(roblox_id))
-    embed.add_field(name="Gamepass check", value=format_gamepass_results(gamepasses), inline=False)
-    embed.set_footer(text="Only staff can see this panel.")
+    gamepasses, war_history = await asyncio.gather(
+        check_ps99_gamepasses(str(roblox_id)),
+        fetch_ps99_player_war_history(str(roblox_id)),
+        return_exceptions=True,
+    )
+    embed.add_field(
+        name="Gamepass check",
+        value=format_gamepass_results(gamepasses if isinstance(gamepasses, list) else []),
+        inline=False,
+    )
+
+    if isinstance(war_history, dict):
+        war_summary, war_rows = format_player_war_history(war_history)
+        embed.add_field(name="Known Clan War History", value=war_summary, inline=False)
+        embed.add_field(name="Recent Known Battles", value=war_rows, inline=False)
+    else:
+        embed.add_field(
+            name="Known Clan War History",
+            value="Could not load PS99 war history right now.",
+            inline=False,
+        )
+
+    embed.set_footer(text="Only staff can see this panel. PS99 war history is sampled/capped, so missing battles are not proof of no history.")
     return embed
 
 
