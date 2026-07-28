@@ -2867,6 +2867,24 @@ def db_get_ticket_by_channel(channel_id):
         return None
 
 
+def db_get_ticket_by_ticket_id(ticket_id):
+    if not db_enabled():
+        return None
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username, status, claimed_by
+                FROM mcwv_tickets
+                WHERE ticket_id = %s
+                LIMIT 1
+            """, (str(ticket_id),))
+            return cur.fetchone()
+    except Exception as e:
+        print("db_get_ticket_by_ticket_id error:", e)
+        return None
+
+
 def db_save_ticket_application(ticket_id, roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept):
     if not db_enabled():
         return False
@@ -4271,6 +4289,7 @@ TICKET_IGNORE_ROLE_IDS.add(1502339420207059066)
 MCWV_TICKET_CATEGORY_ID = int(os.environ.get("MCWV_TICKET_CATEGORY_ID", "1503106486392328333"))
 MCWV_TICKET_PANEL_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_PANEL_CHANNEL_ID", "1501613434364760174"))
 MCWV_TICKET_LOG_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_LOG_CHANNEL_ID", "1501997396610125876"))
+MCWV_TICKET_REVIEW_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_REVIEW_CHANNEL_ID", "1531603629063143424"))
 MCWV_TICKET_MEMBER_ROLE_ID = int(os.environ.get("MCWV_TICKET_MEMBER_ROLE_ID", str(CLAN_MEMBER_ROLE_ID)))
 MCWV_TICKET_BLACKLIST_ROLE_ID = int(os.environ.get("MCWV_TICKET_BLACKLIST_ROLE_ID", "1516151211735257259"))
 MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROLE_IDS")) or {ALLOWED_ROLE_ID, 1502339420207059066}
@@ -5590,7 +5609,14 @@ async def build_ticket_transcript(channel, limit=250):
 
 async def accept_application_ticket(interaction, ticket_row):
     guild = interaction.guild
-    channel = interaction.channel
+    channel = None
+    if guild and ticket_row and ticket_row[1]:
+        channel = guild.get_channel(int(ticket_row[1]))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(ticket_row[1]))
+            except Exception:
+                channel = None
     applicant_id = int(ticket_row[3])
     applicant = guild.get_member(applicant_id) if guild else None
     if applicant is None and guild:
@@ -5615,7 +5641,7 @@ async def accept_application_ticket(interaction, ticket_row):
     else:
         errors.append(f"Could not link Roblox account: {db_msg}")
 
-    if ok:
+    if ok and channel:
         if db_set_ticket_channel(applicant.id, channel.id):
             actions.append("Ticket saved for broadcasts")
         else:
@@ -5630,6 +5656,14 @@ async def accept_application_ticket(interaction, ticket_row):
             errors.append(f"Could not assign member role: {exc}")
     elif ok:
         errors.append("Member role not found")
+
+    if ok and channel:
+        try:
+            safe_name = normalize_ticket_key(roblox_name)[:24] or str(applicant.id)
+            await channel.edit(name=f"⭐-ticket-{safe_name}", reason="MCWV application accepted")
+            actions.append("Ticket renamed as accepted")
+        except Exception as exc:
+            errors.append(f"Could not rename ticket: {exc}")
 
     if ok:
         db_update_ticket_status(
@@ -5794,7 +5828,7 @@ class ApplicationModal(discord.ui.Modal):
 
         safe_name = normalize_ticket_key(resolved["name"] or interaction.user.display_name or interaction.user.name)[:24] or str(interaction.user.id)
         channel = await guild.create_text_channel(
-            name=f"⭐-ticket-{safe_name}",
+            name=f"ticket-{safe_name}",
             category=category,
             topic=f"mcwv-ticket-owner:{interaction.user.id}",
             overwrites=overwrites,
@@ -5883,12 +5917,17 @@ class ApplicationModal(discord.ui.Modal):
             liquid_gems,
             why_accept,
         )
+        review_channel = guild.get_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
         try:
-            await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
+            if isinstance(review_channel, discord.TextChannel):
+                review_embed.add_field(name="Ticket Channel", value=channel.mention, inline=False)
+                await review_channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
+            else:
+                await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
         except Exception as review_error:
-            print(f"[ticket] review embed send failed in {channel.id}: {review_error}")
+            print(f"[ticket] review embed send failed for {ticket_id}: {review_error}")
             await interaction.followup.send(
-                f"⚠️ Ticket was created ({channel.mention}) but the staff review embed could not be sent. Check my permissions.",
+                f"⚠️ Ticket was created ({channel.mention}) but the staff review embed could not be sent. Check my permissions for the review channel.",
                 ephemeral=True,
             )
             return
@@ -5995,17 +6034,25 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         self.ticket_id = ticket_id
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
         opener_id = int(row[3]) if row else None
         opened_at = row[8] if row and len(row) > 8 else None
-        transcript = await build_ticket_transcript(interaction.channel)
-        db_save_ticket_transcript(self.ticket_id, interaction.channel.id, transcript)
+        ticket_channel = interaction.channel
+        if interaction.guild and row and row[1]:
+            ticket_channel = interaction.guild.get_channel(int(row[1]))
+            if ticket_channel is None:
+                try:
+                    ticket_channel = await interaction.guild.fetch_channel(int(row[1]))
+                except Exception:
+                    ticket_channel = interaction.channel
+        transcript = await build_ticket_transcript(ticket_channel)
+        db_save_ticket_transcript(self.ticket_id, ticket_channel.id, transcript)
         db_update_ticket_status(self.ticket_id, "closed", interaction.user.id, closed_at=datetime.now(timezone.utc), closed_by=interaction.user.id, close_reason=str(self.reason.value))
-        await send_ticket_close_outputs(interaction.guild, interaction.channel, self.ticket_id, opener_id, interaction.user.id, opened_at, str(self.reason.value), transcript)
+        await send_ticket_close_outputs(interaction.guild, ticket_channel, self.ticket_id, opener_id, interaction.user.id, opened_at, str(self.reason.value), transcript)
         await interaction.followup.send("✅ Transcript saved and sent. Deleting ticket shortly.", ephemeral=True)
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
         try:
-            await interaction.channel.delete(reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
+            await ticket_channel.delete(reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
         except Exception as exc:
             print("ticket delete error:", exc)
 
@@ -6027,7 +6074,7 @@ class AcceptConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Yes, accept applicant", style=discord.ButtonStyle.success)
     async def confirm_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[0]) != str(self.ticket_id):
@@ -6112,7 +6159,7 @@ class CloseConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Continue to close", style=discord.ButtonStyle.danger)
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[0]) != self.ticket_id:
@@ -6135,6 +6182,17 @@ class ApplicationReviewView(discord.ui.View):
 
     def staff_ok(self, interaction):
         return has_mcwv_ticket_staff_permission(interaction.user)
+
+    def resolved_ticket_id(self, interaction):
+        if self.ticket_id and self.ticket_id != "persistent":
+            return self.ticket_id
+        try:
+            for field in interaction.message.embeds[0].fields:
+                if str(field.name).lower() == "ticket":
+                    return str(field.value).replace("`", "").strip()
+        except Exception:
+            return self.ticket_id
+        return self.ticket_id
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_accept")
     async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6163,7 +6221,8 @@ class ApplicationReviewView(discord.ui.View):
     async def staff_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.staff_ok(interaction):
             return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        ticket_id = self.resolved_ticket_id(interaction)
+        row = db_get_ticket_by_ticket_id(ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         embed = await build_staff_info_embed(row)
@@ -6183,7 +6242,8 @@ class ApplicationReviewView(discord.ui.View):
             color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc),
         )
-        await interaction.response.send_message(embed=embed, view=CloseConfirmView(self.ticket_id, interaction.user.id), ephemeral=True)
+        ticket_id = self.resolved_ticket_id(interaction)
+        await interaction.response.send_message(embed=embed, view=CloseConfirmView(ticket_id, interaction.user.id), ephemeral=True)
 
 
 class MCWVTicketPanelView(discord.ui.View):
