@@ -584,9 +584,18 @@ async def _admin_ticket_close(ticket_id, actor_id, reason):
     transcript = await build_ticket_transcript(channel) if channel else "Channel unavailable"
     db_save_ticket_transcript(ticket["ticketId"], int(ticket["channelId"] or 0), transcript)
     db_update_ticket_status(ticket["ticketId"], "closed", actor_id, closed_at=datetime.now(timezone.utc), closed_by=actor_id, close_reason=reason)
+    opened_at = datetime.fromisoformat(ticket["createdAt"]) if ticket.get("createdAt") else None
+    await send_ticket_close_outputs(
+        guild,
+        channel,
+        ticket["ticketId"],
+        int(ticket["openerDiscordId"]) if ticket.get("openerDiscordId") else None,
+        int(actor_id) if actor_id else None,
+        opened_at,
+        reason,
+        transcript,
+    )
     if channel:
-        embed = discord.Embed(title="Ticket Closed", description=f"Reason: {reason}\nChannel will delete in {MCWV_TICKET_DELETE_DELAY_SECONDS}s.", color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc))
-        await channel.send(embed=embed)
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
         await channel.delete(reason=f"MCWV ticket closed from Hub: {reason}")
     return {"success": True}
@@ -4263,6 +4272,7 @@ MCWV_TICKET_CATEGORY_ID = int(os.environ.get("MCWV_TICKET_CATEGORY_ID", "1503106
 MCWV_TICKET_PANEL_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_PANEL_CHANNEL_ID", "1501613434364760174"))
 MCWV_TICKET_LOG_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_LOG_CHANNEL_ID", "1501997396610125876"))
 MCWV_TICKET_MEMBER_ROLE_ID = int(os.environ.get("MCWV_TICKET_MEMBER_ROLE_ID", str(CLAN_MEMBER_ROLE_ID)))
+MCWV_TICKET_BLACKLIST_ROLE_ID = int(os.environ.get("MCWV_TICKET_BLACKLIST_ROLE_ID", "1516151211735257259"))
 MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROLE_IDS")) or {ALLOWED_ROLE_ID, 1502339420207059066}
 MCWV_TICKET_STAFF_ROLE_IDS.add(ALLOWED_ROLE_ID)
 MCWV_TICKET_STAFF_ROLE_IDS.add(1502339420207059066)
@@ -5711,7 +5721,11 @@ class ScreenshotUploadedView(discord.ui.View):
         if interaction.user.id != int(row[3]):
             return await interaction.response.send_message("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
 
-        staff_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS))
+        staff_mentions = " ".join(
+            f"<@&{role_id}>"
+            for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS)
+            if role_id != 1502339420207059066
+        )
         db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
 
         for child in self.children:
@@ -5921,6 +5935,59 @@ class NoteModal(discord.ui.Modal, title="Staff Note"):
         await interaction.response.send_message("✅ Staff note saved.", ephemeral=True)
 
 
+def transcript_file(transcript_text, ticket_id):
+    data = BytesIO(str(transcript_text or "No transcript available.").encode("utf-8", errors="replace"))
+    safe_id = normalize_ticket_key(ticket_id) or "ticket"
+    return discord.File(data, filename=f"mcwv-ticket-{safe_id}-transcript.txt")
+
+
+def ticket_closed_embed(ticket_id, opener_id, closer_id, opened_at, reason, for_user=False):
+    embed = discord.Embed(
+        title="Ticket Closed",
+        color=discord.Color.green() if not for_user else discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🎫 Ticket ID", value=str(ticket_id), inline=True)
+    embed.add_field(name="✅ Opened By", value=f"<@{opener_id}>" if opener_id else "—", inline=True)
+    embed.add_field(name="🔒 Closed By", value=f"<@{closer_id}>" if closer_id else "—", inline=True)
+    embed.add_field(name="🕒 Open Time", value=opened_at.strftime("%d %b %Y at %H:%M") if hasattr(opened_at, "strftime") else "—", inline=True)
+    embed.add_field(name="❔ Reason", value=str(reason or "No reason specified")[:1024], inline=False)
+    embed.set_footer(text="Transcript attached" if for_user else "MCWV Ticket Logs • Transcript attached")
+    return embed
+
+
+async def send_ticket_close_outputs(guild, channel, ticket_id, opener_id, closer_id, opened_at, reason, transcript):
+    log_channel = guild.get_channel(MCWV_TICKET_LOG_CHANNEL_ID) if guild else None
+    if log_channel:
+        try:
+            await log_channel.send(
+                embed=ticket_closed_embed(ticket_id, opener_id, closer_id, opened_at, reason, for_user=False),
+                file=transcript_file(transcript, ticket_id),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except Exception as exc:
+            print("ticket transcript log send error:", exc)
+
+    if opener_id:
+        try:
+            user = guild.get_member(int(opener_id)) if guild else None
+            if user is None:
+                user = await bot.fetch_user(int(opener_id))
+            await user.send(
+                embed=ticket_closed_embed(ticket_id, opener_id, closer_id, opened_at, reason, for_user=True),
+                file=transcript_file(transcript, ticket_id),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            print("ticket transcript DM send error:", exc)
+
+    if channel:
+        try:
+            await channel.send(embed=ticket_closed_embed(ticket_id, opener_id, closer_id, opened_at, reason, for_user=False))
+        except Exception:
+            pass
+
+
 class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
     reason = discord.ui.TextInput(label="Close reason", style=discord.TextStyle.paragraph, max_length=900)
     def __init__(self, ticket_id):
@@ -5928,13 +5995,14 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         self.ticket_id = ticket_id
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        row = db_get_ticket_by_channel(interaction.channel.id)
+        opener_id = int(row[3]) if row else None
+        opened_at = row[8] if row and len(row) > 8 else None
         transcript = await build_ticket_transcript(interaction.channel)
         db_save_ticket_transcript(self.ticket_id, interaction.channel.id, transcript)
         db_update_ticket_status(self.ticket_id, "closed", interaction.user.id, closed_at=datetime.now(timezone.utc), closed_by=interaction.user.id, close_reason=str(self.reason.value))
-        embed = discord.Embed(title="Ticket Closed", description=f"Reason: {self.reason.value}\nChannel will delete in {MCWV_TICKET_DELETE_DELAY_SECONDS}s.", color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc))
-        await interaction.channel.send(embed=embed)
-        await log_ticket_event(interaction.guild, embed)
-        await interaction.followup.send("✅ Transcript saved. Deleting ticket shortly.", ephemeral=True)
+        await send_ticket_close_outputs(interaction.guild, interaction.channel, self.ticket_id, opener_id, interaction.user.id, opened_at, str(self.reason.value), transcript)
+        await interaction.followup.send("✅ Transcript saved and sent. Deleting ticket shortly.", ephemeral=True)
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
         try:
             await interaction.channel.delete(reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
@@ -5981,6 +6049,50 @@ class AcceptConfirmView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(content="Accept cancelled.", view=self)
         self.stop()
+
+
+class StaffInfoView(discord.ui.View):
+    def __init__(self, ticket_id, applicant_id):
+        super().__init__(timeout=10 * 60)
+        self.ticket_id = str(ticket_id)
+        self.applicant_id = int(applicant_id)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if not has_mcwv_ticket_staff_permission(interaction.user):
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Blacklist applicant", style=discord.ButtonStyle.danger)
+    async def blacklist_applicant(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            return await interaction.response.send_message("❌ This must be used in the server.", ephemeral=True)
+
+        role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
+        if not role:
+            return await interaction.response.send_message("❌ Blacklist role not found. Check MCWV_TICKET_BLACKLIST_ROLE_ID.", ephemeral=True)
+
+        member = guild.get_member(self.applicant_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(self.applicant_id)
+            except Exception:
+                member = None
+
+        if member is None:
+            return await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
+
+        try:
+            await member.add_roles(role, reason=f"Ticket blacklist by {interaction.user}")
+            db_ticket_log(self.ticket_id, interaction.user.id, "ticket/blacklist", f"Blacklisted {member} from opening application tickets", {"roleId": str(role.id)})
+            await interaction.response.send_message(f"✅ {member.mention} has been given **{role.name}** and cannot open application tickets.", ephemeral=True)
+            try:
+                await interaction.channel.send(f"🚫 {member.mention} has been blacklisted from opening MCWV application tickets by {interaction.user.mention}.")
+            except Exception:
+                pass
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Failed to add blacklist role: `{exc}`", ephemeral=True)
 
 
 class CloseConfirmView(discord.ui.View):
@@ -6055,7 +6167,7 @@ class ApplicationReviewView(discord.ui.View):
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         embed = await build_staff_info_embed(row)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=StaffInfoView(row[0], row[3]), ephemeral=True)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6088,6 +6200,9 @@ class MCWVTicketPanelView(discord.ui.View):
         guild = interaction.guild
         if not guild:
             return await interaction.response.send_message("This must be used in the server.", ephemeral=True)
+        blacklist_role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
+        if blacklist_role and isinstance(interaction.user, discord.Member) and blacklist_role in interaction.user.roles:
+            return await interaction.response.send_message("❌ You are currently blocked from opening MCWV application tickets.", ephemeral=True)
         existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
         if existing:
             return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
