@@ -638,6 +638,36 @@ async def _admin_ticket_close(ticket_id, actor_id, reason):
     return {"success": True}
 
 
+async def _admin_ticket_clear(actor_id=0):
+    if not db_enabled():
+        raise ValueError("Database is not available")
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM mcwv_tickets")
+            before = int(cur.fetchone()[0] or 0)
+            cur.execute("DELETE FROM mcwv_ticket_transcripts")
+            cur.execute("DELETE FROM mcwv_ticket_actions")
+            cur.execute("DELETE FROM mcwv_ticket_applications")
+            cur.execute("DELETE FROM mcwv_tickets")
+        conn.commit()
+        db_log_admin_action(
+            "warning",
+            "Application Tickets Cleared",
+            f"Cleared {before} application ticket record(s) from the dashboard.",
+            "tickets/clear",
+            str(actor_id),
+            {"cleared": before, "actorId": str(actor_id)},
+        )
+        return {"success": True, "cleared": before}
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ValueError(f"Failed to clear tickets: {exc}")
+
+
 @app.route("/admin/tickets/settings", methods=["GET", "POST"])
 @require_admin_api_key
 def admin_ticket_settings():
@@ -736,6 +766,18 @@ def admin_ticket_close():
     try:
         future = _run_on_bot_loop(_admin_ticket_close(body.get("ticket_id") or body.get("ticketId"), body.get("actor_id") or 0, body.get("reason") or "Closed from Hub"))
         payload = future.result(timeout=35)
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/tickets/clear", methods=["POST"])
+@require_admin_api_key
+def admin_ticket_clear():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_ticket_clear(body.get("actor_id") or body.get("actorId") or 0))
+        payload = future.result(timeout=20)
         return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
