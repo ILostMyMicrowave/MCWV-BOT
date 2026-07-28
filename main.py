@@ -6198,7 +6198,8 @@ class ApplicationReviewView(discord.ui.View):
     async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.staff_ok(interaction):
             return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        ticket_id = self.resolved_ticket_id(interaction)
+        row = db_get_ticket_by_ticket_id(ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[6] or "").lower() == "accepted":
