@@ -11936,24 +11936,25 @@ async def build_hourly_stats_payload():
             continue
 
     members = extract_clan_members(data)
-    user_ids = sorted(set(members.keys()) | set(current_points.keys()), key=lambda item: int(item) if str(item).isdigit() else 0)
+    # Match the roster count used by the existing hourly bot: current clan members.
+    # Fallback to contributions only if the clan Members block is unavailable.
+    roster_ids = set(members.keys()) or set(current_points.keys())
+    user_ids = sorted(roster_ids, key=lambda item: int(item) if str(item).isdigit() else 0)
     if not user_ids:
         return None
 
     users = await fetch_roblox_users_for_logs(user_ids)
-    pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=battle_start_ts)
 
     entries = []
     for rid in user_ids:
         info = users.get(int(rid), {}) if str(rid).isdigit() else {}
         name = str(info.get("name") or rid)
-        pph = int(pph_map.get(rid, 0) or 0)
         entries.append({
             "robloxId": rid,
             "name": name,
             "displayName": str(info.get("displayName") or name),
             "points": int(current_points.get(rid, 0) or 0),
-            "pph": pph,
+            "pph": 0,
         })
 
     war_rank_by_id = {
@@ -11962,6 +11963,15 @@ async def build_hourly_stats_payload():
     }
     for entry in entries:
         entry["currentRank"] = war_rank_by_id.get(entry["robloxId"])
+
+    # Save the latest live points before reading PPH. This makes the hourly card
+    # and profile cards agree after the card is sent because they share the same
+    # latest player_leaderboard_history snapshot.
+    save_hourly_player_snapshot({"battleId": battle_id, "entries": entries})
+
+    pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=battle_start_ts)
+    for entry in entries:
+        entry["pph"] = int(pph_map.get(str(entry["robloxId"]), 0) or 0)
 
     entries.sort(key=lambda item: (-int(item["pph"]), item["name"].lower()))
 
@@ -12509,6 +12519,43 @@ def hourly_stats_auto_cooldown_remaining_seconds():
     return max(0, math.ceil(remaining_ms / 1000))
 
 
+def reserve_hourly_stats_auto_slot():
+    """Atomically reserve the next automated hourly send slot.
+
+    This protects against duplicate automated sends even if two bot loops/processes
+    briefly overlap during deploys. Manual /hourly_stats does not use this.
+    """
+    if not db_enabled():
+        return hourly_stats_due_now()
+
+    lock_key = 294_729_601
+    locked = False
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            locked = bool(cur.fetchone()[0])
+
+        if not locked:
+            return False
+
+        if not hourly_stats_due_now():
+            return False
+
+        db_set_setting("mcwv_hourly_stats_last_auto_sent_at", _now_iso())
+        return True
+    except Exception as exc:
+        print(f"[hourly stats] auto slot reserve failed: {exc}")
+        return False
+    finally:
+        if locked:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+            except Exception:
+                pass
+
+
 def format_hourly_cooldown(seconds):
     seconds = max(0, int(seconds or 0))
     minutes, sec = divmod(seconds, 60)
@@ -12535,9 +12582,6 @@ async def hourly_stats_loop():
     if not hourly_stats_enabled():
         return
 
-    if not hourly_stats_due_now():
-        return
-
     channel_id = get_hourly_stats_channel_id()
     if not channel_id:
         return
@@ -12547,11 +12591,10 @@ async def hourly_stats_loop():
         print(f"[hourly stats] channel not found/not text: {channel_id}")
         return
 
+    if not reserve_hourly_stats_auto_slot():
+        return
+
     try:
-        # Reserve the scheduled slot before sending so a slow send/retry cannot
-        # produce duplicate automated hourly cards. Manual /hourly_stats is not
-        # limited by this timestamp.
-        db_set_setting("mcwv_hourly_stats_last_auto_sent_at", _now_iso())
         await send_hourly_stats_card(channel)
         print(f"[hourly stats] card sent to {channel_id}")
     except Exception as exc:
