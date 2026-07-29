@@ -1046,6 +1046,7 @@ def admin_status():
             "War Poll Loop": _loop_status("war_poll_loop"),
             "War Collector Loop": _loop_status("hub_war_collect_loop"),
             "Clan Log Loop": _loop_status("clan_log_loop"),
+            "Hourly Stats Loop": _loop_status("hourly_stats_loop"),
             "Ticket Screenshot Reminder Loop": _loop_status("ticket_screenshot_reminder_loop"),
             "Presence Loop": _loop_status("check_loop"),
             "Reminder Loop": _loop_status("reminder_loop"),
@@ -4650,6 +4651,13 @@ MCWV_LOG_CHANNEL_ID = int(os.environ.get("MCWV_LOG_CHANNEL_ID", "0") or "0")
 MCWV_CLAN_LOGS_ENABLED_DEFAULT = os.environ.get("MCWV_CLAN_LOGS_ENABLED", "1") != "0"
 MCWV_CLAN_LOG_INTERVAL_SECONDS = max(30, int(os.environ.get("MCWV_CLAN_LOG_INTERVAL_SECONDS", "60") or "60"))
 MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS = max(1, min(int(os.environ.get("MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS", "8") or "8"), 25))
+MCWV_HOURLY_STATS_CHANNEL_ID = int(os.environ.get("MCWV_HOURLY_STATS_CHANNEL_ID", "0") or "0")
+MCWV_HOURLY_STATS_ENABLED_DEFAULT = os.environ.get("MCWV_HOURLY_STATS_ENABLED", "1") != "0"
+MCWV_HOURLY_STATS_INTERVAL_MINUTES = max(5, int(os.environ.get("MCWV_HOURLY_STATS_INTERVAL_MINUTES", "60") or "60"))
+MCWV_HOURLY_STATS_BG_PATH = os.environ.get(
+    "MCWV_HOURLY_STATS_BG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hourly_stats_bg.webp"),
+)
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
 PS99_IMPORTANT_GAMEPASSES = {
     257811346: "VIP",
@@ -7264,6 +7272,7 @@ class MCWVTicketPanelView(discord.ui.View):
 @app_commands.choices(system=[
     app_commands.Choice(name="Placement alerts", value="placement_alerts"),
     app_commands.Choice(name="Clan logs", value="clan_logs"),
+    app_commands.Choice(name="Hourly stats", value="hourly_stats"),
 ])
 async def setup(interaction: discord.Interaction, system: app_commands.Choice[str], channel: discord.TextChannel):
     if not has_mcwv_ticket_staff_permission(interaction.user):
@@ -7293,6 +7302,25 @@ async def setup(interaction: discord.Interaction, system: app_commands.Choice[st
             description=(
                 f"MCWV join, leave, and diamond donation logs will be posted in {channel.mention}.\n\n"
                 "The bot saves the current clan state first, then logs only new changes."
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if system.value == "hourly_stats":
+        set_hourly_stats_channel_id(channel.id)
+        db_set_setting("mcwv_hourly_stats_enabled", "1")
+        if not hourly_stats_loop.is_running():
+            hourly_stats_loop.change_interval(minutes=MCWV_HOURLY_STATS_INTERVAL_MINUTES)
+            hourly_stats_loop.start()
+        embed = discord.Embed(
+            title="Hourly stats configured",
+            description=(
+                f"MCWV hourly stats cards will be posted in {channel.mention} every "
+                f"**{MCWV_HOURLY_STATS_INTERVAL_MINUTES} minutes**.\n\n"
+                "Use `/hourly_stats` anytime to send one manually."
             ),
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
@@ -7360,6 +7388,22 @@ async def clan_logs_test(interaction: discord.Interaction, event: app_commands.C
         await send_diamond_log(target, data, sample_id, users.get(sample_id, {}), 4_000_000_000, user_total, state.get("totalDiamonds") or 0)
 
     await interaction.followup.send(f"✅ Sent test {event.name.lower()} log in {target.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="hourly_stats", description="Send the MCWV hourly points statistics card", guild=guild_obj)
+@app_commands.describe(channel="Optional channel to send the card in. Defaults to this channel.")
+async def hourly_stats(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.followup.send("❌ Pick a text channel.", ephemeral=True)
+    try:
+        await send_hourly_stats_card(target)
+        await interaction.followup.send(f"✅ Sent hourly stats in {target.mention}.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Hourly stats failed: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
@@ -11441,6 +11485,442 @@ async def send_diamond_log(channel, data, user_id, user_info, donated, new_total
     await channel.send(embed=embed)
 
 
+# ---------------- HOURLY STATS CARD ----------------
+def normalize_hourly_battle_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def format_hourly_points(value):
+    try:
+        value = float(value or 0)
+    except Exception:
+        value = 0
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}K"
+    return str(int(value))
+
+
+def hourly_colour(index, total, zero=False):
+    if zero:
+        return (242, 78, 94)
+    if total <= 1:
+        return (74, 222, 128)
+    t = max(0.0, min(1.0, index / max(total - 1, 1)))
+    stops = [
+        (0.0, (74, 222, 128)),
+        (0.42, (224, 189, 46)),
+        (0.72, (246, 133, 37)),
+        (1.0, (242, 78, 94)),
+    ]
+    for idx in range(len(stops) - 1):
+        left_t, left = stops[idx]
+        right_t, right = stops[idx + 1]
+        if left_t <= t <= right_t:
+            span = max(right_t - left_t, 0.0001)
+            local = (t - left_t) / span
+            return tuple(int(left[i] + (right[i] - left[i]) * local) for i in range(3))
+    return stops[-1][1]
+
+
+def cover_image(path, size):
+    target_w, target_h = size
+    try:
+        img = Image.open(path).convert("RGBA")
+        scale = max(target_w / img.width, target_h / img.height)
+        resized = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
+        left = (resized.width - target_w) // 2
+        top = (resized.height - target_h) // 2
+        return resized.crop((left, top, left + target_w, top + target_h))
+    except Exception as exc:
+        print(f"[hourly stats] background load failed: {exc}")
+        return Image.new("RGBA", size, (8, 10, 26, 255))
+
+
+def to_ms_for_hourly(value):
+    try:
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def points_at_time_for_hourly(rows, target_ms):
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda item: item["time"])
+    if target_ms < rows[0]["time"]:
+        # No full 60-minute baseline yet. Return None instead of faking a rate.
+        return None
+    for idx, current in enumerate(rows):
+        current_ms = current["time"]
+        if current_ms == target_ms:
+            return current["points"]
+        nxt = rows[idx + 1] if idx + 1 < len(rows) else None
+        if not nxt:
+            return current["points"]
+        if current_ms <= target_ms <= nxt["time"]:
+            span = max(nxt["time"] - current_ms, 1)
+            ratio = (target_ms - current_ms) / span
+            return current["points"] + (nxt["points"] - current["points"]) * ratio
+    return rows[-1]["points"]
+
+
+def fetch_hourly_points_from_history(battle_id, user_ids, current_points):
+    if not db_enabled() or not user_ids:
+        return {}
+
+    try:
+        ensure_db_connection()
+        battle_keys = sorted({str(battle_id), normalize_hourly_battle_key(battle_id)})
+        ids = [str(value) for value in user_ids if str(value).strip()]
+        grouped = {rid: [] for rid in ids}
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id::text, points::bigint, captured_at
+                FROM player_leaderboard_history
+                WHERE battle_id = ANY(%s)
+                  AND roblox_id::text = ANY(%s)
+                  AND points IS NOT NULL
+                  AND captured_at >= NOW() - INTERVAL '75 minutes'
+                ORDER BY roblox_id::text ASC, captured_at ASC
+            """, (battle_keys, ids))
+            rows = cur.fetchall()
+
+        for roblox_id, points, captured_at in rows:
+            grouped.setdefault(str(roblox_id), []).append({
+                "points": int(points or 0),
+                "time": to_ms_for_hourly(captured_at),
+            })
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        cutoff_ms = now_ms - 60 * 60 * 1000
+        result = {}
+
+        for rid in ids:
+            current = int(current_points.get(rid, 0) or 0)
+            if current <= 0:
+                result[rid] = 0
+                continue
+            baseline = points_at_time_for_hourly(grouped.get(rid, []), cutoff_ms)
+            result[rid] = max(0, int(round(current - baseline))) if baseline is not None else 0
+
+        return result
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[hourly stats] history lookup failed: {exc}")
+        return {}
+
+
+def draw_gradient_text_on_image(img, xy, text, font, left_color, right_color, shadow=True):
+    x, y = xy
+    dummy = ImageDraw.Draw(img)
+    bbox = dummy.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    if text_w <= 0 or text_h <= 0:
+        return
+    if shadow:
+        dummy.text((x + 3, y + 4), text, font=font, fill=(0, 0, 0, 150))
+    mask = Image.new("L", (text_w + 4, text_h + 4), 0)
+    md = ImageDraw.Draw(mask)
+    md.text((2 - bbox[0], 2 - bbox[1]), text, font=font, fill=255)
+    gradient = Image.new("RGBA", mask.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(gradient)
+    for px in range(mask.size[0]):
+        t = px / max(mask.size[0] - 1, 1)
+        color = tuple(int(left_color[i] + (right_color[i] - left_color[i]) * t) for i in range(3))
+        gd.line((px, 0, px, mask.size[1]), fill=(*color, 255))
+    img.paste(gradient, (x + bbox[0] - 2, y + bbox[1] - 2), mask)
+
+
+async def build_hourly_stats_payload():
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        return None
+
+    clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    if not isinstance(data, dict) or not data:
+        return None
+
+    battles = data.get("Battles") or {}
+    battle = battles.get(battle_id) or battles.get(str(battle_id)) if isinstance(battles, dict) else None
+    if not battle and isinstance(battles, dict):
+        norm = normalize_hourly_battle_key(battle_id)
+        battle = next((value for key, value in battles.items() if normalize_hourly_battle_key(key) == norm), None)
+    if not isinstance(battle, dict):
+        return None
+
+    contributions = battle.get("PointContributions") or battle.get("pointContributions") or []
+    current_points = {}
+    for entry in contributions if isinstance(contributions, list) else []:
+        try:
+            rid = str(int(entry.get("UserID") or entry.get("userId") or 0))
+            current_points[rid] = int(entry.get("Points") or entry.get("points") or 0)
+        except Exception:
+            continue
+
+    members = extract_clan_members(data)
+    user_ids = sorted(set(members.keys()) | set(current_points.keys()), key=lambda item: int(item) if str(item).isdigit() else 0)
+    if not user_ids:
+        return None
+
+    users = await fetch_roblox_users_for_logs(user_ids)
+    pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points)
+
+    entries = []
+    for rid in user_ids:
+        info = users.get(int(rid), {}) if str(rid).isdigit() else {}
+        name = str(info.get("name") or rid)
+        pph = int(pph_map.get(rid, 0) or 0)
+        entries.append({
+            "robloxId": rid,
+            "name": name,
+            "displayName": str(info.get("displayName") or name),
+            "points": int(current_points.get(rid, 0) or 0),
+            "pph": pph,
+        })
+
+    entries.sort(key=lambda item: (-int(item["pph"]), item["name"].lower()))
+
+    overview = await get_big_games_index_clan_overview()
+    clan_rank = (overview or {}).get("rank") or pick_first_int(battle, ("Place", "place", "Rank", "rank", "Position", "position"))
+    total_hourly = sum(int(entry["pph"] or 0) for entry in entries)
+
+    return {
+        "battleId": battle_id,
+        "clanName": str(data.get("Name") or CLAN_NAME),
+        "icon": data.get("Icon"),
+        "rank": clan_rank,
+        "players": len(entries),
+        "active": sum(1 for entry in entries if int(entry["pph"] or 0) > 0),
+        "zero": sum(1 for entry in entries if int(entry["pph"] or 0) <= 0),
+        "hourlyPoints": total_hourly,
+        "entries": entries,
+    }
+
+
+async def generate_hourly_stats_card(payload):
+    S = 2
+    W, H = 1355 * S, 804 * S
+
+    def sc(value):
+        return int(round(value * S))
+
+    def font(size, bold=True):
+        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        try:
+            return ImageFont.truetype(path, sc(size))
+        except Exception:
+            return ImageFont.load_default()
+
+    fonts = {
+        "tag": font(36, True),
+        "badge_label": font(10, False),
+        "badge_value": font(20, True),
+        "stat_label": font(12, False),
+        "stat_value": font(38, True),
+        "row": font(17, True),
+        "row_small": font(15, True),
+    }
+
+    img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
+    overlay = Image.new("RGBA", (W, H), (4, 7, 18, 112))
+    img.alpha_composite(overlay)
+
+    # Faint grid, like the reference, over the supplied galaxy background.
+    grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grid)
+    for x in range(0, W, sc(54)):
+        gd.line((x, 0, x, H), fill=(120, 145, 190, 18), width=sc(1))
+    for y in range(0, H, sc(54)):
+        gd.line((0, y, W, y), fill=(120, 145, 190, 14), width=sc(1))
+    img.alpha_composite(grid)
+
+    d = ImageDraw.Draw(img)
+    card = (sc(31), sc(28), sc(1324), sc(776))
+
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle(card, radius=sc(25), fill=(0, 0, 0, 155))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
+    img.alpha_composite(shadow)
+
+    panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(panel)
+    pd.rounded_rectangle(card, radius=sc(25), fill=(20, 23, 36, 232), outline=(63, 70, 95, 185), width=sc(2))
+    pd.rounded_rectangle((card[0] + sc(2), card[1] + sc(2), card[2] - sc(2), card[3] - sc(2)), radius=sc(23), outline=(255, 255, 255, 16), width=sc(1))
+    img.alpha_composite(panel)
+    d = ImageDraw.Draw(img)
+
+    # Top rainbow strip.
+    strip_x1, strip_y = sc(52), sc(49)
+    strip_x2 = sc(1303)
+    colours = [(92, 111, 255), (75, 205, 162), (232, 202, 53), (247, 129, 42), (248, 73, 82)]
+    for x in range(strip_x1, strip_x2):
+        t = (x - strip_x1) / max(strip_x2 - strip_x1 - 1, 1)
+        idx = min(int(t * (len(colours) - 1)), len(colours) - 2)
+        local = (t - idx / (len(colours) - 1)) * (len(colours) - 1)
+        c1, c2 = colours[idx], colours[idx + 1]
+        color = tuple(int(c1[i] + (c2[i] - c1[i]) * local) for i in range(3))
+        d.line((x, strip_y, x, strip_y + sc(5)), fill=(*color, 255), width=sc(1))
+
+    # Logo.
+    logo_center = (sc(113), sc(132))
+    ring_r = sc(55)
+    for start, color in [(0, (248, 129, 42)), (80, (232, 202, 53)), (165, (75, 205, 162)), (250, (92, 111, 255))]:
+        d.arc((logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r), start, start + 78, fill=(*color, 255), width=sc(5))
+    d.ellipse((logo_center[0] - sc(46), logo_center[1] - sc(46), logo_center[0] + sc(46), logo_center[1] + sc(46)), fill=(12, 13, 31, 230), outline=(190, 195, 255, 80), width=sc(1))
+    asset_id = extract_asset_id(payload.get("icon"))
+    icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
+    if icon_bytes:
+        try:
+            icon = Image.open(BytesIO(icon_bytes)).convert("RGBA").resize((sc(82), sc(82)), Image.Resampling.LANCZOS)
+            mask = Image.new("L", icon.size, 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, icon.size[0] - 1, icon.size[1] - 1), fill=255)
+            img.paste(icon, (logo_center[0] - icon.size[0] // 2, logo_center[1] - icon.size[1] // 2), mask)
+        except Exception:
+            d.text((sc(78), sc(117)), CLAN_NAME, font=font(18, True), fill=(204, 98, 255, 255))
+    else:
+        d.text((sc(78), sc(117)), CLAN_NAME, font=font(18, True), fill=(204, 98, 255, 255))
+
+    draw_gradient_text_on_image(img, (sc(181), sc(115)), f"[{payload.get('clanName') or CLAN_NAME}]", fonts["tag"], (46, 222, 217), (249, 91, 51))
+    d = ImageDraw.Draw(img)
+
+    def small_badge(box, label, value, accent):
+        d.rounded_rectangle(box, radius=sc(10), fill=(25, 28, 45, 230), outline=(*accent, 145), width=sc(1))
+        d.text((box[0] + sc(36), box[1] + sc(8)), label, font=fonts["badge_label"], fill=(160, 165, 184, 255))
+        value_bbox = d.textbbox((0, 0), value, font=fonts["badge_value"])
+        d.text((box[0] + (box[2] - box[0] - (value_bbox[2] - value_bbox[0])) // 2, box[1] + sc(22)), value, font=fonts["badge_value"], fill=(*accent, 255))
+
+    small_badge((sc(327), sc(110), sc(445), sc(158)), "Clan Rank", f"#{payload.get('rank') or '—'}", (238, 196, 56))
+    small_badge((sc(457), sc(110), sc(576), sc(158)), "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (79, 196, 236))
+
+    def stat_box(x, label, value, accent):
+        box = (sc(x), sc(94), sc(x + 135), sc(172))
+        d.rounded_rectangle(box, radius=sc(13), fill=(26, 29, 47, 230), outline=(*accent, 96), width=sc(1))
+        d.text((box[0] + sc(13), box[1] + sc(16)), label, font=fonts["stat_label"], fill=(160, 165, 184, 255))
+        d.text((box[0] + sc(13), box[1] + sc(34)), str(value), font=fonts["stat_value"], fill=(245, 246, 255, 255))
+        d.rounded_rectangle((box[2] - sc(24), box[1] + sc(22), box[2] - sc(12), box[3] - sc(20)), radius=sc(6), fill=(*accent, 255))
+
+    stat_box(858, "Players", payload.get("players", 0), (92, 111, 255))
+    stat_box(1012, "Active", payload.get("active", 0), (75, 205, 120))
+    stat_box(1167, "Zero", payload.get("zero", 0), (248, 73, 82))
+
+    entries = list(payload.get("entries") or [])
+    max_pph = max([int(entry.get("pph") or 0) for entry in entries] + [1])
+    columns = [entries[0:25], entries[25:50], entries[50:75]]
+    panel_y, panel_h = sc(208), sc(545)
+    panel_w = sc(412)
+    panel_xs = [sc(46), sc(472), sc(898)]
+
+    for col_idx, col_entries in enumerate(columns):
+        px = panel_xs[col_idx]
+        d.rounded_rectangle((px, panel_y, px + panel_w, panel_y + panel_h), radius=sc(15), fill=(13, 16, 29, 198), outline=(55, 61, 82, 180), width=sc(2))
+        for row_idx, entry in enumerate(col_entries):
+            global_idx = col_idx * 25 + row_idx
+            y = sc(226) + sc(row_idx * 20.4)
+            if row_idx % 2 == 0:
+                d.rounded_rectangle((px + sc(10), y - sc(1), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(36, 39, 53, 138))
+            pph = int(entry.get("pph") or 0)
+            zero = pph <= 0
+            color = hourly_colour(global_idx, max(len(entries), 1), zero=zero)
+            rank_text = f"{global_idx + 1:02d}"
+            name = fit_text(d, str(entry.get("name") or entry.get("robloxId") or "Unknown"), fonts["row"], sc(145))
+            rank_fill = color if not zero else (152, 158, 174)
+            name_fill = (240, 242, 250) if not zero else (218, 89, 104)
+            score_fill = color if not zero else (145, 151, 168)
+            d.text((px + sc(18), y), rank_text, font=fonts["row_small"], fill=(*rank_fill, 255))
+            d.text((px + sc(68), y), name, font=fonts["row"], fill=(*name_fill, 255))
+
+            bar_x = px + sc(225)
+            bar_y = y + sc(6)
+            bar_w = sc(55)
+            d.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + sc(8)), radius=sc(4), fill=(49, 55, 68, 255))
+            fill_w = int(bar_w * (pph / max_pph)) if max_pph > 0 else 0
+            if fill_w > 0:
+                d.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(8)), radius=sc(4), fill=(*color, 255))
+            elif zero:
+                d.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(196, 53, 73, 210))
+
+            score = str(pph)
+            score_bbox = d.textbbox((0, 0), score, font=fonts["row_small"])
+            d.text((px + panel_w - sc(18) - (score_bbox[2] - score_bbox[0]), y), score, font=fonts["row_small"], fill=(*score_fill, 255))
+
+    out = BytesIO()
+    img = img.resize((1355, 804), Image.Resampling.LANCZOS)
+    img.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+
+async def send_hourly_stats_card(channel):
+    payload = await build_hourly_stats_payload()
+    if not payload:
+        raise ValueError("Could not load active war hourly stats.")
+    image = await generate_hourly_stats_card(payload)
+    file = discord.File(image, filename="mcwv-hourly-stats.png")
+    embed = discord.Embed(color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    embed.set_image(url="attachment://mcwv-hourly-stats.png")
+    embed.set_footer(text="Hourly points use the latest 60 minutes of MCWV leaderboard history.")
+    await channel.send(embed=embed, file=file)
+
+
+def hourly_stats_enabled():
+    raw = db_get_setting("mcwv_hourly_stats_enabled", "1" if MCWV_HOURLY_STATS_ENABLED_DEFAULT else "0")
+    return str(raw).lower() not in ("0", "false", "off", "no")
+
+
+def get_hourly_stats_channel_id():
+    saved = db_get_setting("mcwv_hourly_stats_channel_id", None)
+    try:
+        return int(saved or MCWV_HOURLY_STATS_CHANNEL_ID or 0)
+    except Exception:
+        return int(MCWV_HOURLY_STATS_CHANNEL_ID or 0)
+
+
+def set_hourly_stats_channel_id(channel_id):
+    db_set_setting("mcwv_hourly_stats_channel_id", int(channel_id))
+
+
+@tasks.loop(minutes=60)
+async def hourly_stats_loop():
+    await bot.wait_until_ready()
+    if not hourly_stats_enabled():
+        return
+
+    channel_id = get_hourly_stats_channel_id()
+    if not channel_id:
+        return
+
+    channel = await _maybe_get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"[hourly stats] channel not found/not text: {channel_id}")
+        return
+
+    try:
+        await send_hourly_stats_card(channel)
+        db_set_setting("mcwv_hourly_stats_last_sent_at", _now_iso())
+        print(f"[hourly stats] card sent to {channel_id}")
+    except Exception as exc:
+        print(f"[hourly stats] auto-send failed: {exc}")
+
+
+@hourly_stats_loop.before_loop
+async def before_hourly_stats_loop():
+    await bot.wait_until_ready()
+
+
 async def process_clan_logs():
     channel_id = get_clan_log_channel_id()
     if not channel_id:
@@ -11898,6 +12378,10 @@ def start_bot_loops():
     if not clan_log_loop.is_running():
         clan_log_loop.change_interval(seconds=MCWV_CLAN_LOG_INTERVAL_SECONDS)
         clan_log_loop.start()
+
+    if not hourly_stats_loop.is_running():
+        hourly_stats_loop.change_interval(minutes=MCWV_HOURLY_STATS_INTERVAL_MINUTES)
+        hourly_stats_loop.start()
 
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
         hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
