@@ -12014,9 +12014,9 @@ async def generate_hourly_stats_card(payload):
     fonts = {
         "tag": font(34, True),
         "badge_label": font(10, False),
-        "badge_value": font(22, True),
+        "badge_value": font(28, True),
         "stat_label": font(12, False),
-        "stat_value": font(39, True),
+        "stat_value": font(40, True),
         "row": font(17, True),
         "row_small": font(15, True),
         "tiny": font(10, False),
@@ -12049,6 +12049,14 @@ async def generate_hourly_stats_card(payload):
         bbox = draw.textbbox((0, 0), text, font=font_obj)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x = box[0] + ((box[2] - box[0]) - tw) // 2 - bbox[0]
+        y = box[1] + ((box[3] - box[1]) - th) // 2 - bbox[1]
+        draw.text((x, y), text, font=font_obj, fill=fill)
+
+    def left_center_text(draw, box, text, font_obj, fill):
+        text = str(text)
+        bbox = draw.textbbox((0, 0), text, font=font_obj)
+        th = bbox[3] - bbox[1]
+        x = box[0] - bbox[0]
         y = box[1] + ((box[3] - box[1]) - th) // 2 - bbox[1]
         draw.text((x, y), text, font=font_obj, fill=fill)
 
@@ -12095,13 +12103,32 @@ async def generate_hourly_stats_card(payload):
     img.alpha_composite(strip)
     d = ImageDraw.Draw(img)
 
-    # Logo with segmented ring.
+    # Logo: cleaner neon ring. The old segmented arcs looked uneven around the logo,
+    # so this draws a near-continuous gradient ring with one intentional gap.
     logo_center = (sc(112), sc(132))
-    ring_r = sc(55)
-    alpha_round((logo_center[0] - sc(59), logo_center[1] - sc(59), logo_center[0] + sc(59), logo_center[1] + sc(59)), 60, (0, 0, 0, 80), blur=5)
+    ring_r = sc(56)
+    alpha_round((logo_center[0] - sc(62), logo_center[1] - sc(62), logo_center[0] + sc(62), logo_center[1] + sc(62)), 64, (0, 0, 0, 92), blur=6)
+    ring_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rd = ImageDraw.Draw(ring_layer)
+    ring_box = (logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r)
+    ring_colours = [(93, 111, 255), (72, 214, 177), (232, 205, 54), (248, 135, 43), (93, 111, 255)]
+    # Leave a small gap at top-left for the same premium-gauge feel as the ref,
+    # but keep everything else smooth and balanced.
+    start_angle = -42
+    sweep = 318
+    steps = 120
+    for step in range(steps):
+        t = step / max(steps - 1, 1)
+        colour_pos = t * (len(ring_colours) - 1)
+        idx = min(int(colour_pos), len(ring_colours) - 2)
+        local = colour_pos - idx
+        c1, c2 = ring_colours[idx], ring_colours[idx + 1]
+        color = tuple(int(c1[i] + (c2[i] - c1[i]) * local) for i in range(3))
+        a0 = start_angle + sweep * t
+        a1 = start_angle + sweep * min(1, t + 1 / steps)
+        rd.arc(ring_box, a0, a1, fill=(*color, 255), width=sc(5))
+    img.alpha_composite(ring_layer.filter(ImageFilter.GaussianBlur(sc(0.25))))
     d = ImageDraw.Draw(img)
-    for start, color in [(315, (93, 111, 255)), (35, (72, 214, 177)), (135, (232, 205, 54)), (230, (248, 135, 43))]:
-        d.arc((logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r), start, start + 74, fill=(*color, 255), width=sc(5))
     d.ellipse((logo_center[0] - sc(46), logo_center[1] - sc(46), logo_center[0] + sc(46), logo_center[1] + sc(46)), fill=(11, 12, 29, 236), outline=(190, 195, 255, 90), width=sc(1))
     asset_id = extract_asset_id(payload.get("icon"))
     icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
@@ -12124,25 +12151,29 @@ async def generate_hourly_stats_card(payload):
     clan_bbox = d.textbbox((0, 0), clan_text, font=fonts["tag"])
     clan_text_w = clan_bbox[2] - clan_bbox[0]
 
-    def small_badge(x, label, value, accent, width=126):
-        box = (x, sc(110), x + sc(width), sc(158))
-        alpha_round(box, 10, (22, 25, 43, 222), outline=(*accent, 128), width=1)
+    def small_badge(x, label, value, accent, width=148):
+        box = (x, sc(104), x + sc(width), sc(166))
+        alpha_round((box[0] + sc(1), box[1] + sc(2), box[2] + sc(1), box[3] + sc(2)), 12, (0, 0, 0, 80), blur=3)
+        alpha_round(box, 12, (22, 25, 43, 228), outline=(*accent, 145), width=1)
         dd = ImageDraw.Draw(img)
-        centered_text(dd, (box[0], box[1] + sc(5), box[2], box[1] + sc(20)), label.upper(), fonts["badge_label"], (155, 162, 184, 255))
-        centered_text(dd, (box[0], box[1] + sc(21), box[2], box[3] - sc(3)), value, fonts["badge_value"], (*accent, 255))
+        centered_text(dd, (box[0], box[1] + sc(7), box[2], box[1] + sc(22)), label.upper(), fonts["badge_label"], (164, 172, 196, 255))
+        centered_text(dd, (box[0], box[1] + sc(22), box[2], box[3] - sc(2)), value, fonts["badge_value"], (*accent, 255))
 
-    badge1_x = max(sc(360), clan_x + clan_text_w + sc(34))
-    badge2_x = badge1_x + sc(142)
-    small_badge(badge1_x, "Clan Rank", f"#{payload.get('rank') or '—'}", (239, 198, 58), width=120)
-    small_badge(badge2_x, "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (82, 200, 240), width=132)
+    badge1_x = max(sc(366), clan_x + clan_text_w + sc(40))
+    badge2_x = badge1_x + sc(158)
+    small_badge(badge1_x, "Clan Rank", f"#{payload.get('rank') or '—'}", (239, 198, 58), width=132)
+    small_badge(badge2_x, "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (82, 200, 240), width=152)
 
     # Top-right stat cards.
     def stat_box(x, label, value, accent):
         box = (sc(x), sc(94), sc(x + 135), sc(172))
-        alpha_round(box, 13, (22, 25, 43, 222), outline=(*accent, 108), width=1)
+        alpha_round((box[0] + sc(1), box[1] + sc(2), box[2] + sc(1), box[3] + sc(2)), 13, (0, 0, 0, 75), blur=3)
+        alpha_round(box, 13, (22, 25, 43, 224), outline=(*accent, 112), width=1)
         dd = ImageDraw.Draw(img)
-        dd.text((box[0] + sc(13), box[1] + sc(15)), label, font=fonts["stat_label"], fill=(158, 166, 190, 255))
-        dd.text((box[0] + sc(13), box[1] + sc(33)), str(value), font=fonts["stat_value"], fill=(247, 248, 255, 255))
+        text_left = box[0] + sc(14)
+        text_right = box[2] - sc(35)
+        left_center_text(dd, (text_left, box[1] + sc(12), text_right, box[1] + sc(29)), label, fonts["stat_label"], (162, 170, 194, 255))
+        left_center_text(dd, (text_left, box[1] + sc(28), text_right, box[3] - sc(7)), str(value), fonts["stat_value"], (247, 248, 255, 255))
         dd.rounded_rectangle((box[2] - sc(24), box[1] + sc(22), box[2] - sc(12), box[3] - sc(20)), radius=sc(6), fill=(*accent, 255))
 
     stat_box(858, "Players", payload.get("players", 0), (93, 111, 255))
