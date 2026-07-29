@@ -10842,11 +10842,11 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
         return ImageFont.truetype(path, sc(size))
 
     fonts = {
-        "title": font(70, True),
+        "title": font(68, True),
         "small": font(28, True),
-        "pill": font(30, True),
-        "rank": font(104, True),
-        "label": font(38, False),
+        "pill": font(29, True),
+        "rank": font(102, True),
+        "label": font(39, False),
         "points": font(54, True),
         "logo": font(28, True),
     }
@@ -10905,6 +10905,24 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
         ld.rounded_rectangle((box[0]+sc(2), box[1]+sc(2), box[2]-sc(2), box[1]+sc(32)), radius=sc(radius-2), fill=(255, 255, 255, 16))
         img.alpha_composite(layer)
 
+    def aligned_xy(box, text, font, align="center"):
+        bbox = d.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        if align == "left":
+            x = box[0]
+        elif align == "right":
+            x = box[2] - tw
+        else:
+            x = box[0] + ((box[2] - box[0]) - tw) / 2
+        y = box[1] + ((box[3] - box[1]) - th) / 2
+        return int(x - bbox[0]), int(y - bbox[1])
+
+    def draw_aligned(text, font, box, fill, align="center", shadow=(0, 0, 0, 125), offset=None):
+        xy = aligned_xy(box, text, font, align=align)
+        off = offset or (sc(3), sc(4))
+        draw_text_shadow(d, xy, text, font, fill, shadow=shadow, offset=off)
+
     # Top logo orb.
     logo = (ox + sc(36), oy + sc(31), ox + sc(151), oy + sc(146))
     d.ellipse(logo, fill=(7, 11, 35, 150), outline=(119, 145, 255, 230), width=sc(3))
@@ -10922,14 +10940,28 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     else:
         draw_text_shadow(d, (ox + sc(56), oy + sc(74)), "MCWV", fonts["logo"], (188, 86, 255, 255), offset=(sc(2), sc(2)))
 
-    # Header title and status pill.
-    draw_text_shadow(d, (ox + sc(205), oy + sc(62)), f"[{CLAN_NAME}]", fonts["title"], (250, 251, 255, 255), shadow=(0, 0, 0, 120), offset=(sc(3), sc(4)))
+    # Header title and status pill. Text is aligned in boxes so it stays clean at every size.
+    draw_aligned(
+        f"[{CLAN_NAME}]",
+        fonts["title"],
+        (ox + sc(202), oy + sc(43), ox + sc(545), oy + sc(150)),
+        (250, 251, 255, 255),
+        align="left",
+        shadow=(0, 0, 0, 118),
+        offset=(sc(3), sc(4)),
+    )
     pill_text = f"Position {'Increased' if improved else 'Decreased'} by {diff}"
     pill = (ox + sc(560), oy + sc(38), ox + cw - sc(38), oy + sc(100))
     glass_panel(pill, radius=20, fill_alpha=118, outline_alpha=90)
     d.rounded_rectangle(pill, radius=sc(20), outline=(*accent, 185), width=sc(2))
-    tw = d.textbbox((0, 0), pill_text, font=fonts["pill"])[2]
-    draw_text_shadow(d, (pill[0] + ((pill[2]-pill[0]) - tw)//2, pill[1] + sc(11)), pill_text, fonts["pill"], (*accent, 255), shadow=(0,0,0,135), offset=(sc(2), sc(2)))
+    draw_aligned(
+        pill_text,
+        fonts["pill"],
+        (pill[0] + sc(18), pill[1] + sc(2), pill[2] - sc(18), pill[3] - sc(2)),
+        (*accent, 255),
+        shadow=(0, 0, 0, 132),
+        offset=(sc(2), sc(2)),
+    )
 
     # Main glass rank transition panel.
     bar = (ox + sc(38), oy + sc(182), ox + cw - sc(38), oy + sc(368))
@@ -10956,22 +10988,39 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     d.polygon(arrow, fill=(*accent_2, 34))
     d.polygon([(ox+sc(510), bar[1]), (ox+sc(642), oy+sc(275)), (ox+sc(510), bar[3]), (ox+sc(590), bar[3]), (ox+sc(723), oy+sc(275)), (ox+sc(590), bar[1])], fill=(*accent_2, 18))
 
-    # Rank numbers.
-    draw_text_shadow(d, (ox + sc(82), oy + sc(231)), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255), shadow=(0, 0, 0, 128), offset=(sc(4), sc(5)))
-    new_text = f"#{new_rank}"
-    new_w = d.textbbox((0, 0), new_text, font=fonts["rank"])[2]
-    draw_text_shadow(d, (ox + cw - sc(75) - new_w, oy + sc(231)), new_text, fonts["rank"], (*accent, 255), shadow=(0, 0, 0, 130), offset=(sc(4), sc(5)))
+    # Rank numbers centered vertically in each half of the bar.
+    draw_aligned(
+        f"#{old_rank}",
+        fonts["rank"],
+        (bar[0] + sc(44), bar[1] + sc(8), bar[0] + sc(330), bar[3] - sc(4)),
+        (248, 249, 255, 255),
+        shadow=(0, 0, 0, 128),
+        offset=(sc(4), sc(5)),
+    )
+    draw_aligned(
+        f"#{new_rank}",
+        fonts["rank"],
+        (bar[2] - sc(330), bar[1] + sc(8), bar[2] - sc(44), bar[3] - sc(4)),
+        (*accent, 255),
+        shadow=(0, 0, 0, 130),
+        offset=(sc(4), sc(5)),
+    )
 
     # Bottom contribution glass chip.
     footer = (ox + sc(230), oy + sc(398), ox + cw - sc(230), oy + sc(478))
     glass_panel(footer, radius=28, fill_alpha=54, outline_alpha=24)
     label = "Contributions"
     pts = format_compact_points(points)
-    label_w = d.textbbox((0, 0), label, font=fonts["label"])[2]
-    pts_w = d.textbbox((0, 0), pts, font=fonts["points"])[2]
-    start_x = ox + (cw - label_w - sc(28) - pts_w) // 2
-    draw_text_shadow(d, (start_x, oy + sc(405)), label, fonts["label"], (233, 236, 250, 240), shadow=(0, 0, 0, 105), offset=(sc(2), sc(3)))
-    draw_text_shadow(d, (start_x + label_w + sc(28), oy + sc(397)), pts, fonts["points"], (255, 220, 94, 255), shadow=(0, 0, 0, 138), offset=(sc(3), sc(3)))
+    label_bbox = d.textbbox((0, 0), label, font=fonts["label"])
+    pts_bbox = d.textbbox((0, 0), pts, font=fonts["points"])
+    label_w = label_bbox[2] - label_bbox[0]
+    pts_w = pts_bbox[2] - pts_bbox[0]
+    group_w = label_w + sc(28) + pts_w
+    group_x = ox + (cw - group_w) // 2
+    label_box = (group_x, footer[1] + sc(6), group_x + label_w, footer[3] - sc(6))
+    pts_box = (group_x + label_w + sc(28), footer[1] + sc(2), group_x + group_w, footer[3] - sc(6))
+    draw_aligned(label, fonts["label"], label_box, (233, 236, 250, 240), align="left", shadow=(0, 0, 0, 105), offset=(sc(2), sc(3)))
+    draw_aligned(pts, fonts["points"], pts_box, (255, 220, 94, 255), align="left", shadow=(0, 0, 0, 138), offset=(sc(3), sc(3)))
 
     img = img.resize((1080, 560), Image.Resampling.LANCZOS)
     out = BytesIO()
