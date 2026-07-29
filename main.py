@@ -11212,21 +11212,38 @@ async def fetch_roblox_headshot_for_logs(user_id, size=320):
 
 def draw_member_icon(draw, box, accent, S):
     x1, y1, x2, y2 = box
-    draw.rounded_rectangle(box, radius=int(14 * S), fill=(accent[0], accent[1], accent[2], 32))
+    # Use fully opaque blended colours here. ImageDraw does not alpha-composite
+    # semi-transparent fills; it replaces pixels, which made the icon blocks look
+    # like bright empty squares in Discord.
+    bg = (
+        max(24, int(accent[0] * 0.22)),
+        max(22, int(accent[1] * 0.22)),
+        max(42, int(accent[2] * 0.30)),
+        255,
+    )
+    draw.rounded_rectangle(box, radius=int(14 * S), fill=bg, outline=(*accent, 255), width=int(1.5 * S))
     cx = (x1 + x2) // 2
     head_r = int(9 * S)
-    head_y = y1 + int(19 * S)
-    draw.ellipse((cx - head_r, head_y - head_r, cx + head_r, head_y + head_r), outline=(*accent, 255), width=int(4 * S))
-    draw.arc((cx - int(19 * S), y1 + int(30 * S), cx + int(19 * S), y1 + int(66 * S)), 200, 340, fill=(*accent, 255), width=int(4 * S))
+    head_y = y1 + int(20 * S)
+    stroke = int(4.5 * S)
+    draw.ellipse((cx - head_r, head_y - head_r, cx + head_r, head_y + head_r), outline=(*accent, 255), width=stroke)
+    draw.arc((cx - int(19 * S), y1 + int(31 * S), cx + int(19 * S), y1 + int(67 * S)), 200, 340, fill=(*accent, 255), width=stroke)
 
 
 def draw_arrow_icon(draw, box, accent, S):
     x1, y1, x2, y2 = box
-    draw.rounded_rectangle(box, radius=int(14 * S), fill=(accent[0], accent[1], accent[2], 30))
+    bg = (
+        max(24, int(accent[0] * 0.22)),
+        max(22, int(accent[1] * 0.22)),
+        max(42, int(accent[2] * 0.30)),
+        255,
+    )
+    draw.rounded_rectangle(box, radius=int(14 * S), fill=bg, outline=(*accent, 255), width=int(1.5 * S))
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
-    draw.line((cx - int(12 * S), cy, cx + int(12 * S), cy), fill=(*accent, 255), width=int(4 * S))
-    draw.line((cx + int(2 * S), cy - int(10 * S), cx + int(13 * S), cy, cx + int(2 * S), cy + int(10 * S)), fill=(*accent, 255), width=int(4 * S), joint="curve")
+    stroke = int(4.5 * S)
+    draw.line((cx - int(13 * S), cy, cx + int(13 * S), cy), fill=(*accent, 255), width=stroke)
+    draw.line((cx + int(2 * S), cy - int(11 * S), cx + int(14 * S), cy, cx + int(2 * S), cy + int(11 * S)), fill=(*accent, 255), width=stroke, joint="curve")
 
 
 async def generate_clan_member_log_card(kind, user_id, user_info, member_count, member_capacity):
@@ -11293,8 +11310,12 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     icon_box = (sc(50), sc(210), sc(108), sc(268))
     draw_member_icon(d, icon_box, label_color, S)
     count_text = f"{int(member_count or 0)}/{int(member_capacity or 0) if member_capacity else '?'}"
-    draw_text_shadow(d, (sc(112), sc(218)), count_text, fonts["meta"], (250, 250, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
-    d.text((sc(220), sc(223)), "Members", font=fonts["meta_regular"], fill=(190, 188, 205, 255))
+    count_x = sc(112)
+    count_y = sc(218)
+    draw_text_shadow(d, (count_x, count_y), count_text, fonts["meta"], (250, 250, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
+    count_bbox = d.textbbox((count_x, count_y), count_text, font=fonts["meta"])
+    members_x = count_bbox[2] + sc(22)
+    d.text((members_x, sc(223)), "Members", font=fonts["meta_regular"], fill=(190, 188, 205, 255))
 
     arrow_box = (sc(50), sc(315), sc(108), sc(373))
     draw_arrow_icon(d, arrow_box, label_color, S)
