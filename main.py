@@ -11015,9 +11015,10 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     # Solid colour chevrons with a crisp shadow and a tiny highlight edge.
     arrow = [(ox+sc(414), bar[1]), (ox+sc(552), oy+sc(275)), (ox+sc(414), bar[3]), (ox+sc(506), bar[3]), (ox+sc(644), oy+sc(275)), (ox+sc(506), bar[1])]
     arrow2 = [(ox+sc(494), bar[1]), (ox+sc(632), oy+sc(275)), (ox+sc(494), bar[3]), (ox+sc(580), bar[3]), (ox+sc(718), oy+sc(275)), (ox+sc(580), bar[1])]
-    # Solid chevrons only — no shadows/highlights/outline so there are no dark seams.
+    # Solid two-tone chevrons — no shadows/highlights/outline so there are no dark seams.
     chevron_main = tuple(min(255, int(v * 0.98)) for v in accent)
-    d.polygon(arrow2, fill=(*chevron_main, 255))
+    chevron_second = tuple(min(255, int(v * 0.72 + 35)) for v in accent)
+    d.polygon(arrow2, fill=(*chevron_second, 255))
     d.polygon(arrow, fill=(*chevron_main, 255))
 
     # Rank numbers centered vertically in each half of the bar.
