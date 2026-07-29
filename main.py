@@ -1050,6 +1050,8 @@ def admin_status():
             "hourlyStatsIntervalMinutes": globals().get("MCWV_HOURLY_STATS_INTERVAL_MINUTES"),
             "hourlyStatsPingEnabled": _safe_call("hourly_stats_ping_enabled", False),
             "hourlyStatsPingThreshold": _safe_call("get_hourly_stats_ping_threshold", MCWV_HOURLY_STATS_PING_THRESHOLD_DEFAULT),
+            "hourlyStatsStartTime": _safe_call("get_hourly_stats_start_time", MCWV_HOURLY_STATS_START_TIME_DEFAULT),
+            "hourlyStatsPingMessage": _safe_call("get_hourly_stats_ping_message", MCWV_HOURLY_STATS_PING_MESSAGE_DEFAULT),
             "hourlyStatsLastSentAt": _safe_call("db_get_setting", None, "mcwv_hourly_stats_last_sent_at"),
         },
         "loops": {
@@ -1381,9 +1383,17 @@ async def _admin_setup_system_from_body(body):
             )
             db_set_setting("mcwv_hourly_stats_ping_threshold", threshold)
 
+        if "start_time" in body or "startTime" in body:
+            start_time = normalize_hourly_start_time(body.get("start_time", body.get("startTime")))
+            db_set_setting("mcwv_hourly_stats_start_time", start_time)
+
+        if "ping_message" in body or "pingMessage" in body:
+            message = str(body.get("ping_message", body.get("pingMessage")) or "")[:1200]
+            db_set_setting("mcwv_hourly_stats_ping_message", message)
+
         loop_obj = globals().get("hourly_stats_loop")
         if loop_obj is not None:
-            loop_obj.change_interval(minutes=MCWV_HOURLY_STATS_INTERVAL_MINUTES)
+            loop_obj.change_interval(minutes=1)
             if not loop_obj.is_running():
                 loop_obj.start()
 
@@ -1416,10 +1426,12 @@ async def _admin_send_hourly_stats_from_body(body):
     channel = await _validate_admin_text_channel(channel_id, require_invite=False)
     ping_enabled = body.get("ping_enabled", body.get("pingEnabled", None))
     ping_threshold = body.get("ping_threshold", body.get("pingThreshold", None))
+    ping_message = body.get("ping_message", body.get("pingMessage", None))
     await send_hourly_stats_card(
         channel,
         ping_enabled=_admin_bool(ping_enabled, hourly_stats_ping_enabled()) if ping_enabled is not None else None,
         ping_threshold=_admin_int(ping_threshold, get_hourly_stats_ping_threshold(), minimum=0, maximum=1_000_000_000) if ping_threshold is not None else None,
+        ping_message=str(ping_message)[:1200] if ping_message is not None else None,
     )
     return {"success": True, "channel_id": str(channel.id), "message": f"Hourly stats sent in #{channel.name}."}
 
@@ -4801,6 +4813,11 @@ MCWV_HOURLY_STATS_ENABLED_DEFAULT = os.environ.get("MCWV_HOURLY_STATS_ENABLED", 
 MCWV_HOURLY_STATS_INTERVAL_MINUTES = max(5, int(os.environ.get("MCWV_HOURLY_STATS_INTERVAL_MINUTES", "60") or "60"))
 MCWV_HOURLY_STATS_PING_ENABLED_DEFAULT = os.environ.get("MCWV_HOURLY_STATS_PING_ENABLED", "0") == "1"
 MCWV_HOURLY_STATS_PING_THRESHOLD_DEFAULT = max(0, int(os.environ.get("MCWV_HOURLY_STATS_PING_THRESHOLD", "100") or "100"))
+MCWV_HOURLY_STATS_START_TIME_DEFAULT = os.environ.get("MCWV_HOURLY_STATS_START_TIME", "").strip()
+MCWV_HOURLY_STATS_PING_MESSAGE_DEFAULT = os.environ.get(
+    "MCWV_HOURLY_STATS_PING_MESSAGE",
+    "Reconnect/lock in and start gaining points now.\n\nEvery time you slack in points per hour, it’s recorded. Slack too much = get kicked.",
+)
 MCWV_HOURLY_STATS_BG_PATH = os.environ.get(
     "MCWV_HOURLY_STATS_BG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hourly_stats_bg.webp"),
@@ -12267,7 +12284,44 @@ def fetch_hourly_ping_targets(entries, threshold):
     return targets
 
 
-async def send_hourly_ping_followup(channel, entries, threshold):
+def record_hourly_ping_targets(targets, threshold):
+    if not db_enabled() or not targets:
+        return
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS hourly_stats_ping_records (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_id TEXT,
+                    username TEXT,
+                    pph INTEGER,
+                    threshold INTEGER,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.executemany("""
+                INSERT INTO hourly_stats_ping_records (discord_id, username, pph, threshold, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, [
+                (
+                    str(target.get("discordId") or ""),
+                    str(target.get("username") or "Unknown"),
+                    int(target.get("pph") or 0),
+                    int(threshold),
+                )
+                for target in targets
+            ])
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
+async def send_hourly_ping_followup(channel, entries, threshold, message=None):
     targets = fetch_hourly_ping_targets(entries, threshold)
     if not targets:
         return 0
@@ -12284,20 +12338,35 @@ async def send_hourly_ping_followup(channel, entries, threshold):
         else:
             current += part
 
+    warning = render_hourly_ping_message(message, threshold, len(targets))
+    if warning:
+        addition = f"\n\n{warning}"
+        if len(current) + len(addition) <= 1900:
+            current += addition
+        else:
+            if current.strip():
+                chunks.append(current.rstrip())
+            current = warning
+
     if current.strip():
         chunks.append(current.rstrip())
 
-    for chunk in chunks[:5]:
+    for chunk in chunks[:6]:
         await channel.send(
             content=chunk,
             allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
         )
         await asyncio.sleep(0.4)
 
+    try:
+        record_hourly_ping_targets(targets, threshold)
+    except Exception as exc:
+        print(f"[hourly stats] ping record failed: {exc}")
+
     return len(targets)
 
 
-async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None):
+async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None):
     payload = await build_hourly_stats_payload()
     if not payload:
         raise ValueError("Could not load active war hourly stats.")
@@ -12306,11 +12375,12 @@ async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None
     # Send as a plain image attachment, not an embed.
     await channel.send(file=file)
     save_hourly_player_snapshot(payload)
+    db_set_setting("mcwv_hourly_stats_last_sent_at", _now_iso())
 
     should_ping = hourly_stats_ping_enabled() if ping_enabled is None else bool(ping_enabled)
     threshold = get_hourly_stats_ping_threshold() if ping_threshold is None else max(0, int(ping_threshold))
     if should_ping and threshold > 0:
-        await send_hourly_ping_followup(channel, payload.get("entries") or [], threshold)
+        await send_hourly_ping_followup(channel, payload.get("entries") or [], threshold, message=ping_message)
 
 
 def hourly_stats_enabled():
@@ -12330,6 +12400,65 @@ def get_hourly_stats_ping_threshold():
         return int(MCWV_HOURLY_STATS_PING_THRESHOLD_DEFAULT)
 
 
+def normalize_hourly_start_time(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text)
+    if not match:
+        return ""
+    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+
+
+def get_hourly_stats_start_time():
+    return normalize_hourly_start_time(db_get_setting("mcwv_hourly_stats_start_time", MCWV_HOURLY_STATS_START_TIME_DEFAULT))
+
+
+def get_hourly_stats_ping_message():
+    value = db_get_setting("mcwv_hourly_stats_ping_message", None)
+    if value is None:
+        return MCWV_HOURLY_STATS_PING_MESSAGE_DEFAULT
+    return str(value)
+
+
+def render_hourly_ping_message(message, threshold, count):
+    template = get_hourly_stats_ping_message() if message is None else str(message)
+    return (
+        template
+        .replace("{threshold}", str(int(threshold)))
+        .replace("{count}", str(int(count)))
+    ).strip()
+
+
+def parse_iso_ms(value):
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def hourly_stats_due_now():
+    interval = max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60))
+    now = datetime.now(timezone.utc)
+    now_minute = int(now.timestamp() // 60)
+    start_time = get_hourly_stats_start_time()
+
+    last_sent = db_get_setting("mcwv_hourly_stats_last_auto_sent_at", None) or db_get_setting("mcwv_hourly_stats_last_sent_at", None)
+    last_ms = parse_iso_ms(last_sent) if last_sent else None
+    if last_ms is not None and (now.timestamp() * 1000 - last_ms) < max(1, interval) * 60 * 1000 - 5000:
+        return False
+
+    if start_time:
+        hour, minute = [int(part) for part in start_time.split(":", 1)]
+        start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        start_minute = int(start.timestamp() // 60)
+        if now_minute < start_minute:
+            start_minute -= 24 * 60
+        return (now_minute - start_minute) % interval == 0
+
+    return True
+
+
 def get_hourly_stats_channel_id():
     saved = db_get_setting("mcwv_hourly_stats_channel_id", None)
     try:
@@ -12342,10 +12471,13 @@ def set_hourly_stats_channel_id(channel_id):
     db_set_setting("mcwv_hourly_stats_channel_id", int(channel_id))
 
 
-@tasks.loop(minutes=60)
+@tasks.loop(minutes=1)
 async def hourly_stats_loop():
     await bot.wait_until_ready()
     if not hourly_stats_enabled():
+        return
+
+    if not hourly_stats_due_now():
         return
 
     channel_id = get_hourly_stats_channel_id()
@@ -12359,7 +12491,9 @@ async def hourly_stats_loop():
 
     try:
         await send_hourly_stats_card(channel)
-        db_set_setting("mcwv_hourly_stats_last_sent_at", _now_iso())
+        now_iso = _now_iso()
+        db_set_setting("mcwv_hourly_stats_last_sent_at", now_iso)
+        db_set_setting("mcwv_hourly_stats_last_auto_sent_at", now_iso)
         print(f"[hourly stats] card sent to {channel_id}")
     except Exception as exc:
         print(f"[hourly stats] auto-send failed: {exc}")
@@ -12829,7 +12963,7 @@ def start_bot_loops():
         clan_log_loop.start()
 
     if not hourly_stats_loop.is_running():
-        hourly_stats_loop.change_interval(minutes=MCWV_HOURLY_STATS_INTERVAL_MINUTES)
+        hourly_stats_loop.change_interval(minutes=1)
         hourly_stats_loop.start()
 
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
