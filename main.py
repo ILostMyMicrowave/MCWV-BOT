@@ -12407,12 +12407,7 @@ async def send_hourly_ping_followup(channel, entries, threshold, message=None):
     return len(targets)
 
 
-async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None, enforce_cooldown=True):
-    if enforce_cooldown:
-        remaining = hourly_stats_cooldown_remaining_seconds()
-        if remaining > 0:
-            raise ValueError(f"Hourly stats already sent this hour. Try again in {format_hourly_cooldown(remaining)}.")
-
+async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None):
     payload = await build_hourly_stats_payload()
     if not payload:
         raise ValueError("Could not load active war hourly stats.")
@@ -12489,7 +12484,7 @@ def hourly_stats_due_now():
     now_minute = int(now.timestamp() // 60)
     start_time = get_hourly_stats_start_time()
 
-    last_ms = hourly_stats_last_sent_ms()
+    last_ms = hourly_stats_last_auto_sent_ms()
     if last_ms is not None and (now.timestamp() * 1000 - last_ms) < max(1, interval) * 60 * 1000 - 5000:
         return False
 
@@ -12504,18 +12499,13 @@ def hourly_stats_due_now():
     return True
 
 
-def hourly_stats_last_sent_ms():
-    values = []
-    for key in ("mcwv_hourly_stats_last_sent_at", "mcwv_hourly_stats_last_auto_sent_at"):
-        value = db_get_setting(key, None)
-        parsed = parse_iso_ms(value) if value else None
-        if parsed is not None:
-            values.append(parsed)
-    return max(values) if values else None
+def hourly_stats_last_auto_sent_ms():
+    value = db_get_setting("mcwv_hourly_stats_last_auto_sent_at", None)
+    return parse_iso_ms(value) if value else None
 
 
-def hourly_stats_cooldown_remaining_seconds():
-    last_ms = hourly_stats_last_sent_ms()
+def hourly_stats_auto_cooldown_remaining_seconds():
+    last_ms = hourly_stats_last_auto_sent_ms()
     if last_ms is None:
         return 0
     interval_ms = max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60)) * 60 * 1000
@@ -12563,10 +12553,11 @@ async def hourly_stats_loop():
         return
 
     try:
+        # Reserve the scheduled slot before sending so a slow send/retry cannot
+        # produce duplicate automated hourly cards. Manual /hourly_stats is not
+        # limited by this timestamp.
+        db_set_setting("mcwv_hourly_stats_last_auto_sent_at", _now_iso())
         await send_hourly_stats_card(channel)
-        now_iso = _now_iso()
-        db_set_setting("mcwv_hourly_stats_last_sent_at", now_iso)
-        db_set_setting("mcwv_hourly_stats_last_auto_sent_at", now_iso)
         print(f"[hourly stats] card sent to {channel_id}")
     except Exception as exc:
         print(f"[hourly stats] auto-send failed: {exc}")
