@@ -10967,53 +10967,57 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     bar = (ox + sc(38), oy + sc(182), ox + cw - sc(38), oy + sc(368))
     glass_panel(bar, radius=34, fill_alpha=118, outline_alpha=82)
 
-    # Rank transition bar: smoother left-to-right flow with a broad soft blend.
+    # Rank transition bar: smooth continuous gradient with solid chevrons.
     bar_w, bar_h = bar[2] - bar[0], bar[3] - bar[1]
     bar_art = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
     bd = ImageDraw.Draw(bar_art)
-    base = (30, 43, 118)
-    mid = (36, 63, 126)
-    target = tuple(int(v * 0.70) for v in accent)
+
+    left_rgb = (30, 42, 120)
+    mid_rgb = (38, 70, 145)
+    right_rgb = tuple(min(255, int(v * 0.88)) for v in accent)
+    far_rgb = tuple(min(255, int(v * 0.70 + 35)) for v in accent)
+
+    def smoothstep(v):
+        v = max(0.0, min(1.0, v))
+        return v * v * (3 - 2 * v)
+
     for x in range(bar_w):
         t = x / max(bar_w - 1, 1)
-        # Smoothstep begins the colour flow before the chevron and finishes near the right edge.
-        flow = max(0.0, min(1.0, (t - 0.36) / 0.58))
-        flow = flow * flow * (3 - 2 * flow)
-        pre = max(0.0, min(1.0, t / 0.46))
-        pre = pre * pre * (3 - 2 * pre)
-        blue = tuple(int((1 - pre) * base[i] + pre * mid[i]) for i in range(3))
-        rgb = tuple(int((1 - flow) * blue[i] + flow * target[i]) for i in range(3))
-        a = int(126 + 36 * flow)
-        bd.line((x, 0, x, bar_h), fill=(*rgb, a))
+        # One long soft gradient: blue holds on the left, then rolls smoothly into the accent.
+        blend_one = smoothstep((t - 0.30) / 0.34)
+        blend_two = smoothstep((t - 0.58) / 0.38)
+        blue_to_mid = tuple(int((1 - blend_one) * left_rgb[i] + blend_one * mid_rgb[i]) for i in range(3))
+        mid_to_accent = tuple(int((1 - blend_two) * blue_to_mid[i] + blend_two * right_rgb[i]) for i in range(3))
+        final_blend = smoothstep((t - 0.78) / 0.22)
+        rgb = tuple(int((1 - final_blend) * mid_to_accent[i] + final_blend * far_rgb[i]) for i in range(3))
+        alpha = int(162 + 34 * smoothstep((t - 0.45) / 0.55))
+        bd.line((x, 0, x, bar_h), fill=(*rgb, alpha))
 
-    # Subtle luminous band through the center to guide the eye along the transition.
-    for x in range(int(bar_w * 0.31), int(bar_w * 0.74)):
-        t = x / max(bar_w - 1, 1)
-        band = 1 - abs(t - 0.53) / 0.22
-        if band > 0:
-            band = band * band * (3 - 2 * band)
-            bd.line((x, 0, x, bar_h), fill=(*accent_2, int(18 * band)))
+    # Soft gloss pass: bright top edge, darker lower edge, all clipped to the bar.
+    for y in range(bar_h):
+        top = max(0.0, 1 - y / max(bar_h * 0.36, 1))
+        bottom = max(0.0, (y - bar_h * 0.58) / max(bar_h * 0.42, 1))
+        if top:
+            bd.line((0, y, bar_w, y), fill=(255, 255, 255, int(24 * top)))
+        if bottom:
+            bd.line((0, y, bar_w, y), fill=(0, 0, 0, int(30 * bottom)))
 
     img.paste(bar_art, (bar[0], bar[1]), rounded_mask((bar_w, bar_h), sc(34)))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle(bar, radius=sc(34), outline=(156, 170, 255, 118), width=sc(2))
-    d.rounded_rectangle((bar[0]+sc(3), bar[1]+sc(3), bar[2]-sc(3), bar[3]-sc(3)), radius=sc(31), outline=(255, 255, 255, 22), width=sc(1))
+    d.rounded_rectangle(bar, radius=sc(34), outline=(165, 181, 255, 132), width=sc(2))
+    d.rounded_rectangle((bar[0]+sc(3), bar[1]+sc(3), bar[2]-sc(3), bar[3]-sc(3)), radius=sc(31), outline=(255, 255, 255, 30), width=sc(1))
 
-    # Chevrons: layered, aligned with the gradient flow, softly transparent.
-    arrow_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    agd = ImageDraw.Draw(arrow_glow)
-    arrow = [(ox+sc(414), bar[1]), (ox+sc(552), oy+sc(275)), (ox+sc(414), bar[3]), (ox+sc(505), bar[3]), (ox+sc(642), oy+sc(275)), (ox+sc(505), bar[1])]
-    arrow2 = [(ox+sc(492), bar[1]), (ox+sc(630), oy+sc(275)), (ox+sc(492), bar[3]), (ox+sc(574), bar[3]), (ox+sc(712), oy+sc(275)), (ox+sc(574), bar[1])]
-    arrow3 = [(ox+sc(570), bar[1]), (ox+sc(704), oy+sc(275)), (ox+sc(570), bar[3]), (ox+sc(640), bar[3]), (ox+sc(774), oy+sc(275)), (ox+sc(640), bar[1])]
-    agd.polygon(arrow, fill=(*accent_2, 34))
-    agd.polygon(arrow2, fill=(*accent_2, 24))
-    agd.polygon(arrow3, fill=(*accent_2, 12))
-    arrow_glow = arrow_glow.filter(ImageFilter.GaussianBlur(sc(1.4)))
-    img.alpha_composite(arrow_glow)
-    d = ImageDraw.Draw(img)
-    d.polygon(arrow, fill=(*accent_2, 28))
-    d.polygon(arrow2, fill=(*accent_2, 18))
-    d.polygon(arrow3, fill=(*accent_2, 8))
+    # Solid colour chevrons with a crisp shadow and a tiny highlight edge.
+    arrow = [(ox+sc(414), bar[1]), (ox+sc(552), oy+sc(275)), (ox+sc(414), bar[3]), (ox+sc(506), bar[3]), (ox+sc(644), oy+sc(275)), (ox+sc(506), bar[1])]
+    arrow2 = [(ox+sc(494), bar[1]), (ox+sc(632), oy+sc(275)), (ox+sc(494), bar[3]), (ox+sc(580), bar[3]), (ox+sc(718), oy+sc(275)), (ox+sc(580), bar[1])]
+    chevron_main = tuple(min(255, int(v * 0.98)) for v in accent)
+    chevron_second = tuple(min(255, int(v * 0.78 + 18)) for v in accent)
+    d.polygon([(x+sc(4), y+sc(5)) for x, y in arrow], fill=(0, 0, 0, 58))
+    d.polygon([(x+sc(4), y+sc(5)) for x, y in arrow2], fill=(0, 0, 0, 44))
+    d.polygon(arrow, fill=(*chevron_main, 232))
+    d.polygon(arrow2, fill=(*chevron_second, 204))
+    d.line([arrow[0], arrow[1], arrow[4], arrow[5], arrow[0]], fill=(255, 255, 255, 48), width=sc(1))
+    d.line([arrow2[0], arrow2[1], arrow2[4], arrow2[5], arrow2[0]], fill=(255, 255, 255, 34), width=sc(1))
 
     # Rank numbers centered vertically in each half of the bar.
     draw_aligned(
