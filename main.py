@@ -4837,37 +4837,11 @@ def fetch_broadcast_metrics_map():
                 WITH latest AS (
                     SELECT DISTINCT ON (roblox_id)
                         roblox_id::text AS roblox_id,
+                        battle_id,
                         points::bigint AS points,
                         captured_at
                     FROM player_leaderboard_history
                     WHERE points IS NOT NULL
-                    ORDER BY roblox_id, captured_at DESC
-                ), hour_base AS (
-                    SELECT DISTINCT ON (roblox_id)
-                        roblox_id::text AS roblox_id,
-                        points::bigint AS points,
-                        captured_at
-                    FROM player_leaderboard_history
-                    WHERE points IS NOT NULL
-                      AND captured_at <= NOW() - INTERVAL '1 hour'
-                    ORDER BY roblox_id, captured_at DESC
-                ), recent_hour_base AS (
-                    SELECT DISTINCT ON (roblox_id)
-                        roblox_id::text AS roblox_id,
-                        points::bigint AS points,
-                        captured_at
-                    FROM player_leaderboard_history
-                    WHERE points IS NOT NULL
-                      AND captured_at >= NOW() - INTERVAL '1 hour'
-                    ORDER BY roblox_id, captured_at ASC
-                ), five_base AS (
-                    SELECT DISTINCT ON (roblox_id)
-                        roblox_id::text AS roblox_id,
-                        points::bigint AS points,
-                        captured_at
-                    FROM player_leaderboard_history
-                    WHERE points IS NOT NULL
-                      AND captured_at <= NOW() - INTERVAL '5 minutes'
                     ORDER BY roblox_id, captured_at DESC
                 )
                 SELECT
@@ -4875,9 +4849,37 @@ def fetch_broadcast_metrics_map():
                     GREATEST(0, l.points - COALESCE(h.points, rh.points, l.points)) AS pph,
                     GREATEST(0, l.points - COALESCE(f.points, l.points)) AS change_5m
                 FROM latest l
-                LEFT JOIN hour_base h ON h.roblox_id = l.roblox_id
-                LEFT JOIN recent_hour_base rh ON rh.roblox_id = l.roblox_id
-                LEFT JOIN five_base f ON f.roblox_id = l.roblox_id
+                LEFT JOIN LATERAL (
+                    SELECT points::bigint AS points, captured_at
+                    FROM player_leaderboard_history p
+                    WHERE p.roblox_id::text = l.roblox_id
+                      AND p.points IS NOT NULL
+                      AND p.battle_id IS NOT DISTINCT FROM l.battle_id
+                      AND p.captured_at <= l.captured_at - INTERVAL '1 hour'
+                    ORDER BY p.captured_at DESC
+                    LIMIT 1
+                ) h ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT points::bigint AS points, captured_at
+                    FROM player_leaderboard_history p
+                    WHERE p.roblox_id::text = l.roblox_id
+                      AND p.points IS NOT NULL
+                      AND p.battle_id IS NOT DISTINCT FROM l.battle_id
+                      AND p.captured_at >= l.captured_at - INTERVAL '1 hour'
+                      AND p.captured_at < l.captured_at
+                    ORDER BY p.captured_at ASC
+                    LIMIT 1
+                ) rh ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT points::bigint AS points, captured_at
+                    FROM player_leaderboard_history p
+                    WHERE p.roblox_id::text = l.roblox_id
+                      AND p.points IS NOT NULL
+                      AND p.battle_id IS NOT DISTINCT FROM l.battle_id
+                      AND p.captured_at <= l.captured_at - INTERVAL '5 minutes'
+                    ORDER BY p.captured_at DESC
+                    LIMIT 1
+                ) f ON TRUE
             """)
             for roblox_id, pph, change_5m in cur.fetchall():
                 metrics[str(roblox_id)] = {
@@ -4899,6 +4901,11 @@ def broadcast_user_from_row(row, points_map, metrics_map):
     points = int(points_map.get(roblox_id, 0))
     metrics = metrics_map.get(roblox_id, {}) if isinstance(metrics_map, dict) else {}
 
+    # If the user has zero current war points, any old DB metric is stale for
+    # the active battle. War points do not decrease, so last-hour gain must be 0.
+    pph = int(metrics.get("pph", 0) or 0) if points > 0 else 0
+    change5m = int(metrics.get("change5m", 0) or 0) if points > 0 else 0
+
     return {
         "roblox_id": roblox_id,
         "discord_id": discord_id,
@@ -4906,8 +4913,8 @@ def broadcast_user_from_row(row, points_map, metrics_map):
         "role": role,
         "ticket_channel_id": ticket_channel_id,
         "points": points,
-        "pph": int(metrics.get("pph", 0) or 0),
-        "change5m": int(metrics.get("change5m", 0) or 0),
+        "pph": pph,
+        "change5m": change5m,
         "rank": None,
     }
 
