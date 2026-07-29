@@ -1045,6 +1045,7 @@ def admin_status():
         "loops": {
             "War Poll Loop": _loop_status("war_poll_loop"),
             "War Collector Loop": _loop_status("hub_war_collect_loop"),
+            "Clan Log Loop": _loop_status("clan_log_loop"),
             "Ticket Screenshot Reminder Loop": _loop_status("ticket_screenshot_reminder_loop"),
             "Presence Loop": _loop_status("check_loop"),
             "Reminder Loop": _loop_status("reminder_loop"),
@@ -4645,6 +4646,10 @@ MCWV_PLACEMENT_BG_PATH = os.environ.get(
     "MCWV_PLACEMENT_BG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "placement_card_bg.webp"),
 )
+MCWV_LOG_CHANNEL_ID = int(os.environ.get("MCWV_LOG_CHANNEL_ID", "0") or "0")
+MCWV_CLAN_LOGS_ENABLED_DEFAULT = os.environ.get("MCWV_CLAN_LOGS_ENABLED", "1") != "0"
+MCWV_CLAN_LOG_INTERVAL_SECONDS = max(30, int(os.environ.get("MCWV_CLAN_LOG_INTERVAL_SECONDS", "60") or "60"))
+MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS = max(1, min(int(os.environ.get("MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS", "8") or "8"), 25))
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
 PS99_IMPORTANT_GAMEPASSES = {
     257811346: "VIP",
@@ -7251,6 +7256,7 @@ class MCWVTicketPanelView(discord.ui.View):
 )
 @app_commands.choices(system=[
     app_commands.Choice(name="Placement alerts", value="placement_alerts"),
+    app_commands.Choice(name="Clan logs", value="clan_logs"),
 ])
 async def setup(interaction: discord.Interaction, system: app_commands.Choice[str], channel: discord.TextChannel):
     if not has_mcwv_ticket_staff_permission(interaction.user):
@@ -7265,6 +7271,21 @@ async def setup(interaction: discord.Interaction, system: app_commands.Choice[st
             description=(
                 f"MCWV placement cards will be posted in {channel.mention} during active wars only.\n\n"
                 "The bot saves the current placement first, then alerts only when the placement changes."
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if system.value == "clan_logs":
+        set_clan_log_channel_id(channel.id)
+        db_set_setting("mcwv_clan_logs_enabled", "1")
+        embed = discord.Embed(
+            title="Clan logs configured",
+            description=(
+                f"MCWV join, leave, and diamond donation logs will be posted in {channel.mention}.\n\n"
+                "The bot saves the current clan state first, then logs only new changes."
             ),
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
@@ -7295,6 +7316,43 @@ async def placement_test(interaction: discord.Interaction, channel: discord.Text
     file = discord.File(image, filename="mcwv-placement.png")
     await target.send(embed=build_placement_embed(old_rank, new_rank, points), file=file)
     await interaction.followup.send(f"✅ Sent test placement card in {target.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="clan_logs_test", description="Preview an MCWV clan log", guild=guild_obj)
+@app_commands.describe(event="Which log to preview", channel="Optional channel to send the test log in")
+@app_commands.choices(event=[
+    app_commands.Choice(name="Player joined", value="joined"),
+    app_commands.Choice(name="Player left", value="left"),
+    app_commands.Choice(name="Diamond donation", value="diamond"),
+])
+async def clan_logs_test(interaction: discord.Interaction, event: app_commands.Choice[str], channel: discord.TextChannel = None):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.followup.send("❌ Pick a text channel.", ephemeral=True)
+
+    payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    members = extract_clan_members(data)
+    if not members:
+        return await interaction.followup.send("❌ Could not load clan members for the preview.", ephemeral=True)
+
+    sample_id = int(next(iter(members.keys())))
+    users = await fetch_roblox_users_for_logs([sample_id])
+    state = build_clan_log_state(data)
+    member_count = len(members)
+    member_capacity = state.get("memberCapacity") or data.get("MemberCapacity") or 0
+
+    if event.value in ("joined", "left"):
+        await send_clan_member_log(target, event.value, sample_id, users.get(sample_id, {}), member_count, member_capacity)
+    else:
+        diamonds = state.get("diamonds", {})
+        user_total = int(diamonds.get(str(sample_id), 4_000_000_000) or 4_000_000_000)
+        await send_diamond_log(target, data, sample_id, users.get(sample_id, {}), 4_000_000_000, user_total, state.get("totalDiamonds") or 0)
+
+    await interaction.followup.send(f"✅ Sent test {event.name.lower()} log in {target.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
@@ -10953,6 +11011,451 @@ def rounded_mask(size, radius):
     return mask
 
 
+# ---------------- CLAN LOGS ----------------
+CLAN_LOG_STATE_KEY = "mcwv_clan_log_state"
+
+
+def clan_logs_enabled():
+    raw = db_get_setting("mcwv_clan_logs_enabled", "1" if MCWV_CLAN_LOGS_ENABLED_DEFAULT else "0")
+    return str(raw).lower() not in ("0", "false", "off", "no")
+
+
+def get_clan_log_channel_id():
+    saved = db_get_setting("mcwv_clan_log_channel_id", None)
+    try:
+        return int(saved or MCWV_LOG_CHANNEL_ID or 0)
+    except Exception:
+        return int(MCWV_LOG_CHANNEL_ID or 0)
+
+
+def set_clan_log_channel_id(channel_id):
+    db_set_setting("mcwv_clan_log_channel_id", int(channel_id))
+
+
+def load_clan_log_state():
+    raw = db_get_setting(CLAN_LOG_STATE_KEY, "")
+    try:
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def save_clan_log_state(state):
+    db_set_setting(CLAN_LOG_STATE_KEY, json.dumps(state))
+
+
+def format_log_number(value):
+    try:
+        value = float(value or 0)
+    except Exception:
+        value = 0
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}b"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}m"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}k"
+    return str(int(value))
+
+
+def extract_clan_members(data):
+    members = {}
+    for member in data.get("Members", []) if isinstance(data, dict) else []:
+        try:
+            user_id = str(int(member.get("UserID")))
+            members[user_id] = {
+                "joinTime": int(member.get("JoinTime") or 0),
+                "permissionLevel": int(member.get("PermissionLevel") or 0),
+            }
+        except Exception:
+            continue
+    return members
+
+
+def extract_clan_diamonds(data):
+    contributions = {}
+    root = data.get("DiamondContributions", {}) if isinstance(data, dict) else {}
+    all_time = root.get("AllTime", {}) if isinstance(root, dict) else {}
+
+    for entry in all_time.get("Data", []) if isinstance(all_time, dict) else []:
+        try:
+            user_id = str(int(entry.get("UserID")))
+            diamonds = int(entry.get("Diamonds") or 0)
+            contributions[user_id] = diamonds
+        except Exception:
+            continue
+
+    total = int(all_time.get("Sum") or data.get("DepositedDiamonds") or sum(contributions.values()) or 0)
+    return contributions, total
+
+
+def build_clan_log_state(data):
+    members = extract_clan_members(data)
+    diamonds, total_diamonds = extract_clan_diamonds(data)
+    return {
+        "members": members,
+        "diamonds": diamonds,
+        "totalDiamonds": total_diamonds,
+        "memberCapacity": int(data.get("MemberCapacity") or 0) if isinstance(data, dict) else 0,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def display_user_label(user_info, fallback_id=None):
+    name = str((user_info or {}).get("name") or fallback_id or "Unknown")
+    display = str((user_info or {}).get("displayName") or name)
+    return f"{display} ({name})"
+
+
+def fit_text(draw, text, font, max_width):
+    text = str(text)
+    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+        return text
+    ellipsis = "…"
+    while text and draw.textbbox((0, 0), text + ellipsis, font=font)[2] > max_width:
+        text = text[:-1]
+    return text + ellipsis if text else ellipsis
+
+
+async def fetch_roblox_users_for_logs(user_ids):
+    ids = []
+    for value in user_ids:
+        try:
+            uid = int(value)
+            if uid not in ids:
+                ids.append(uid)
+        except Exception:
+            continue
+
+    user_map = {}
+
+    # Prefer local DB names when available so logs still work during Roblox hiccups.
+    try:
+        for row in db_get_all_tracked() or []:
+            try:
+                rid = int(row[0])
+                username = str(row[2]) if len(row) > 2 and row[2] else str(rid)
+                if rid in ids:
+                    user_map[rid] = {"name": username, "displayName": username}
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    missing = [uid for uid in ids if uid not in user_map]
+    if not missing:
+        return user_map
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    for index in range(0, len(missing), 100):
+        chunk = missing[index:index + 100]
+        try:
+            async with session.post(
+                ROBLOX_USERS_API,
+                json={"userIds": chunk, "excludeBannedUsers": False},
+                headers={"User-Agent": "MCWV-Bot/1.0", "Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as res:
+                if res.status != 200:
+                    print(f"[clan logs] Roblox users HTTP {res.status}")
+                    continue
+                payload = await res.json(content_type=None)
+
+            for user in payload.get("data", []) if isinstance(payload, dict) else []:
+                try:
+                    uid = int(user.get("id"))
+                    user_map[uid] = {
+                        "name": str(user.get("name") or uid),
+                        "displayName": str(user.get("displayName") or user.get("name") or uid),
+                    }
+                except Exception:
+                    continue
+        except Exception as exc:
+            print(f"[clan logs] Roblox user lookup failed: {exc}")
+
+    return user_map
+
+
+async def fetch_roblox_headshot_for_logs(user_id, size=320):
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    try:
+        url = (
+            "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+            f"?userIds={int(user_id)}&size=720x720&format=Png&isCircular=false"
+        )
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as res:
+            if res.status != 200:
+                return None
+            payload = await res.json(content_type=None)
+
+        image_url = ((payload.get("data") or [{}])[0] or {}).get("imageUrl") if isinstance(payload, dict) else None
+        if not image_url:
+            return None
+
+        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=12)) as res:
+            if res.status != 200:
+                return None
+            image_bytes = await res.read()
+
+        avatar = Image.open(BytesIO(image_bytes)).convert("RGBA")
+        return avatar.resize((size, size), Image.Resampling.LANCZOS)
+    except Exception as exc:
+        print(f"[clan logs] avatar fetch failed for {user_id}: {exc}")
+        return None
+
+
+def draw_member_icon(draw, box, accent, S):
+    x1, y1, x2, y2 = box
+    draw.rounded_rectangle(box, radius=int(14 * S), fill=(accent[0], accent[1], accent[2], 32))
+    cx = (x1 + x2) // 2
+    head_r = int(9 * S)
+    head_y = y1 + int(19 * S)
+    draw.ellipse((cx - head_r, head_y - head_r, cx + head_r, head_y + head_r), outline=(*accent, 255), width=int(4 * S))
+    draw.arc((cx - int(19 * S), y1 + int(30 * S), cx + int(19 * S), y1 + int(66 * S)), 200, 340, fill=(*accent, 255), width=int(4 * S))
+
+
+def draw_arrow_icon(draw, box, accent, S):
+    x1, y1, x2, y2 = box
+    draw.rounded_rectangle(box, radius=int(14 * S), fill=(accent[0], accent[1], accent[2], 30))
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    draw.line((cx - int(12 * S), cy, cx + int(12 * S), cy), fill=(*accent, 255), width=int(4 * S))
+    draw.line((cx + int(2 * S), cy - int(10 * S), cx + int(13 * S), cy, cx + int(2 * S), cy + int(10 * S)), fill=(*accent, 255), width=int(4 * S), joint="curve")
+
+
+async def generate_clan_member_log_card(kind, user_id, user_info, member_count, member_capacity):
+    S = 2
+    W, H = 1250 * S, 420 * S
+    joined = kind == "joined"
+    accent = (74, 222, 128) if joined else (255, 84, 96)
+    ring = (190, 70, 255) if joined else (255, 118, 138)
+    label_color = (190, 78, 255) if joined else (255, 110, 135)
+    small_label = "NEW MEMBER" if joined else "MEMBER LEFT"
+    title = "Player Joined" if joined else "Player Left"
+    verb = "joined" if joined else "left"
+
+    def sc(value):
+        return int(round(value * S))
+
+    def font(size, bold=True):
+        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        try:
+            return ImageFont.truetype(path, sc(size))
+        except Exception:
+            return ImageFont.load_default()
+
+    fonts = {
+        "eyebrow": font(24, True),
+        "title": font(76, True),
+        "meta": font(36, True),
+        "meta_regular": font(34, False),
+        "body_bold": font(28, True),
+        "body": font(28, False),
+    }
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(card)
+
+    # Dark premium card background with soft purple/red glow.
+    for x in range(W):
+        t = x / max(W - 1, 1)
+        r = int(12 + 10 * (1 - t))
+        g = int(14 + 8 * (1 - t))
+        b = int(38 + 18 * (1 - t))
+        cd.line((x, 0, x, H), fill=(r, g, b, 255))
+
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((sc(-120), sc(120), sc(460), sc(610)), fill=(120, 55, 190, 58))
+    gd.ellipse((sc(760), sc(-120), sc(1290), sc(500)), fill=(*ring, 42))
+    glow = glow.filter(ImageFilter.GaussianBlur(sc(34)))
+    card.alpha_composite(glow)
+
+    mask = rounded_mask((W - sc(16), H - sc(20)), sc(34))
+    shaped = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shaped.paste(card.crop((sc(8), sc(8), W - sc(8), H - sc(12))), (sc(8), sc(8)), mask)
+    img.alpha_composite(shaped)
+
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((sc(8), sc(8), W - sc(8), H - sc(12)), radius=sc(34), outline=(220, 225, 255, 170), width=sc(2))
+    d.rounded_rectangle((sc(10), sc(10), W - sc(10), H - sc(14)), radius=sc(32), outline=(255, 255, 255, 28), width=sc(1))
+
+    draw_text_shadow(d, (sc(50), sc(42)), small_label, fonts["eyebrow"], (*label_color, 255), shadow=(0, 0, 0, 120), offset=(sc(2), sc(2)))
+    draw_text_shadow(d, (sc(50), sc(96)), title, fonts["title"], (*accent, 255), shadow=(0, 0, 0, 130), offset=(sc(3), sc(4)))
+
+    icon_box = (sc(50), sc(210), sc(108), sc(268))
+    draw_member_icon(d, icon_box, label_color, S)
+    count_text = f"{int(member_count or 0)}/{int(member_capacity or 0) if member_capacity else '?'}"
+    draw_text_shadow(d, (sc(112), sc(218)), count_text, fonts["meta"], (250, 250, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
+    d.text((sc(220), sc(223)), "Members", font=fonts["meta_regular"], fill=(190, 188, 205, 255))
+
+    arrow_box = (sc(50), sc(315), sc(108), sc(373))
+    draw_arrow_icon(d, arrow_box, label_color, S)
+    label = display_user_label(user_info, user_id)
+    label = fit_text(d, label, fonts["body_bold"], sc(480))
+    x = sc(112)
+    y = sc(326)
+    draw_text_shadow(d, (x, y), label, fonts["body_bold"], (255, 255, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
+    label_w = d.textbbox((x, y), label, font=fonts["body_bold"])[2] - x
+    d.text((x + label_w + sc(8), y), f" {verb} ", font=fonts["body"], fill=(188, 186, 203, 255))
+    verb_w = d.textbbox((0, 0), f" {verb} ", font=fonts["body"])[2]
+    d.text((x + label_w + sc(8) + verb_w, y), f"[{CLAN_NAME}].", font=fonts["body"], fill=(155, 155, 255, 255))
+
+    # Avatar ring.
+    center = (sc(1045), sc(210))
+    outer_r = sc(150)
+    inner_r = sc(126)
+    d.ellipse((center[0] - outer_r, center[1] - outer_r, center[0] + outer_r, center[1] + outer_r), fill=(*ring, 64))
+    d.ellipse((center[0] - sc(141), center[1] - sc(141), center[0] + sc(141), center[1] + sc(141)), outline=(*ring, 255), width=sc(8))
+    d.ellipse((center[0] - inner_r, center[1] - inner_r, center[0] + inner_r, center[1] + inner_r), fill=(34, 35, 46, 255))
+
+    avatar = await fetch_roblox_headshot_for_logs(user_id, size=sc(244))
+    if avatar is None:
+        avatar = Image.new("RGBA", (sc(244), sc(244)), (180, 180, 190, 255))
+        ad = ImageDraw.Draw(avatar)
+        ad.ellipse((sc(82), sc(70), sc(108), sc(96)), fill=(0, 0, 0, 255))
+        ad.ellipse((sc(136), sc(70), sc(162), sc(96)), fill=(0, 0, 0, 255))
+        ad.arc((sc(78), sc(95), sc(168), sc(180)), 20, 160, fill=(0, 0, 0, 255), width=sc(6))
+
+    avatar_mask = Image.new("L", avatar.size, 0)
+    ImageDraw.Draw(avatar_mask).ellipse((0, 0, avatar.size[0] - 1, avatar.size[1] - 1), fill=255)
+    img.paste(avatar, (center[0] - avatar.size[0] // 2, center[1] - avatar.size[1] // 2), avatar_mask)
+
+    img = img.resize((1250, 420), Image.Resampling.LANCZOS)
+    out = BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+
+async def send_clan_member_log(channel, kind, user_id, user_info, member_count, member_capacity):
+    image = await generate_clan_member_log_card(kind, user_id, user_info, member_count, member_capacity)
+    filename = f"mcwv-player-{kind}.png"
+    file = discord.File(image, filename=filename)
+    embed = discord.Embed(
+        description=f"User: {display_user_label(user_info, user_id)}",
+        color=discord.Color.green() if kind == "joined" else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_image(url=f"attachment://{filename}")
+    await channel.send(embed=embed, file=file)
+
+
+async def send_diamond_log(channel, data, user_id, user_info, donated, new_total, clan_total):
+    clan_name = str(data.get("Name") or CLAN_NAME).lower()
+    icon_asset = extract_asset_id(data.get("Icon"))
+    embed = discord.Embed(
+        title=f"Diamond Update • {clan_name}",
+        description=(
+            f"{display_user_label(user_info, user_id)} donated\n"
+            f"**{format_log_number(donated)} 💎** (Total: {format_log_number(new_total)})\n"
+            f"Clan Diamonds: **{format_log_number(clan_total)} 💎**"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if icon_asset:
+        embed.set_thumbnail(url=f"{PS99_API}/image/{icon_asset}")
+    await channel.send(embed=embed)
+
+
+async def process_clan_logs():
+    channel_id = get_clan_log_channel_id()
+    if not channel_id:
+        return
+
+    channel = await _maybe_get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"[clan logs] channel not found/not text: {channel_id}")
+        return
+
+    payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict) or not data:
+        return
+
+    current_state = build_clan_log_state(data)
+    previous = load_clan_log_state()
+
+    if not previous:
+        save_clan_log_state(current_state)
+        print(f"[clan logs] initial state saved: members={len(current_state['members'])} diamonds={current_state['totalDiamonds']}")
+        return
+
+    old_members = previous.get("members", {}) if isinstance(previous.get("members"), dict) else {}
+    new_members = current_state.get("members", {})
+    old_diamonds = previous.get("diamonds", {}) if isinstance(previous.get("diamonds"), dict) else {}
+    new_diamonds = current_state.get("diamonds", {})
+
+    joined_ids = sorted(set(new_members) - set(old_members), key=lambda rid: new_members.get(rid, {}).get("joinTime", 0))
+    left_ids = sorted(set(old_members) - set(new_members))
+
+    diamond_events = []
+    for rid, total in new_diamonds.items():
+        try:
+            previous_total = int(old_diamonds.get(rid, total))
+            total = int(total)
+            delta = total - previous_total
+            if delta > 0:
+                diamond_events.append((rid, delta, total))
+        except Exception:
+            continue
+
+    diamond_events.sort(key=lambda item: item[1], reverse=True)
+    diamond_events = diamond_events[:MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS]
+
+    lookup_ids = set(joined_ids) | set(left_ids) | {rid for rid, _, _ in diamond_events}
+    users = await fetch_roblox_users_for_logs(lookup_ids)
+    member_count = len(new_members)
+    member_capacity = current_state.get("memberCapacity") or data.get("MemberCapacity") or 0
+
+    for rid in joined_ids:
+        try:
+            await send_clan_member_log(channel, "joined", int(rid), users.get(int(rid), {}), member_count, member_capacity)
+            await asyncio.sleep(0.8)
+        except Exception as exc:
+            print(f"[clan logs] joined log failed for {rid}: {exc}")
+
+    for rid in left_ids:
+        try:
+            await send_clan_member_log(channel, "left", int(rid), users.get(int(rid), {}), member_count, member_capacity)
+            await asyncio.sleep(0.8)
+        except Exception as exc:
+            print(f"[clan logs] left log failed for {rid}: {exc}")
+
+    for rid, delta, total in diamond_events:
+        try:
+            await send_diamond_log(channel, data, int(rid), users.get(int(rid), {}), delta, total, current_state.get("totalDiamonds") or 0)
+            await asyncio.sleep(0.8)
+        except Exception as exc:
+            print(f"[clan logs] diamond log failed for {rid}: {exc}")
+
+    save_clan_log_state(current_state)
+
+
+@tasks.loop(seconds=60)
+async def clan_log_loop():
+    await bot.wait_until_ready()
+    if not clan_logs_enabled():
+        return
+    try:
+        await process_clan_logs()
+    except Exception as exc:
+        print(f"[clan logs] loop failed: {exc}")
+
+
+@clan_log_loop.before_loop
+async def before_clan_log_loop():
+    await bot.wait_until_ready()
+
+
 async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     # Modern placement card using the supplied galaxy background as the main art.
     # Transparent Discord-ready PNG, rendered at 2x then downsampled for smooth edges.
@@ -11316,6 +11819,10 @@ def start_bot_loops():
 
     if not placement_alert_loop.is_running():
         placement_alert_loop.start()
+
+    if not clan_log_loop.is_running():
+        clan_log_loop.change_interval(seconds=MCWV_CLAN_LOG_INTERVAL_SECONDS)
+        clan_log_loop.start()
 
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
         hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
