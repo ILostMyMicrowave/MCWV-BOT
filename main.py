@@ -11735,78 +11735,73 @@ def points_at_time_for_hourly(rows, target_ms):
     return rows[-1]["points"]
 
 
-def fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=None):
-    """Return PPH using the same baseline rule as the Hub leaderboard cards.
+def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, battle_start_ts=None):
+    """Return PPH exactly like the Hub leaderboard profile cards.
 
-    Hub leaderboard PPH = current live points - snapshot baseline from the same
-    battle, preferring the latest snapshot at/before NOW()-1h, otherwise the
-    earliest snapshot after NOW()-1h while history is warming up. No interpolation
-    or point_history fallback here, so the hourly card matches profile cards.
+    The profile modal uses player_leaderboard_history only: latest snapshot points
+    minus the snapshot baseline 60 minutes before the latest snapshot. It does not
+    use live current_points. This function mirrors that so the hourly card matches
+    the profile cards instead of drifting when live API points update between snapshots.
     """
     ids = [str(value) for value in user_ids if str(value).strip()]
     if not ids:
         return {}
 
-    zeroes = {rid: 0 for rid in ids}
-
+    result = {rid: 0 for rid in ids}
     if not db_enabled():
-        return zeroes
+        return result
 
     try:
         ensure_db_connection()
         battle_keys = sorted({str(battle_id), normalize_hourly_battle_key(battle_id)})
-        baselines = {}
+        grouped = {rid: [] for rid in ids}
 
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS exists
             """)
             if not bool(cur.fetchone()[0]):
-                return zeroes
+                return result
 
             cur.execute("""
-                WITH selected AS (
-                    SELECT unnest(%s::text[]) AS roblox_id
-                )
-                SELECT
-                    s.roblox_id,
-                    h.points::bigint AS hour_points,
-                    rh.points::bigint AS recent_points
-                FROM selected s
-                LEFT JOIN LATERAL (
-                    SELECT points
-                    FROM player_leaderboard_history p
-                    WHERE p.roblox_id::text = s.roblox_id
-                      AND p.battle_id = ANY(%s)
-                      AND p.points IS NOT NULL
-                      AND p.captured_at <= NOW() - INTERVAL '1 hour'
-                    ORDER BY p.captured_at DESC
-                    LIMIT 1
-                ) h ON TRUE
-                LEFT JOIN LATERAL (
-                    SELECT points
-                    FROM player_leaderboard_history p
-                    WHERE p.roblox_id::text = s.roblox_id
-                      AND p.battle_id = ANY(%s)
-                      AND p.points IS NOT NULL
-                      AND p.captured_at >= NOW() - INTERVAL '1 hour'
-                    ORDER BY p.captured_at ASC
-                    LIMIT 1
-                ) rh ON TRUE
-            """, (ids, battle_keys, battle_keys))
+                SELECT roblox_id::text, points::bigint, captured_at
+                FROM player_leaderboard_history
+                WHERE battle_id = ANY(%s)
+                  AND roblox_id::text = ANY(%s)
+                  AND points IS NOT NULL
+                ORDER BY roblox_id::text ASC, captured_at ASC
+            """, (battle_keys, ids))
 
-            for roblox_id, hour_points, recent_points in cur.fetchall():
-                baseline = hour_points if hour_points is not None else recent_points
-                if baseline is not None:
-                    baselines[str(roblox_id)] = int(baseline or 0)
+            for roblox_id, points, captured_at in cur.fetchall():
+                grouped.setdefault(str(roblox_id), []).append({
+                    "points": int(points or 0),
+                    "time": to_ms_for_hourly(captured_at),
+                })
 
-        result = {}
-        for rid in ids:
-            current = int(current_points.get(rid, 0) or 0)
-            if current <= 0 or rid not in baselines:
+        for rid, rows in grouped.items():
+            rows = [row for row in rows if row.get("time")]
+            if len(rows) < 2:
                 result[rid] = 0
-            else:
-                result[rid] = max(0, int(current - baselines[rid]))
+                continue
+
+            rows.sort(key=lambda item: item["time"])
+            latest = rows[-1]
+            latest_points = int(latest["points"] or 0)
+            hourly_cutoff = int(latest["time"] or 0) - 60 * 60 * 1000
+
+            baseline = None
+            for row in reversed(rows):
+                if int(row["time"] or 0) <= hourly_cutoff:
+                    baseline = row
+                    break
+
+            if baseline is None:
+                for row in rows:
+                    if int(row["time"] or 0) >= hourly_cutoff:
+                        baseline = row
+                        break
+
+            result[rid] = max(0, latest_points - int((baseline or latest).get("points") or 0))
 
         return result
     except Exception as exc:
@@ -11815,7 +11810,7 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle
         except Exception:
             pass
         print(f"[hourly stats] history lookup failed: {exc}")
-        return zeroes
+        return result
 
 
 def save_hourly_player_snapshot(payload):
