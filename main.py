@@ -1059,6 +1059,7 @@ def admin_status():
             "War Collector Loop": _loop_status("hub_war_collect_loop"),
             "Clan Log Loop": _loop_status("clan_log_loop"),
             "Hourly Stats Loop": _loop_status("hourly_stats_loop"),
+            "Hourly Player Snapshot Loop": _loop_status("hourly_player_snapshot_loop"),
             "Ticket Screenshot Reminder Loop": _loop_status("ticket_screenshot_reminder_loop"),
             "Presence Loop": _loop_status("check_loop"),
             "Reminder Loop": _loop_status("reminder_loop"),
@@ -5018,7 +5019,7 @@ def fetch_broadcast_metrics_map():
                 )
                 SELECT
                     l.roblox_id,
-                    GREATEST(0, l.points - COALESCE(h.points, rh.points, l.points)) AS pph,
+                    GREATEST(0, l.points - COALESCE(h.points, l.points)) AS pph,
                     GREATEST(0, l.points - COALESCE(f.points, l.points)) AS change_5m
                 FROM latest l
                 LEFT JOIN LATERAL (
@@ -5031,17 +5032,6 @@ def fetch_broadcast_metrics_map():
                     ORDER BY p.captured_at DESC
                     LIMIT 1
                 ) h ON TRUE
-                LEFT JOIN LATERAL (
-                    SELECT points::bigint AS points, captured_at
-                    FROM player_leaderboard_history p
-                    WHERE p.roblox_id::text = l.roblox_id
-                      AND p.points IS NOT NULL
-                      AND p.battle_id IS NOT DISTINCT FROM l.battle_id
-                      AND p.captured_at >= l.captured_at - INTERVAL '1 hour'
-                      AND p.captured_at < l.captured_at
-                    ORDER BY p.captured_at ASC
-                    LIMIT 1
-                ) rh ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT points::bigint AS points, captured_at
                     FROM player_leaderboard_history p
@@ -11747,7 +11737,7 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
     if not ids:
         return {}
 
-    result = {rid: 0 for rid in ids}
+    result = {rid: {"pph": 0, "ready": False} for rid in ids}
     if not db_enabled():
         return result
 
@@ -11781,7 +11771,7 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
         for rid, rows in grouped.items():
             rows = [row for row in rows if row.get("time")]
             if len(rows) < 2:
-                result[rid] = 0
+                result[rid] = {"pph": 0, "ready": False}
                 continue
 
             rows.sort(key=lambda item: item["time"])
@@ -11796,12 +11786,14 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
                     break
 
             if baseline is None:
-                for row in rows:
-                    if int(row["time"] or 0) >= hourly_cutoff:
-                        baseline = row
-                        break
+                # No full 60-minute window yet. Do not fake a PPH value.
+                result[rid] = {"pph": 0, "ready": False}
+                continue
 
-            result[rid] = max(0, latest_points - int((baseline or latest).get("points") or 0))
+            result[rid] = {
+                "pph": max(0, latest_points - int(baseline.get("points") or 0)),
+                "ready": True,
+            }
 
         return result
     except Exception as exc:
@@ -11971,13 +11963,19 @@ async def build_hourly_stats_payload():
 
     pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=battle_start_ts)
     for entry in entries:
-        entry["pph"] = int(pph_map.get(str(entry["robloxId"]), 0) or 0)
+        pph_info = pph_map.get(str(entry["robloxId"]), {"pph": 0, "ready": False})
+        if isinstance(pph_info, dict):
+            entry["pph"] = int(pph_info.get("pph") or 0)
+            entry["pphReady"] = bool(pph_info.get("ready"))
+        else:
+            entry["pph"] = int(pph_info or 0)
+            entry["pphReady"] = True
 
-    entries.sort(key=lambda item: (-int(item["pph"]), item["name"].lower()))
+    entries.sort(key=lambda item: (not bool(item.get("pphReady")), -int(item["pph"]), item["name"].lower()))
 
     overview = await get_big_games_index_clan_overview()
     clan_rank = (overview or {}).get("rank") or pick_first_int(battle, ("Place", "place", "Rank", "rank", "Position", "position"))
-    total_hourly = sum(int(entry["pph"] or 0) for entry in entries)
+    total_hourly = sum(int(entry["pph"] or 0) for entry in entries if entry.get("pphReady"))
 
     return {
         "battleId": battle_id,
@@ -11985,11 +11983,81 @@ async def build_hourly_stats_payload():
         "icon": data.get("Icon"),
         "rank": clan_rank,
         "players": len(entries),
-        "active": sum(1 for entry in entries if int(entry["pph"] or 0) > 0),
-        "zero": sum(1 for entry in entries if int(entry["pph"] or 0) <= 0),
+        "active": sum(1 for entry in entries if entry.get("pphReady") and int(entry["pph"] or 0) > 0),
+        "zero": sum(1 for entry in entries if entry.get("pphReady") and int(entry["pph"] or 0) <= 0),
+        "warmingUp": sum(1 for entry in entries if not entry.get("pphReady")),
         "hourlyPoints": total_hourly,
         "entries": entries,
     }
+
+
+async def collect_hourly_player_snapshot():
+    """Save current player leaderboard points without sending a card.
+
+    This runs every minute so the 60-minute PPH window has real history even if
+    nobody opens the website leaderboard.
+    """
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        return False
+
+    clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    if not isinstance(data, dict) or not data:
+        return False
+
+    battles = data.get("Battles") or {}
+    battle = battles.get(battle_id) or battles.get(str(battle_id)) if isinstance(battles, dict) else None
+    if not battle and isinstance(battles, dict):
+        norm = normalize_hourly_battle_key(battle_id)
+        battle = next((value for key, value in battles.items() if normalize_hourly_battle_key(key) == norm), None)
+    if not isinstance(battle, dict):
+        return False
+
+    contributions = battle.get("PointContributions") or battle.get("pointContributions") or []
+    current_points = {}
+    for entry in contributions if isinstance(contributions, list) else []:
+        try:
+            rid = str(int(entry.get("UserID") or entry.get("userId") or 0))
+            current_points[rid] = int(entry.get("Points") or entry.get("points") or 0)
+        except Exception:
+            continue
+
+    members = extract_clan_members(data)
+    roster_ids = set(members.keys()) or set(current_points.keys())
+    if not roster_ids:
+        return False
+
+    names = {}
+    try:
+        for row in db_get_all_tracked() or []:
+            try:
+                rid = str(row[0]).strip()
+                if rid:
+                    names[rid] = str(row[2]).strip() if len(row) > 2 and row[2] else rid
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    base_entries = []
+    for rid in sorted(roster_ids, key=lambda item: int(item) if str(item).isdigit() else 0):
+        base_entries.append({
+            "robloxId": rid,
+            "name": names.get(rid, rid),
+            "points": int(current_points.get(rid, 0) or 0),
+            "pph": 0,
+        })
+
+    war_rank_by_id = {
+        entry["robloxId"]: index + 1
+        for index, entry in enumerate(sorted(base_entries, key=lambda item: (-int(item.get("points") or 0), str(item.get("name") or "").lower())))
+    }
+    for entry in base_entries:
+        entry["currentRank"] = war_rank_by_id.get(entry["robloxId"])
+
+    save_hourly_player_snapshot({"battleId": battle_id, "entries": base_entries})
+    return True
 
 
 async def generate_hourly_stats_card(payload):
@@ -12205,22 +12273,23 @@ async def generate_hourly_stats_card(payload):
         for row_idx, entry in enumerate(col_entries):
             global_idx = col_idx * 25 + row_idx
             y = sc(226) + sc(row_idx * 20.4)
+            pph_ready = bool(entry.get("pphReady"))
             pph = int(entry.get("pph") or 0)
-            zero = pph <= 0
-            color = (112, 122, 148) if all_zero else hourly_colour(global_idx, max(len(entries), 1), zero=zero)
+            zero = pph_ready and pph <= 0
+            color = (112, 122, 148) if (all_zero or not pph_ready) else hourly_colour(global_idx, max(len(entries), 1), zero=zero)
 
             row_box = (px + sc(10), y - sc(1), px + panel_w - sc(10), y + sc(18))
             if row_idx % 2 == 0:
                 alpha_round(row_box, 5, (255, 255, 255, 17))
-            if global_idx < 3 and not zero:
+            if global_idx < 3 and pph_ready and not zero:
                 alpha_round(row_box, 5, (*color, 20))
             dd = ImageDraw.Draw(img)
 
             rank_text = f"{global_idx + 1:02d}"
             name = fit_text(dd, str(entry.get("name") or entry.get("robloxId") or "Unknown"), fonts["row"], sc(150))
-            rank_fill = color if not zero else (145, 154, 178)
-            name_fill = (246, 247, 252) if not zero else ((176, 184, 205) if all_zero else (226, 96, 108))
-            score_fill = color if not zero else ((152, 160, 184) if all_zero else (145, 151, 168))
+            rank_fill = color if pph_ready and not zero else (145, 154, 178)
+            name_fill = (246, 247, 252) if pph_ready and not zero else ((176, 184, 205) if (all_zero or not pph_ready) else (226, 96, 108))
+            score_fill = color if pph_ready and not zero else ((152, 160, 184) if (all_zero or not pph_ready) else (145, 151, 168))
 
             dd.text((px + sc(18), y), rank_text, font=fonts["row_small"], fill=(*rank_fill, 255))
             dd.text((px + sc(68), y), name, font=fonts["row"], fill=(*name_fill, 255))
@@ -12253,7 +12322,7 @@ async def generate_hourly_stats_card(payload):
                 marker = (92, 104, 132) if all_zero else (197, 55, 74)
                 dd.rounded_rectangle((bar_x, bar_y, bar_x + sc(3), bar_y + bar_h), radius=sc(2), fill=(*marker, 220))
 
-            score = str(pph)
+            score = str(pph) if pph_ready else "—"
             right_text(dd, px + panel_w - sc(18), y, score, fonts["row_small"], (*score_fill, 255))
 
     # Tiny timestamp in the bottom-right.
@@ -12273,7 +12342,7 @@ def fetch_hourly_ping_targets(entries, threshold):
 
     low_entries = [
         entry for entry in entries
-        if int(entry.get("pph") or 0) < int(threshold)
+        if entry.get("pphReady") and int(entry.get("pph") or 0) < int(threshold)
     ]
     if not low_entries:
         return []
@@ -12603,6 +12672,23 @@ async def hourly_stats_loop():
 
 @hourly_stats_loop.before_loop
 async def before_hourly_stats_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def hourly_player_snapshot_loop():
+    await bot.wait_until_ready()
+    if not hourly_stats_enabled():
+        return
+    try:
+        if await collect_hourly_player_snapshot():
+            print("[hourly stats] player snapshot saved/refreshed")
+    except Exception as exc:
+        print(f"[hourly stats] player snapshot loop failed: {exc}")
+
+
+@hourly_player_snapshot_loop.before_loop
+async def before_hourly_player_snapshot_loop():
     await bot.wait_until_ready()
 
 
@@ -13067,6 +13153,9 @@ def start_bot_loops():
     if not hourly_stats_loop.is_running():
         hourly_stats_loop.change_interval(minutes=1)
         hourly_stats_loop.start()
+
+    if not hourly_player_snapshot_loop.is_running():
+        hourly_player_snapshot_loop.start()
 
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
         hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
