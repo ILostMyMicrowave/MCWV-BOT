@@ -1041,6 +1041,14 @@ def admin_status():
             "queueLengths": {},
             "reminderInterval": globals().get("reminder_interval"),
             "reminderChannel": globals().get("reminder_channel_id"),
+            "placementChannel": _safe_call("get_placement_channel_id", None),
+            "placementAlertsEnabled": _safe_call("placement_alerts_enabled", False),
+            "clanLogChannel": _safe_call("get_clan_log_channel_id", None),
+            "clanLogsEnabled": _safe_call("clan_logs_enabled", False),
+            "hourlyStatsChannel": _safe_call("get_hourly_stats_channel_id", None),
+            "hourlyStatsEnabled": _safe_call("hourly_stats_enabled", False),
+            "hourlyStatsIntervalMinutes": globals().get("MCWV_HOURLY_STATS_INTERVAL_MINUTES"),
+            "hourlyStatsLastSentAt": _safe_call("db_get_setting", None, "mcwv_hourly_stats_last_sent_at"),
         },
         "loops": {
             "War Poll Loop": _loop_status("war_poll_loop"),
@@ -1291,7 +1299,98 @@ def admin_sync():
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
+    # Backwards-compatible admin actions through the already-existing /admin/sync
+    # route. This avoids 404s on hosts that are still using the older route list.
+    if target == "setup":
+        try:
+            future = _run_on_bot_loop(_admin_setup_system_from_body(body))
+            payload = future.result(timeout=15)
+            admin_log("Setup Updated", payload.get("message", "Bot system setup updated"))
+            return jsonify(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    if target in ("hourly_stats", "hourly_stats_send", "send_hourly_stats"):
+        try:
+            future = _run_on_bot_loop(_admin_send_hourly_stats_from_body(body))
+            payload = future.result(timeout=45)
+            admin_log("Hourly Stats Sent", payload.get("message", "Hourly stats sent"))
+            return jsonify(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
     return jsonify({"error": f"Unknown sync target: {target}"}), 400
+
+
+async def _admin_setup_system_from_body(body):
+    system = str(body.get("system") or body.get("target") or "").strip().lower().replace("-", "_")
+    channel_id = body.get("channel_id") or body.get("channelId") or body.get("channel")
+
+    if system in ("placement", "placement_alert", "placement_alerts"):
+        channel = await _validate_admin_text_channel(channel_id, require_invite=False)
+        set_placement_channel_id(channel.id)
+        db_set_setting("mcwv_placement_alerts_enabled", "1")
+        return {"success": True, "system": "placement_alerts", "channel_id": str(channel.id), "message": f"Placement alerts configured for #{channel.name}."}
+
+    if system in ("clan_log", "clan_logs", "logs"):
+        channel = await _validate_admin_text_channel(channel_id, require_invite=False)
+        set_clan_log_channel_id(channel.id)
+        db_set_setting("mcwv_clan_logs_enabled", "1")
+        return {"success": True, "system": "clan_logs", "channel_id": str(channel.id), "message": f"Clan logs configured for #{channel.name}."}
+
+    if system in ("hourly", "hourly_stats", "hourly_statistics"):
+        channel = await _validate_admin_text_channel(channel_id, require_invite=False)
+        set_hourly_stats_channel_id(channel.id)
+        db_set_setting("mcwv_hourly_stats_enabled", "1")
+        loop_obj = globals().get("hourly_stats_loop")
+        if loop_obj is not None:
+            loop_obj.change_interval(minutes=MCWV_HOURLY_STATS_INTERVAL_MINUTES)
+            if not loop_obj.is_running():
+                loop_obj.start()
+        return {"success": True, "system": "hourly_stats", "channel_id": str(channel.id), "message": f"Hourly stats configured for #{channel.name}."}
+
+    raise ValueError("Unknown setup system. Use placement_alerts, clan_logs, or hourly_stats.")
+
+
+@app.route("/admin/setup", methods=["POST"])
+@require_admin_api_key
+def admin_setup_system():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_setup_system_from_body(body))
+        payload = future.result(timeout=15)
+        admin_log("Setup Updated", payload.get("message", "Bot system setup updated"))
+        return jsonify(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+async def _admin_send_hourly_stats_from_body(body):
+    channel_id = body.get("channel_id") or body.get("channelId") or body.get("channel") or get_hourly_stats_channel_id()
+    channel = await _validate_admin_text_channel(channel_id, require_invite=False)
+    await send_hourly_stats_card(channel)
+    return {"success": True, "channel_id": str(channel.id), "message": f"Hourly stats sent in #{channel.name}."}
+
+
+@app.route("/admin/hourly-stats/send", methods=["POST"])
+@require_admin_api_key
+def admin_hourly_stats_send():
+    body = request.get_json(silent=True) or {}
+    try:
+        future = _run_on_bot_loop(_admin_send_hourly_stats_from_body(body))
+        payload = future.result(timeout=45)
+        admin_log("Hourly Stats Sent", payload.get("message", "Hourly stats sent"))
+        return jsonify(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/admin/giveaway/end", methods=["POST"])
