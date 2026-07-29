@@ -11248,13 +11248,15 @@ def draw_arrow_icon(draw, box, accent, S):
 
 
 async def generate_clan_member_log_card(kind, user_id, user_info, member_count, member_capacity):
+    # Match the cleaner CW-Bot style: simple dark card, big title, subtle icons,
+    # large avatar ring. No watermark/panels/chips.
     S = 2
     W, H = 1250 * S, 420 * S
     joined = kind == "joined"
 
     accent = (74, 222, 128) if joined else (255, 84, 96)
-    accent_2 = (190, 72, 255) if joined else (255, 133, 104)
-    label_color = (202, 82, 255) if joined else (255, 108, 132)
+    ring = (190, 70, 255) if joined else (255, 118, 138)
+    label_color = (190, 78, 255) if joined else (255, 110, 135)
     small_label = "NEW MEMBER" if joined else "MEMBER LEFT"
     title = "Player Joined" if joined else "Player Left"
     verb = "joined" if joined else "left"
@@ -11262,7 +11264,7 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     def sc(value):
         return int(round(value * S))
 
-    # Keep the original/default font family; improve the card around it.
+    # Keep default/system fonts as requested.
     def font(size, bold=True):
         path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
         try:
@@ -11272,83 +11274,40 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
 
     fonts = {
         "eyebrow": font(24, True),
-        "title": font(74, True),
-        "meta": font(35, True),
-        "meta_regular": font(31, False),
+        "title": font(82, True),
+        "meta": font(37, True),
+        "meta_regular": font(34, False),
         "body_bold": font(29, True),
         "body": font(29, False),
-        "tiny": font(18, True),
-        "watermark": font(118, True),
     }
-
-    def composite_shape(draw_fn):
-        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        ld = ImageDraw.Draw(layer)
-        draw_fn(ld)
-        img.alpha_composite(layer)
-        return ImageDraw.Draw(img)
-
-    def glass_panel(box, radius=26, fill=(16, 18, 48, 150), outline=(190, 195, 255, 70)):
-        def _draw(ld):
-            ld.rounded_rectangle(box, radius=sc(radius), fill=fill, outline=outline, width=sc(1))
-            # A small top highlight makes the glass feel less flat.
-            ld.rounded_rectangle(
-                (box[0] + sc(2), box[1] + sc(2), box[2] - sc(2), box[1] + sc(28)),
-                radius=sc(max(radius - 2, 4)),
-                fill=(255, 255, 255, 16),
-            )
-        return composite_shape(_draw)
 
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 
-    # Drop shadow behind the rounded card.
+    # Shadow.
     shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow)
     card_box = (sc(8), sc(8), W - sc(8), H - sc(12))
-    sd.rounded_rectangle(card_box, radius=sc(36), fill=(0, 0, 0, 175))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(9)))
+    sd.rounded_rectangle(card_box, radius=sc(36), fill=(0, 0, 0, 150))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
     img.alpha_composite(shadow)
 
-    # Premium dark background: blue/black base with purple or warm side glow.
+    # Clean dark background similar to the reference card.
     card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     cd = ImageDraw.Draw(card)
     for x in range(W):
         t = x / max(W - 1, 1)
-        r = int(8 + 10 * (1 - t) + (26 if t > 0.62 else 0) * (t - 0.62))
-        g = int(11 + 8 * (1 - t))
-        b = int(34 + 18 * (1 - t) + 14 * t)
+        r = int(11 + 6 * (1 - t))
+        g = int(14 + 7 * (1 - t))
+        b = int(36 + 14 * (1 - t))
         cd.line((x, 0, x, H), fill=(r, g, b, 255))
 
+    # Soft glows only; no heavy panels/diagonal shapes.
     fx = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     fd = ImageDraw.Draw(fx)
-    fd.ellipse((sc(-220), sc(120), sc(460), sc(620)), fill=(112, 47, 180, 72))
-    fd.ellipse((sc(690), sc(-180), sc(1370), sc(540)), fill=(*accent_2, 58))
-    fd.polygon(
-        [(sc(655), sc(0)), (sc(835), sc(0)), (sc(710), H), (sc(520), H)],
-        fill=(255, 255, 255, 10),
-    )
-    fd.polygon(
-        [(sc(860), sc(0)), (sc(1040), sc(0)), (sc(900), H), (sc(735), H)],
-        fill=(255, 255, 255, 7),
-    )
-
-    # Subtle deterministic star/noise texture.
-    rng = random.Random(int(user_id) if str(user_id).isdigit() else 42)
-    for _ in range(95):
-        x = rng.randint(sc(24), W - sc(24))
-        y = rng.randint(sc(24), H - sc(24))
-        a = rng.randint(18, 58)
-        s = rng.choice([1, 1, 1, 2]) * S
-        fd.ellipse((x, y, x + s, y + s), fill=(220, 225, 255, a))
-
-    fx = fx.filter(ImageFilter.GaussianBlur(sc(0.4)))
+    fd.ellipse((sc(-165), sc(155), sc(420), sc(615)), fill=(102, 45, 165, 48))
+    fd.ellipse((sc(760), sc(-135), sc(1335), sc(520)), fill=(*ring, 38))
+    fx = fx.filter(ImageFilter.GaussianBlur(sc(42)))
     card.alpha_composite(fx)
-
-    # Watermark behind text.
-    wd = ImageDraw.Draw(card)
-    watermark = CLAN_NAME
-    bbox = wd.textbbox((0, 0), watermark, font=fonts["watermark"])
-    wd.text((sc(430), sc(245)), watermark, font=fonts["watermark"], fill=(255, 255, 255, 10))
 
     mask = rounded_mask((W - sc(16), H - sc(20)), sc(36))
     shaped = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -11356,85 +11315,85 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     img.alpha_composite(shaped)
 
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle(card_box, radius=sc(36), outline=(205, 215, 255, 210), width=sc(2))
-    d.rounded_rectangle((sc(12), sc(12), W - sc(12), H - sc(16)), radius=sc(33), outline=(*accent_2, 75), width=sc(2))
+    d.rounded_rectangle(card_box, radius=sc(36), outline=(225, 230, 255, 185), width=sc(2))
+    d.rounded_rectangle((sc(11), sc(11), W - sc(11), H - sc(15)), radius=sc(33), outline=(255, 255, 255, 28), width=sc(1))
 
-    # Event pill.
-    pill_box = (sc(48), sc(34), sc(255), sc(73))
-    glass_panel(pill_box, radius=17, fill=(20, 17, 54, 145), outline=(*label_color, 120))
+    # Text positions copied from the clean reference layout.
+    draw_text_shadow(d, (sc(50), sc(42)), small_label, fonts["eyebrow"], (*label_color, 255), shadow=(0, 0, 0, 115), offset=(sc(2), sc(2)))
+    draw_text_shadow(d, (sc(50), sc(100)), title, fonts["title"], (*accent, 255), shadow=(0, 0, 0, 145), offset=(sc(4), sc(5)))
+
+    # Subtle small icon tiles. Use alpha compositing so they blend instead of becoming bright squares.
+    def icon_tile(box, draw_symbol):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle(box, radius=sc(14), fill=(*label_color, 22))
+        img.alpha_composite(layer)
+        dd = ImageDraw.Draw(img)
+        draw_symbol(dd, box)
+        return dd
+
+    def member_symbol(dd, box):
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) // 2
+        head_r = sc(10)
+        head_y = y1 + sc(20)
+        dd.ellipse((cx - head_r, head_y - head_r, cx + head_r, head_y + head_r), outline=(*label_color, 255), width=sc(4))
+        dd.arc((cx - sc(22), y1 + sc(30), cx + sc(22), y1 + sc(70)), 200, 340, fill=(*label_color, 255), width=sc(4))
+
+    def arrow_symbol(dd, box):
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        dd.line((cx - sc(12), cy, cx + sc(13), cy), fill=(*label_color, 255), width=sc(4))
+        dd.line((cx + sc(2), cy - sc(10), cx + sc(13), cy, cx + sc(2), cy + sc(10)), fill=(*label_color, 255), width=sc(4), joint="curve")
+
+    icon_tile((sc(50), sc(210), sc(108), sc(268)), member_symbol)
     d = ImageDraw.Draw(img)
-    d.ellipse((sc(65), sc(48), sc(78), sc(61)), fill=(*accent, 255))
-    d.text((sc(88), sc(43)), small_label, font=fonts["eyebrow"], fill=(238, 228, 255, 255))
-
-    # Big headline with a controlled shadow.
-    draw_text_shadow(d, (sc(50), sc(103)), title, fonts["title"], (*accent, 255), shadow=(0, 0, 0, 145), offset=(sc(4), sc(5)))
-
-    # Member count glass chip.
-    stat_box = (sc(50), sc(202), sc(444), sc(276))
-    glass_panel(stat_box, radius=24, fill=(12, 15, 45, 142), outline=(*label_color, 86))
-    d = ImageDraw.Draw(img)
-    icon_box = (sc(70), sc(216), sc(124), sc(262))
-    draw_member_icon(d, icon_box, label_color, S)
     count_text = f"{int(member_count or 0)}/{int(member_capacity or 0) if member_capacity else '?'}"
-    count_x = sc(142)
+    count_x = sc(112)
     count_y = sc(218)
-    draw_text_shadow(d, (count_x, count_y), count_text, fonts["meta"], (255, 255, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(2), sc(2)))
+    draw_text_shadow(d, (count_x, count_y), count_text, fonts["meta"], (252, 252, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
     count_right = d.textbbox((count_x, count_y), count_text, font=fonts["meta"])[2]
-    d.text((count_right + sc(18), sc(224)), "Members", font=fonts["meta_regular"], fill=(205, 203, 221, 255))
+    d.text((count_right + sc(22), sc(224)), "Members", font=fonts["meta_regular"], fill=(190, 188, 205, 255))
 
-    # Action line chip.
-    action_box = (sc(50), sc(306), sc(790), sc(376))
-    glass_panel(action_box, radius=24, fill=(13, 16, 47, 152), outline=(*label_color, 82))
+    icon_tile((sc(50), sc(315), sc(108), sc(373)), arrow_symbol)
     d = ImageDraw.Draw(img)
-    arrow_box = (sc(70), sc(318), sc(124), sc(364))
-    draw_arrow_icon(d, arrow_box, label_color, S)
-    label = fit_text(d, display_user_label(user_info, user_id), fonts["body_bold"], sc(470))
-    x = sc(142)
+    label = fit_text(d, display_user_label(user_info, user_id), fonts["body_bold"], sc(510))
+    x = sc(112)
     y = sc(326)
-    draw_text_shadow(d, (x, y), label, fonts["body_bold"], (255, 255, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(2), sc(2)))
+    draw_text_shadow(d, (x, y), label, fonts["body_bold"], (255, 255, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
     label_w = d.textbbox((x, y), label, font=fonts["body_bold"])[2] - x
     verb_text = f" {verb} "
-    d.text((x + label_w + sc(9), y), verb_text, font=fonts["body"], fill=(200, 198, 216, 255))
+    d.text((x + label_w + sc(8), y), verb_text, font=fonts["body"], fill=(188, 186, 203, 255))
     verb_w = d.textbbox((0, 0), verb_text, font=fonts["body"])[2]
-    d.text((x + label_w + sc(9) + verb_w, y), f"[{CLAN_NAME}].", font=fonts["body"], fill=(158, 160, 255, 255))
+    d.text((x + label_w + sc(8) + verb_w, y), f"[{CLAN_NAME}].", font=fonts["body"], fill=(155, 155, 255, 255))
 
-    # Avatar showcase panel on the right.
-    avatar_panel = (sc(850), sc(48), sc(1212), sc(372))
-    glass_panel(avatar_panel, radius=34, fill=(8, 10, 30, 88), outline=(*accent_2, 72))
-    d = ImageDraw.Draw(img)
-    center = (sc(1040), sc(210))
+    # Avatar ring like the reference.
+    center = (sc(1045), sc(210))
     outer_r = sc(151)
-    mid_r = sc(136)
-    inner_r = sc(122)
+    inner_r = sc(126)
 
-    ring_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    rd = ImageDraw.Draw(ring_layer)
-    rd.ellipse((center[0] - outer_r, center[1] - outer_r, center[0] + outer_r, center[1] + outer_r), fill=(*accent_2, 46))
-    rd.ellipse((center[0] - sc(142), center[1] - sc(142), center[0] + sc(142), center[1] + sc(142)), outline=(*label_color, 255), width=sc(9))
-    rd.arc((center[0] - sc(142), center[1] - sc(142), center[0] + sc(142), center[1] + sc(142)), 210, 330, fill=(*accent, 255), width=sc(8))
-    rd.ellipse((center[0] - mid_r, center[1] - mid_r, center[0] + mid_r, center[1] + mid_r), outline=(255, 255, 255, 32), width=sc(2))
-    ring_layer = ring_layer.filter(ImageFilter.GaussianBlur(sc(0.3)))
-    img.alpha_composite(ring_layer)
+    ring_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rg = ImageDraw.Draw(ring_glow)
+    rg.ellipse((center[0] - outer_r, center[1] - outer_r, center[0] + outer_r, center[1] + outer_r), fill=(*ring, 54))
+    ring_glow = ring_glow.filter(ImageFilter.GaussianBlur(sc(8)))
+    img.alpha_composite(ring_glow)
+
     d = ImageDraw.Draw(img)
-    d.ellipse((center[0] - inner_r, center[1] - inner_r, center[0] + inner_r, center[1] + inner_r), fill=(24, 25, 34, 255))
+    d.ellipse((center[0] - sc(145), center[1] - sc(145), center[0] + sc(145), center[1] + sc(145)), outline=(*ring, 255), width=sc(8))
+    d.ellipse((center[0] - inner_r, center[1] - inner_r, center[0] + inner_r, center[1] + inner_r), fill=(34, 35, 46, 255))
 
-    avatar = await fetch_roblox_headshot_for_logs(user_id, size=sc(238))
+    avatar = await fetch_roblox_headshot_for_logs(user_id, size=sc(244))
     if avatar is None:
-        avatar = Image.new("RGBA", (sc(238), sc(238)), (180, 180, 190, 255))
+        avatar = Image.new("RGBA", (sc(244), sc(244)), (180, 180, 190, 255))
         ad = ImageDraw.Draw(avatar)
-        ad.ellipse((sc(80), sc(68), sc(105), sc(94)), fill=(0, 0, 0, 255))
-        ad.ellipse((sc(133), sc(68), sc(158), sc(94)), fill=(0, 0, 0, 255))
-        ad.arc((sc(76), sc(96), sc(165), sc(178)), 20, 160, fill=(0, 0, 0, 255), width=sc(6))
+        ad.ellipse((sc(82), sc(70), sc(108), sc(96)), fill=(0, 0, 0, 255))
+        ad.ellipse((sc(136), sc(70), sc(162), sc(96)), fill=(0, 0, 0, 255))
+        ad.arc((sc(78), sc(95), sc(168), sc(180)), 20, 160, fill=(0, 0, 0, 255), width=sc(6))
 
     avatar_mask = Image.new("L", avatar.size, 0)
     ImageDraw.Draw(avatar_mask).ellipse((0, 0, avatar.size[0] - 1, avatar.size[1] - 1), fill=255)
     img.paste(avatar, (center[0] - avatar.size[0] // 2, center[1] - avatar.size[1] // 2), avatar_mask)
-
-    # Small bottom-right clan chip.
-    chip = (sc(925), sc(340), sc(1155), sc(378))
-    glass_panel(chip, radius=16, fill=(10, 12, 34, 170), outline=(*accent, 90))
-    d = ImageDraw.Draw(img)
-    d.text((sc(948), sc(348)), f"{CLAN_NAME} CLAN LOG", font=fonts["tiny"], fill=(232, 233, 255, 220))
 
     img = img.resize((1250, 420), Image.Resampling.LANCZOS)
     out = BytesIO()
