@@ -11011,6 +11011,7 @@ def rounded_mask(size, radius):
     return mask
 
 
+
 # ---------------- CLAN LOGS ----------------
 CLAN_LOG_STATE_KEY = "mcwv_clan_log_state"
 
@@ -11250,9 +11251,10 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     S = 2
     W, H = 1250 * S, 420 * S
     joined = kind == "joined"
+
     accent = (74, 222, 128) if joined else (255, 84, 96)
-    ring = (190, 70, 255) if joined else (255, 118, 138)
-    label_color = (190, 78, 255) if joined else (255, 110, 135)
+    accent_2 = (190, 72, 255) if joined else (255, 133, 104)
+    label_color = (202, 82, 255) if joined else (255, 108, 132)
     small_label = "NEW MEMBER" if joined else "MEMBER LEFT"
     title = "Player Joined" if joined else "Player Left"
     verb = "joined" if joined else "left"
@@ -11260,6 +11262,7 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     def sc(value):
         return int(round(value * S))
 
+    # Keep the original/default font family; improve the card around it.
     def font(size, bold=True):
         path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
         try:
@@ -11269,85 +11272,169 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
 
     fonts = {
         "eyebrow": font(24, True),
-        "title": font(76, True),
-        "meta": font(36, True),
-        "meta_regular": font(34, False),
-        "body_bold": font(28, True),
-        "body": font(28, False),
+        "title": font(74, True),
+        "meta": font(35, True),
+        "meta_regular": font(31, False),
+        "body_bold": font(29, True),
+        "body": font(29, False),
+        "tiny": font(18, True),
+        "watermark": font(118, True),
     }
 
+    def composite_shape(draw_fn):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        draw_fn(ld)
+        img.alpha_composite(layer)
+        return ImageDraw.Draw(img)
+
+    def glass_panel(box, radius=26, fill=(16, 18, 48, 150), outline=(190, 195, 255, 70)):
+        def _draw(ld):
+            ld.rounded_rectangle(box, radius=sc(radius), fill=fill, outline=outline, width=sc(1))
+            # A small top highlight makes the glass feel less flat.
+            ld.rounded_rectangle(
+                (box[0] + sc(2), box[1] + sc(2), box[2] - sc(2), box[1] + sc(28)),
+                radius=sc(max(radius - 2, 4)),
+                fill=(255, 255, 255, 16),
+            )
+        return composite_shape(_draw)
+
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # Drop shadow behind the rounded card.
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    card_box = (sc(8), sc(8), W - sc(8), H - sc(12))
+    sd.rounded_rectangle(card_box, radius=sc(36), fill=(0, 0, 0, 175))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(9)))
+    img.alpha_composite(shadow)
+
+    # Premium dark background: blue/black base with purple or warm side glow.
     card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     cd = ImageDraw.Draw(card)
-
-    # Dark premium card background with soft purple/red glow.
     for x in range(W):
         t = x / max(W - 1, 1)
-        r = int(12 + 10 * (1 - t))
-        g = int(14 + 8 * (1 - t))
-        b = int(38 + 18 * (1 - t))
+        r = int(8 + 10 * (1 - t) + (26 if t > 0.62 else 0) * (t - 0.62))
+        g = int(11 + 8 * (1 - t))
+        b = int(34 + 18 * (1 - t) + 14 * t)
         cd.line((x, 0, x, H), fill=(r, g, b, 255))
 
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse((sc(-120), sc(120), sc(460), sc(610)), fill=(120, 55, 190, 58))
-    gd.ellipse((sc(760), sc(-120), sc(1290), sc(500)), fill=(*ring, 42))
-    glow = glow.filter(ImageFilter.GaussianBlur(sc(34)))
-    card.alpha_composite(glow)
+    fx = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    fd = ImageDraw.Draw(fx)
+    fd.ellipse((sc(-220), sc(120), sc(460), sc(620)), fill=(112, 47, 180, 72))
+    fd.ellipse((sc(690), sc(-180), sc(1370), sc(540)), fill=(*accent_2, 58))
+    fd.polygon(
+        [(sc(655), sc(0)), (sc(835), sc(0)), (sc(710), H), (sc(520), H)],
+        fill=(255, 255, 255, 10),
+    )
+    fd.polygon(
+        [(sc(860), sc(0)), (sc(1040), sc(0)), (sc(900), H), (sc(735), H)],
+        fill=(255, 255, 255, 7),
+    )
 
-    mask = rounded_mask((W - sc(16), H - sc(20)), sc(34))
+    # Subtle deterministic star/noise texture.
+    rng = random.Random(int(user_id) if str(user_id).isdigit() else 42)
+    for _ in range(95):
+        x = rng.randint(sc(24), W - sc(24))
+        y = rng.randint(sc(24), H - sc(24))
+        a = rng.randint(18, 58)
+        s = rng.choice([1, 1, 1, 2]) * S
+        fd.ellipse((x, y, x + s, y + s), fill=(220, 225, 255, a))
+
+    fx = fx.filter(ImageFilter.GaussianBlur(sc(0.4)))
+    card.alpha_composite(fx)
+
+    # Watermark behind text.
+    wd = ImageDraw.Draw(card)
+    watermark = CLAN_NAME
+    bbox = wd.textbbox((0, 0), watermark, font=fonts["watermark"])
+    wd.text((sc(430), sc(245)), watermark, font=fonts["watermark"], fill=(255, 255, 255, 10))
+
+    mask = rounded_mask((W - sc(16), H - sc(20)), sc(36))
     shaped = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     shaped.paste(card.crop((sc(8), sc(8), W - sc(8), H - sc(12))), (sc(8), sc(8)), mask)
     img.alpha_composite(shaped)
 
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((sc(8), sc(8), W - sc(8), H - sc(12)), radius=sc(34), outline=(220, 225, 255, 170), width=sc(2))
-    d.rounded_rectangle((sc(10), sc(10), W - sc(10), H - sc(14)), radius=sc(32), outline=(255, 255, 255, 28), width=sc(1))
+    d.rounded_rectangle(card_box, radius=sc(36), outline=(205, 215, 255, 210), width=sc(2))
+    d.rounded_rectangle((sc(12), sc(12), W - sc(12), H - sc(16)), radius=sc(33), outline=(*accent_2, 75), width=sc(2))
 
-    draw_text_shadow(d, (sc(50), sc(42)), small_label, fonts["eyebrow"], (*label_color, 255), shadow=(0, 0, 0, 120), offset=(sc(2), sc(2)))
-    draw_text_shadow(d, (sc(50), sc(96)), title, fonts["title"], (*accent, 255), shadow=(0, 0, 0, 130), offset=(sc(3), sc(4)))
+    # Event pill.
+    pill_box = (sc(48), sc(34), sc(255), sc(73))
+    glass_panel(pill_box, radius=17, fill=(20, 17, 54, 145), outline=(*label_color, 120))
+    d = ImageDraw.Draw(img)
+    d.ellipse((sc(65), sc(48), sc(78), sc(61)), fill=(*accent, 255))
+    d.text((sc(88), sc(43)), small_label, font=fonts["eyebrow"], fill=(238, 228, 255, 255))
 
-    icon_box = (sc(50), sc(210), sc(108), sc(268))
+    # Big headline with a controlled shadow.
+    draw_text_shadow(d, (sc(50), sc(103)), title, fonts["title"], (*accent, 255), shadow=(0, 0, 0, 145), offset=(sc(4), sc(5)))
+
+    # Member count glass chip.
+    stat_box = (sc(50), sc(202), sc(444), sc(276))
+    glass_panel(stat_box, radius=24, fill=(12, 15, 45, 142), outline=(*label_color, 86))
+    d = ImageDraw.Draw(img)
+    icon_box = (sc(70), sc(216), sc(124), sc(262))
     draw_member_icon(d, icon_box, label_color, S)
     count_text = f"{int(member_count or 0)}/{int(member_capacity or 0) if member_capacity else '?'}"
-    count_x = sc(112)
+    count_x = sc(142)
     count_y = sc(218)
-    draw_text_shadow(d, (count_x, count_y), count_text, fonts["meta"], (250, 250, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
-    count_bbox = d.textbbox((count_x, count_y), count_text, font=fonts["meta"])
-    members_x = count_bbox[2] + sc(22)
-    d.text((members_x, sc(223)), "Members", font=fonts["meta_regular"], fill=(190, 188, 205, 255))
+    draw_text_shadow(d, (count_x, count_y), count_text, fonts["meta"], (255, 255, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(2), sc(2)))
+    count_right = d.textbbox((count_x, count_y), count_text, font=fonts["meta"])[2]
+    d.text((count_right + sc(18), sc(224)), "Members", font=fonts["meta_regular"], fill=(205, 203, 221, 255))
 
-    arrow_box = (sc(50), sc(315), sc(108), sc(373))
+    # Action line chip.
+    action_box = (sc(50), sc(306), sc(790), sc(376))
+    glass_panel(action_box, radius=24, fill=(13, 16, 47, 152), outline=(*label_color, 82))
+    d = ImageDraw.Draw(img)
+    arrow_box = (sc(70), sc(318), sc(124), sc(364))
     draw_arrow_icon(d, arrow_box, label_color, S)
-    label = display_user_label(user_info, user_id)
-    label = fit_text(d, label, fonts["body_bold"], sc(480))
-    x = sc(112)
+    label = fit_text(d, display_user_label(user_info, user_id), fonts["body_bold"], sc(470))
+    x = sc(142)
     y = sc(326)
-    draw_text_shadow(d, (x, y), label, fonts["body_bold"], (255, 255, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
+    draw_text_shadow(d, (x, y), label, fonts["body_bold"], (255, 255, 255, 255), shadow=(0, 0, 0, 150), offset=(sc(2), sc(2)))
     label_w = d.textbbox((x, y), label, font=fonts["body_bold"])[2] - x
-    d.text((x + label_w + sc(8), y), f" {verb} ", font=fonts["body"], fill=(188, 186, 203, 255))
-    verb_w = d.textbbox((0, 0), f" {verb} ", font=fonts["body"])[2]
-    d.text((x + label_w + sc(8) + verb_w, y), f"[{CLAN_NAME}].", font=fonts["body"], fill=(155, 155, 255, 255))
+    verb_text = f" {verb} "
+    d.text((x + label_w + sc(9), y), verb_text, font=fonts["body"], fill=(200, 198, 216, 255))
+    verb_w = d.textbbox((0, 0), verb_text, font=fonts["body"])[2]
+    d.text((x + label_w + sc(9) + verb_w, y), f"[{CLAN_NAME}].", font=fonts["body"], fill=(158, 160, 255, 255))
 
-    # Avatar ring.
-    center = (sc(1045), sc(210))
-    outer_r = sc(150)
-    inner_r = sc(126)
-    d.ellipse((center[0] - outer_r, center[1] - outer_r, center[0] + outer_r, center[1] + outer_r), fill=(*ring, 64))
-    d.ellipse((center[0] - sc(141), center[1] - sc(141), center[0] + sc(141), center[1] + sc(141)), outline=(*ring, 255), width=sc(8))
-    d.ellipse((center[0] - inner_r, center[1] - inner_r, center[0] + inner_r, center[1] + inner_r), fill=(34, 35, 46, 255))
+    # Avatar showcase panel on the right.
+    avatar_panel = (sc(850), sc(48), sc(1212), sc(372))
+    glass_panel(avatar_panel, radius=34, fill=(8, 10, 30, 88), outline=(*accent_2, 72))
+    d = ImageDraw.Draw(img)
+    center = (sc(1040), sc(210))
+    outer_r = sc(151)
+    mid_r = sc(136)
+    inner_r = sc(122)
 
-    avatar = await fetch_roblox_headshot_for_logs(user_id, size=sc(244))
+    ring_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rd = ImageDraw.Draw(ring_layer)
+    rd.ellipse((center[0] - outer_r, center[1] - outer_r, center[0] + outer_r, center[1] + outer_r), fill=(*accent_2, 46))
+    rd.ellipse((center[0] - sc(142), center[1] - sc(142), center[0] + sc(142), center[1] + sc(142)), outline=(*label_color, 255), width=sc(9))
+    rd.arc((center[0] - sc(142), center[1] - sc(142), center[0] + sc(142), center[1] + sc(142)), 210, 330, fill=(*accent, 255), width=sc(8))
+    rd.ellipse((center[0] - mid_r, center[1] - mid_r, center[0] + mid_r, center[1] + mid_r), outline=(255, 255, 255, 32), width=sc(2))
+    ring_layer = ring_layer.filter(ImageFilter.GaussianBlur(sc(0.3)))
+    img.alpha_composite(ring_layer)
+    d = ImageDraw.Draw(img)
+    d.ellipse((center[0] - inner_r, center[1] - inner_r, center[0] + inner_r, center[1] + inner_r), fill=(24, 25, 34, 255))
+
+    avatar = await fetch_roblox_headshot_for_logs(user_id, size=sc(238))
     if avatar is None:
-        avatar = Image.new("RGBA", (sc(244), sc(244)), (180, 180, 190, 255))
+        avatar = Image.new("RGBA", (sc(238), sc(238)), (180, 180, 190, 255))
         ad = ImageDraw.Draw(avatar)
-        ad.ellipse((sc(82), sc(70), sc(108), sc(96)), fill=(0, 0, 0, 255))
-        ad.ellipse((sc(136), sc(70), sc(162), sc(96)), fill=(0, 0, 0, 255))
-        ad.arc((sc(78), sc(95), sc(168), sc(180)), 20, 160, fill=(0, 0, 0, 255), width=sc(6))
+        ad.ellipse((sc(80), sc(68), sc(105), sc(94)), fill=(0, 0, 0, 255))
+        ad.ellipse((sc(133), sc(68), sc(158), sc(94)), fill=(0, 0, 0, 255))
+        ad.arc((sc(76), sc(96), sc(165), sc(178)), 20, 160, fill=(0, 0, 0, 255), width=sc(6))
 
     avatar_mask = Image.new("L", avatar.size, 0)
     ImageDraw.Draw(avatar_mask).ellipse((0, 0, avatar.size[0] - 1, avatar.size[1] - 1), fill=255)
     img.paste(avatar, (center[0] - avatar.size[0] // 2, center[1] - avatar.size[1] // 2), avatar_mask)
+
+    # Small bottom-right clan chip.
+    chip = (sc(925), sc(340), sc(1155), sc(378))
+    glass_panel(chip, radius=16, fill=(10, 12, 34, 170), outline=(*accent, 90))
+    d = ImageDraw.Draw(img)
+    d.text((sc(948), sc(348)), f"{CLAN_NAME} CLAN LOG", font=fonts["tiny"], fill=(232, 233, 255, 220))
 
     img = img.resize((1250, 420), Image.Resampling.LANCZOS)
     out = BytesIO()
@@ -11355,17 +11442,18 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     out.seek(0)
     return out
 
-
 async def send_clan_member_log(channel, kind, user_id, user_info, member_count, member_capacity):
     image = await generate_clan_member_log_card(kind, user_id, user_info, member_count, member_capacity)
     filename = f"mcwv-player-{kind}.png"
     file = discord.File(image, filename=filename)
     embed = discord.Embed(
-        description=f"User: {display_user_label(user_info, user_id)}",
         color=discord.Color.green() if kind == "joined" else discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_image(url=f"attachment://{filename}")
+    # Discord renders descriptions above embed images. Footer is the clean way to
+    # keep the user text below the generated card.
+    embed.set_footer(text=f"User: {display_user_label(user_info, user_id)}")
     await channel.send(embed=embed, file=file)
 
 
