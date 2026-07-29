@@ -10965,28 +10965,51 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
 
     # Main glass rank transition panel.
     bar = (ox + sc(38), oy + sc(182), ox + cw - sc(38), oy + sc(368))
-    glass_panel(bar, radius=34, fill_alpha=102, outline_alpha=75)
+    glass_panel(bar, radius=34, fill_alpha=118, outline_alpha=82)
 
-    # Accent gradient on right half.
+    # Rank transition bar: rich blue left side, clean colour wash on the right side.
     bar_w, bar_h = bar[2] - bar[0], bar[3] - bar[1]
-    grad = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(grad)
+    bar_art = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(bar_art)
     for x in range(bar_w):
         t = x / max(bar_w - 1, 1)
-        if t < 0.47:
-            a = 0
+        if t < 0.48:
+            # Keep the left rank zone deep and readable.
+            r, g, b = (30, 43, 118)
+            a = 142
         else:
-            mix = (t - 0.47) / 0.53
-            a = int(42 + 108 * mix)
-        gd.line((x, 0, x, bar_h), fill=(*accent, a))
-    img.paste(grad, (bar[0], bar[1]), rounded_mask((bar_w, bar_h), sc(34)))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle(bar, radius=sc(34), outline=(144, 157, 255, 100), width=sc(2))
+            mix = (t - 0.48) / 0.52
+            base = (30, 43, 118)
+            target = tuple(int(v * 0.78) for v in accent)
+            r = int((1 - mix) * base[0] + mix * target[0])
+            g = int((1 - mix) * base[1] + mix * target[1])
+            b = int((1 - mix) * base[2] + mix * target[2])
+            a = int(74 + 74 * mix)
+        bd.line((x, 0, x, bar_h), fill=(r, g, b, a))
 
-    # Sleek arrow mark.
-    arrow = [(ox+sc(425), bar[1]), (ox+sc(558), oy+sc(275)), (ox+sc(425), bar[3]), (ox+sc(520), bar[3]), (ox+sc(653), oy+sc(275)), (ox+sc(520), bar[1])]
-    d.polygon(arrow, fill=(*accent_2, 34))
-    d.polygon([(ox+sc(510), bar[1]), (ox+sc(642), oy+sc(275)), (ox+sc(510), bar[3]), (ox+sc(590), bar[3]), (ox+sc(723), oy+sc(275)), (ox+sc(590), bar[1])], fill=(*accent_2, 18))
+    # Center fade so the arrow blends instead of looking pasted on.
+    for x in range(int(bar_w * 0.38), int(bar_w * 0.62)):
+        mix = 1 - abs((x / bar_w) - 0.5) / 0.12
+        if mix > 0:
+            bd.line((x, 0, x, bar_h), fill=(*accent_2, int(16 * mix)))
+
+    img.paste(bar_art, (bar[0], bar[1]), rounded_mask((bar_w, bar_h), sc(34)))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle(bar, radius=sc(34), outline=(156, 170, 255, 118), width=sc(2))
+    d.rounded_rectangle((bar[0]+sc(3), bar[1]+sc(3), bar[2]-sc(3), bar[3]-sc(3)), radius=sc(31), outline=(255, 255, 255, 22), width=sc(1))
+
+    # Sleek centre arrow: visible, but glassy and not overpowering.
+    arrow_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    agd = ImageDraw.Draw(arrow_glow)
+    arrow = [(ox+sc(422), bar[1]), (ox+sc(555), oy+sc(275)), (ox+sc(422), bar[3]), (ox+sc(520), bar[3]), (ox+sc(653), oy+sc(275)), (ox+sc(520), bar[1])]
+    arrow2 = [(ox+sc(505), bar[1]), (ox+sc(638), oy+sc(275)), (ox+sc(505), bar[3]), (ox+sc(588), bar[3]), (ox+sc(720), oy+sc(275)), (ox+sc(588), bar[1])]
+    agd.polygon(arrow, fill=(*accent_2, 54))
+    agd.polygon(arrow2, fill=(*accent_2, 30))
+    arrow_glow = arrow_glow.filter(ImageFilter.GaussianBlur(sc(1.2)))
+    img.alpha_composite(arrow_glow)
+    d = ImageDraw.Draw(img)
+    d.polygon(arrow, fill=(*accent_2, 42))
+    d.polygon(arrow2, fill=(*accent_2, 22))
 
     # Rank numbers centered vertically in each half of the bar.
     draw_aligned(
