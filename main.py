@@ -10731,63 +10731,192 @@ async def fetch_image_bytes(url):
     return None
 
 
-async def get_active_battle_id_for_placement():
+def placement_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def pick_first_int(source, keys):
+    if not isinstance(source, dict):
+        return None
+    for key in keys:
+        value = placement_int(source.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def pick_active_battle_id(payload):
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    config = data.get("configData", {}) if isinstance(data, dict) else {}
+
+    candidates = [
+        data.get("activeBattleConfigName"),
+        data.get("activeBattleId"),
+        data.get("battleId"),
+        data.get("configName"),
+        payload.get("activeBattleConfigName") if isinstance(payload, dict) else None,
+        payload.get("activeBattleId") if isinstance(payload, dict) else None,
+        payload.get("battleId") if isinstance(payload, dict) else None,
+        config.get("Title") if isinstance(config, dict) else None,
+        config.get("configName") if isinstance(config, dict) else None,
+        config.get("_id") if isinstance(config, dict) else None,
+    ]
+
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return None
+
+
+def battle_is_live(payload):
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    config = data.get("configData", {}) if isinstance(data, dict) else {}
+    start = config.get("StartTime") or data.get("startTime") or data.get("startTimeSeconds")
+    finish = config.get("FinishTime") or data.get("finishTime") or data.get("finishTimeSeconds")
+
+    # If the endpoint does not include times, do not block the alert.
+    if not start or not finish:
+        return True
+
+    try:
+        now = datetime.now(timezone.utc).timestamp()
+        return float(start) <= now <= float(finish)
+    except Exception:
+        return True
+
+
+async def fetch_json_for_placement(url, timeout_seconds=15):
     global session
     if session is None or session.closed:
         session = aiohttp.ClientSession()
     try:
-        async with session.get(ACTIVE_BATTLE_API, timeout=aiohttp.ClientTimeout(total=15)) as res:
+        async with session.get(
+            url,
+            headers={"User-Agent": "MCWV-Bot/1.0", "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        ) as res:
             if res.status != 200:
+                print(f"[placement] HTTP {res.status} for {url}")
                 return None
-            payload = await res.json(content_type=None)
-        data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        config = data.get("configData", {}) if isinstance(data, dict) else {}
-        battle_id = data.get("configName") or config.get("Title") or config.get("_id")
-        start = config.get("StartTime") or data.get("startTime")
-        finish = config.get("FinishTime") or data.get("finishTime")
-        now = datetime.now(timezone.utc).timestamp()
-        if start and finish and not (float(start) <= now <= float(finish)):
-            return None
-        return str(battle_id) if battle_id else None
+            return await res.json(content_type=None)
     except Exception as exc:
-        print(f"[placement] active battle fetch failed: {exc}")
+        print(f"[placement] JSON fetch failed for {url}: {exc}")
         return None
+
+
+async def get_big_games_index_clan_overview():
+    # This copies the same position source used by the Hub /api/war route.
+    # The db.biggames.io overview page contains MCWV's live battle points and Place.
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    url = f"https://db.biggames.io/clans/leaderboard?sort=Points&item={CLAN_NAME}&tab=overview"
+
+    try:
+        async with session.get(
+            url,
+            headers={"User-Agent": "MCWV-Bot/1.0", "Accept": "text/html"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as res:
+            if res.status != 200:
+                print(f"[placement] Big Games index HTTP {res.status}")
+                return None
+            html = await res.text()
+
+        escaped = re.search(r'\\"BattleID\\",\\"Points\\",(\d+),\\"PointContributions\\",[\s\S]*?\\"Place\\",(\d+)', html)
+        plain = re.search(r'"BattleID","Points",(\d+),"PointContributions",[\s\S]*?"Place",(\d+)', html)
+        match = escaped or plain
+
+        if not match:
+            print("[placement] Big Games index did not expose Points/Place")
+            return None
+
+        return {
+            "points": int(match.group(1)),
+            "rank": int(match.group(2)),
+        }
+    except Exception as exc:
+        print(f"[placement] Big Games index fetch failed: {exc}")
+        return None
+
+
+async def get_active_battle_id_for_placement():
+    # Prefer the v1 endpoint used by the Hub, then fall back to the legacy active battle endpoint.
+    for url in (f"{PS99_API}/v1/clans/players", ACTIVE_BATTLE_API):
+        payload = await fetch_json_for_placement(url)
+        if not payload:
+            continue
+
+        battle_id = pick_active_battle_id(payload)
+        if not battle_id:
+            continue
+
+        if not battle_is_live(payload):
+            return None
+
+        return battle_id
+
+    return None
 
 
 async def get_mcwv_placement_snapshot():
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         return None
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
-    try:
-        async with session.get(CLAN_API, timeout=aiohttp.ClientTimeout(total=15)) as res:
-            if res.status != 200:
-                return None
-            payload = await res.json(content_type=None)
-        data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        battles = data.get("Battles") or {}
-        battle = battles.get(battle_id) or battles.get(str(battle_id))
-        if not battle and battles:
-            norm = str(battle_id).lower()
-            battle = next((value for key, value in battles.items() if str(key).lower() == norm), None)
-        if not isinstance(battle, dict):
-            return None
-        rank = battle.get("Place") or battle.get("place")
-        points = battle.get("Points") or battle.get("points") or 0
-        if not rank:
-            return None
-        return {
-            "battleId": battle_id,
-            "rank": int(rank),
-            "points": int(points or 0),
-            "icon": data.get("Icon"),
-            "name": data.get("Name") or CLAN_NAME,
-        }
-    except Exception as exc:
-        print(f"[placement] clan placement fetch failed: {exc}")
+
+    # Same primary source as the website: db.biggames.io overview.
+    index_overview = await get_big_games_index_clan_overview()
+
+    clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    battles = (data.get("Battles") or {}) if isinstance(data, dict) else {}
+    battle = (battles.get(battle_id) or battles.get(str(battle_id))) if isinstance(battles, dict) else None
+
+    if not battle and isinstance(battles, dict) and battles:
+        norm = str(battle_id).lower()
+        battle = next((value for key, value in battles.items() if str(key).lower() == norm), None)
+
+    fallback_rank = pick_first_int(
+        battle,
+        (
+            "Place",
+            "place",
+            "Placement",
+            "placement",
+            "Rank",
+            "rank",
+            "Position",
+            "position",
+            "ClanPlacement",
+            "LeaderboardPosition",
+            "reportedPlace",
+        ),
+    )
+    fallback_points = pick_first_int(
+        battle,
+        ("Points", "points", "BattlePoints", "battlePoints", "Score", "score", "Value", "value"),
+    )
+
+    rank = (index_overview or {}).get("rank") or fallback_rank
+    points = (index_overview or {}).get("points") or fallback_points or 0
+
+    if not rank:
+        print(f"[placement] no rank found for {battle_id} (index={index_overview}, battle_keys={list(battle.keys()) if isinstance(battle, dict) else None})")
         return None
+
+    return {
+        "battleId": battle_id,
+        "rank": int(rank),
+        "points": int(points or 0),
+        "icon": data.get("Icon") if isinstance(data, dict) else None,
+        "name": data.get("Name") if isinstance(data, dict) else CLAN_NAME,
+    }
 
 
 def _load_card_fonts():
@@ -11013,8 +11142,11 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     d.rounded_rectangle((bar[0]+sc(3), bar[1]+sc(3), bar[2]-sc(3), bar[3]-sc(3)), radius=sc(31), outline=(255, 255, 255, 30), width=sc(1))
 
     # Solid colour chevrons with a crisp shadow and a tiny highlight edge.
-    arrow = [(ox+sc(414), bar[1]), (ox+sc(552), oy+sc(275)), (ox+sc(414), bar[3]), (ox+sc(506), bar[3]), (ox+sc(644), oy+sc(275)), (ox+sc(506), bar[1])]
-    arrow2 = [(ox+sc(494), bar[1]), (ox+sc(632), oy+sc(275)), (ox+sc(494), bar[3]), (ox+sc(580), bar[3]), (ox+sc(718), oy+sc(275)), (ox+sc(580), bar[1])]
+    # Slightly left of the previous version so the full double-chevron sits more centrally
+    # between the old and new rank blocks instead of leaning into the new-rank side.
+    chevron_shift = sc(38)
+    arrow = [(ox+sc(414)-chevron_shift, bar[1]), (ox+sc(552)-chevron_shift, oy+sc(275)), (ox+sc(414)-chevron_shift, bar[3]), (ox+sc(506)-chevron_shift, bar[3]), (ox+sc(644)-chevron_shift, oy+sc(275)), (ox+sc(506)-chevron_shift, bar[1])]
+    arrow2 = [(ox+sc(494)-chevron_shift, bar[1]), (ox+sc(632)-chevron_shift, oy+sc(275)), (ox+sc(494)-chevron_shift, bar[3]), (ox+sc(580)-chevron_shift, bar[3]), (ox+sc(718)-chevron_shift, oy+sc(275)), (ox+sc(580)-chevron_shift, bar[1])]
     # Solid two-tone chevrons — no shadows/highlights/outline so there are no dark seams.
     chevron_main = tuple(min(255, int(v * 0.98)) for v in accent)
     chevron_second = tuple(min(255, int(v * 0.72 + 35)) for v in accent)
