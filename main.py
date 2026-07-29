@@ -10993,14 +10993,18 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
         alpha = int(162 + 34 * smoothstep((t - 0.45) / 0.55))
         bd.line((x, 0, x, bar_h), fill=(*rgb, alpha))
 
-    # Soft gloss pass: bright top edge, darker lower edge, all clipped to the bar.
+    # Soft gloss pass composited over the gradient. Important: use a separate
+    # overlay so it blends with the bar instead of replacing pixels with white/black.
+    gloss = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
+    gl = ImageDraw.Draw(gloss)
     for y in range(bar_h):
-        top = max(0.0, 1 - y / max(bar_h * 0.36, 1))
-        bottom = max(0.0, (y - bar_h * 0.58) / max(bar_h * 0.42, 1))
+        top = max(0.0, 1 - y / max(bar_h * 0.34, 1))
+        bottom = max(0.0, (y - bar_h * 0.64) / max(bar_h * 0.36, 1))
         if top:
-            bd.line((0, y, bar_w, y), fill=(255, 255, 255, int(24 * top)))
+            gl.line((0, y, bar_w, y), fill=(255, 255, 255, int(18 * top)))
         if bottom:
-            bd.line((0, y, bar_w, y), fill=(0, 0, 0, int(30 * bottom)))
+            gl.line((0, y, bar_w, y), fill=(0, 0, 0, int(18 * bottom)))
+    bar_art.alpha_composite(gloss)
 
     img.paste(bar_art, (bar[0], bar[1]), rounded_mask((bar_w, bar_h), sc(34)))
     d = ImageDraw.Draw(img)
