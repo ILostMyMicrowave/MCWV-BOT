@@ -11858,78 +11858,84 @@ async def generate_hourly_stats_card(payload):
         "tiny": font(10, False),
     }
 
-    def rounded_layer(box, radius, fill, outline=None, width=1, blur=0):
+    def alpha_round(box, radius, fill, outline=None, width=1, blur=0):
         layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
-        ld.rounded_rectangle(box, radius=sc(radius), fill=fill, outline=outline, width=sc(width) if outline else 1)
+        ld.rounded_rectangle(
+            box,
+            radius=sc(radius),
+            fill=fill,
+            outline=outline,
+            width=sc(width) if outline else 1,
+        )
+        if blur:
+            layer = layer.filter(ImageFilter.GaussianBlur(sc(blur)))
+        img.alpha_composite(layer)
+
+    def alpha_rect(box, fill, blur=0):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rectangle(box, fill=fill)
         if blur:
             layer = layer.filter(ImageFilter.GaussianBlur(sc(blur)))
         img.alpha_composite(layer)
 
     def centered_text(draw, box, text, font_obj, fill):
-        bbox = draw.textbbox((0, 0), str(text), font=font_obj)
+        text = str(text)
+        bbox = draw.textbbox((0, 0), text, font=font_obj)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x = box[0] + ((box[2] - box[0]) - tw) // 2 - bbox[0]
         y = box[1] + ((box[3] - box[1]) - th) // 2 - bbox[1]
-        draw.text((x, y), str(text), font=font_obj, fill=fill)
+        draw.text((x, y), text, font=font_obj, fill=fill)
 
     def right_text(draw, right_x, y, text, font_obj, fill):
-        bbox = draw.textbbox((0, 0), str(text), font=font_obj)
-        draw.text((right_x - (bbox[2] - bbox[0]), y), str(text), font=font_obj, fill=fill)
+        text = str(text)
+        bbox = draw.textbbox((0, 0), text, font=font_obj)
+        draw.text((right_x - (bbox[2] - bbox[0]), y), text, font=font_obj, fill=fill)
 
     # Background: user's galaxy asset, darkened but still visible.
     img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
-    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 122)))
+    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 104)))
 
-    # Faint grid and vignette.
+    # Faint grid with depth. Use alpha compositing so it never becomes harsh.
     grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grid)
     for x in range(0, W, sc(54)):
-        gd.line((x, 0, x, H), fill=(125, 145, 205, 17), width=sc(1))
+        gd.line((x, 0, x, H), fill=(125, 145, 205, 16), width=sc(1))
     for y in range(0, H, sc(54)):
-        gd.line((0, y, W, y), fill=(125, 145, 205, 13), width=sc(1))
+        gd.line((0, y, W, y), fill=(125, 145, 205, 12), width=sc(1))
     img.alpha_composite(grid)
 
-    vignette = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    vd = ImageDraw.Draw(vignette)
-    vd.rectangle((0, 0, W, H), outline=(0, 0, 0, 0))
-    vd.ellipse((sc(-260), sc(-160), W + sc(260), H + sc(180)), outline=(0, 0, 0, 0), fill=(0, 0, 0, 0))
-    # Simple side darkening.
-    for x in range(W):
-        edge = min(x / max(sc(160), 1), (W - x) / max(sc(160), 1), 1)
-        alpha = int((1 - edge) * 95)
-        if alpha:
-            vd.line((x, 0, x, H), fill=(0, 0, 0, alpha))
-    img.alpha_composite(vignette)
-
-    # Main card shadow + glass panel.
+    # Main panel.
     card = (sc(31), sc(28), sc(1324), sc(776))
-    rounded_layer((card[0] + sc(3), card[1] + sc(5), card[2] + sc(3), card[3] + sc(5)), 25, (0, 0, 0, 165), blur=7)
-    rounded_layer(card, 25, (15, 18, 31, 226), outline=(72, 82, 112, 195), width=2)
-    rounded_layer((card[0] + sc(2), card[1] + sc(2), card[2] - sc(2), card[3] - sc(2)), 23, (255, 255, 255, 0), outline=(255, 255, 255, 24), width=1)
+    alpha_round((card[0] + sc(4), card[1] + sc(7), card[2] + sc(4), card[3] + sc(7)), 25, (0, 0, 0, 145), blur=8)
+    alpha_round(card, 25, (14, 17, 30, 218), outline=(76, 88, 120, 190), width=2)
+    alpha_round((card[0] + sc(2), card[1] + sc(2), card[2] - sc(2), card[3] - sc(2)), 23, (255, 255, 255, 0), outline=(255, 255, 255, 26), width=1)
 
     d = ImageDraw.Draw(img)
 
-    # Top rainbow strip with a soft glow.
+    # Top rainbow strip with soft glow.
     strip_x1, strip_y = sc(52), sc(50)
     strip_x2 = sc(1303)
     colours = [(93, 111, 255), (72, 214, 177), (232, 205, 54), (248, 135, 43), (250, 72, 82)]
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_d = ImageDraw.Draw(glow)
+    strip = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(strip)
     for x in range(strip_x1, strip_x2):
         t = (x - strip_x1) / max(strip_x2 - strip_x1 - 1, 1)
         idx = min(int(t * (len(colours) - 1)), len(colours) - 2)
         local = (t - idx / (len(colours) - 1)) * (len(colours) - 1)
         c1, c2 = colours[idx], colours[idx + 1]
         color = tuple(int(c1[i] + (c2[i] - c1[i]) * local) for i in range(3))
-        glow_d.line((x, strip_y, x, strip_y + sc(5)), fill=(*color, 255), width=sc(1))
-    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(sc(1.3))))
-    img.alpha_composite(glow)
+        sd.line((x, strip_y, x, strip_y + sc(5)), fill=(*color, 255), width=sc(1))
+    img.alpha_composite(strip.filter(ImageFilter.GaussianBlur(sc(1.2))))
+    img.alpha_composite(strip)
     d = ImageDraw.Draw(img)
 
     # Logo with segmented ring.
     logo_center = (sc(112), sc(132))
     ring_r = sc(55)
+    alpha_round((logo_center[0] - sc(59), logo_center[1] - sc(59), logo_center[0] + sc(59), logo_center[1] + sc(59)), 60, (0, 0, 0, 80), blur=5)
+    d = ImageDraw.Draw(img)
     for start, color in [(315, (93, 111, 255)), (35, (72, 214, 177)), (135, (232, 205, 54)), (230, (248, 135, 43))]:
         d.arc((logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r), start, start + 74, fill=(*color, 255), width=sc(5))
     d.ellipse((logo_center[0] - sc(46), logo_center[1] - sc(46), logo_center[0] + sc(46), logo_center[1] + sc(46)), fill=(11, 12, 29, 236), outline=(190, 195, 255, 90), width=sc(1))
@@ -11951,13 +11957,12 @@ async def generate_hourly_stats_card(payload):
     clan_x, clan_y = sc(181), sc(111)
     draw_gradient_text_on_image(img, (clan_x, clan_y), clan_text, fonts["tag"], (45, 225, 215), (249, 91, 51))
     d = ImageDraw.Draw(img)
-
     clan_bbox = d.textbbox((0, 0), clan_text, font=fonts["tag"])
     clan_text_w = clan_bbox[2] - clan_bbox[0]
 
     def small_badge(x, label, value, accent, width=126):
         box = (x, sc(110), x + sc(width), sc(158))
-        rounded_layer(box, 10, (22, 25, 43, 224), outline=(*accent, 130), width=1)
+        alpha_round(box, 10, (22, 25, 43, 222), outline=(*accent, 128), width=1)
         dd = ImageDraw.Draw(img)
         centered_text(dd, (box[0], box[1] + sc(5), box[2], box[1] + sc(20)), label.upper(), fonts["badge_label"], (155, 162, 184, 255))
         centered_text(dd, (box[0], box[1] + sc(21), box[2], box[3] - sc(3)), value, fonts["badge_value"], (*accent, 255))
@@ -11970,7 +11975,7 @@ async def generate_hourly_stats_card(payload):
     # Top-right stat cards.
     def stat_box(x, label, value, accent):
         box = (sc(x), sc(94), sc(x + 135), sc(172))
-        rounded_layer(box, 13, (22, 25, 43, 226), outline=(*accent, 110), width=1)
+        alpha_round(box, 13, (22, 25, 43, 222), outline=(*accent, 108), width=1)
         dd = ImageDraw.Draw(img)
         dd.text((box[0] + sc(13), box[1] + sc(15)), label, font=fonts["stat_label"], fill=(158, 166, 190, 255))
         dd.text((box[0] + sc(13), box[1] + sc(33)), str(value), font=fonts["stat_value"], fill=(247, 248, 255, 255))
@@ -11991,19 +11996,23 @@ async def generate_hourly_stats_card(payload):
 
     for col_idx, col_entries in enumerate(columns):
         px = panel_xs[col_idx]
-        rounded_layer((px, panel_y, px + panel_w, panel_y + panel_h), 15, (10, 13, 25, 207), outline=(58, 66, 92, 190), width=2)
+        alpha_round((px, panel_y, px + panel_w, panel_y + panel_h), 15, (9, 12, 24, 204), outline=(61, 70, 96, 185), width=2)
+        alpha_round((px + sc(2), panel_y + sc(2), px + panel_w - sc(2), panel_y + sc(26)), 13, (255, 255, 255, 12))
         dd = ImageDraw.Draw(img)
+
         for row_idx, entry in enumerate(col_entries):
             global_idx = col_idx * 25 + row_idx
-            y = sc(229) + sc(row_idx * 20.0)
+            y = sc(226) + sc(row_idx * 20.4)
             pph = int(entry.get("pph") or 0)
             zero = pph <= 0
             color = (112, 122, 148) if all_zero else hourly_colour(global_idx, max(len(entries), 1), zero=zero)
 
+            row_box = (px + sc(10), y - sc(1), px + panel_w - sc(10), y + sc(18))
             if row_idx % 2 == 0:
-                dd.rounded_rectangle((px + sc(10), y - sc(2), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(38, 42, 57, 140))
-            elif global_idx < 3 and not zero:
-                dd.rounded_rectangle((px + sc(10), y - sc(2), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(*color, 30))
+                alpha_round(row_box, 5, (255, 255, 255, 17))
+            if global_idx < 3 and not zero:
+                alpha_round(row_box, 5, (*color, 20))
+            dd = ImageDraw.Draw(img)
 
             rank_text = f"{global_idx + 1:02d}"
             name = fit_text(dd, str(entry.get("name") or entry.get("robloxId") or "Unknown"), fonts["row"], sc(150))
@@ -12021,7 +12030,7 @@ async def generate_hourly_stats_card(payload):
             fill_w = int(bar_w * (pph / max_pph)) if max_pph > 0 else 0
             if fill_w > 0:
                 dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(8)), radius=sc(4), fill=(*color, 255))
-                dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(3)), radius=sc(3), fill=(255, 255, 255, 34))
+                dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(3)), radius=sc(3), fill=(255, 255, 255, 32))
             elif zero:
                 marker = (88, 100, 128) if all_zero else (197, 55, 74)
                 dd.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(*marker, 210))
@@ -12029,10 +12038,10 @@ async def generate_hourly_stats_card(payload):
             score = str(pph)
             right_text(dd, px + panel_w - sc(18), y, score, fonts["row_small"], (*score_fill, 255))
 
-    # Tiny timestamp in the bottom-right, outside the row content.
+    # Tiny timestamp in the bottom-right.
     d = ImageDraw.Draw(img)
     updated = datetime.now(timezone.utc).strftime("Updated %H:%M UTC")
-    right_text(d, sc(1300), sc(754), updated, fonts["tiny"], (120, 129, 155, 210))
+    right_text(d, sc(1300), sc(754), updated, fonts["tiny"], (120, 129, 155, 190))
 
     out = BytesIO()
     img = img.resize((1355, 804), Image.Resampling.LANCZOS)
