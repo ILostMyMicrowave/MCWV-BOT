@@ -11571,7 +11571,7 @@ def points_at_time_for_hourly(rows, target_ms):
     return rows[-1]["points"]
 
 
-def fetch_hourly_points_from_history(battle_id, user_ids, current_points):
+def fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=None):
     if not db_enabled() or not user_ids:
         return {}
 
@@ -11580,18 +11580,54 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points):
         battle_keys = sorted({str(battle_id), normalize_hourly_battle_key(battle_id)})
         ids = [str(value) for value in user_ids if str(value).strip()]
         grouped = {rid: [] for rid in ids}
+        point_history_map = {rid: 0 for rid in ids}
 
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT roblox_id::text, points::bigint, captured_at
-                FROM player_leaderboard_history
-                WHERE battle_id = ANY(%s)
-                  AND roblox_id::text = ANY(%s)
-                  AND points IS NOT NULL
-                  AND captured_at >= NOW() - INTERVAL '75 minutes'
-                ORDER BY roblox_id::text ASC, captured_at ASC
-            """, (battle_keys, ids))
-            rows = cur.fetchall()
+                SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS exists
+            """)
+            history_exists = bool(cur.fetchone()[0])
+
+            if history_exists:
+                cur.execute("""
+                    SELECT roblox_id::text, points::bigint, captured_at
+                    FROM player_leaderboard_history
+                    WHERE battle_id = ANY(%s)
+                      AND roblox_id::text = ANY(%s)
+                      AND points IS NOT NULL
+                      AND captured_at >= NOW() - INTERVAL '2 hours'
+                    ORDER BY roblox_id::text ASC, captured_at ASC
+                """, (battle_keys, ids))
+                rows = cur.fetchall()
+            else:
+                rows = []
+
+            cur.execute("""
+                SELECT to_regclass('public.point_history') IS NOT NULL AS exists
+            """)
+            point_history_exists = bool(cur.fetchone()[0])
+
+            if point_history_exists:
+                if battle_start_ts:
+                    cur.execute("""
+                        SELECT user_id::text, COALESCE(SUM(points_added), 0)::bigint
+                        FROM point_history
+                        WHERE user_id::text = ANY(%s)
+                          AND created_at >= NOW() - INTERVAL '1 hour'
+                          AND created_at >= to_timestamp(%s)
+                        GROUP BY user_id::text
+                    """, (ids, int(battle_start_ts)))
+                else:
+                    cur.execute("""
+                        SELECT user_id::text, COALESCE(SUM(points_added), 0)::bigint
+                        FROM point_history
+                        WHERE user_id::text = ANY(%s)
+                          AND created_at >= NOW() - INTERVAL '1 hour'
+                        GROUP BY user_id::text
+                    """, (ids,))
+
+                for roblox_id, points in cur.fetchall():
+                    point_history_map[str(roblox_id)] = max(0, int(points or 0))
 
         for roblox_id, points, captured_at in rows:
             grouped.setdefault(str(roblox_id), []).append({
@@ -11608,8 +11644,13 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points):
             if current <= 0:
                 result[rid] = 0
                 continue
+
             baseline = points_at_time_for_hourly(grouped.get(rid, []), cutoff_ms)
-            result[rid] = max(0, int(round(current - baseline))) if baseline is not None else 0
+            snapshot_gain = max(0, int(round(current - baseline))) if baseline is not None else 0
+            # point_history logs real deltas over the last 60m. Use it as a fallback
+            # when snapshot history is still warming up, matching the Hub analytics approach.
+            delta_gain = int(point_history_map.get(rid, 0) or 0)
+            result[rid] = max(snapshot_gain, delta_gain)
 
         return result
     except Exception as exc:
@@ -11619,6 +11660,72 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points):
             pass
         print(f"[hourly stats] history lookup failed: {exc}")
         return {}
+
+
+def save_hourly_player_snapshot(payload):
+    if not db_enabled() or not isinstance(payload, dict):
+        return
+
+    entries = payload.get("entries") or []
+    if not entries:
+        return
+
+    try:
+        ensure_db_connection()
+        battle_key = normalize_hourly_battle_key(payload.get("battleId"))
+        if not battle_key:
+            return
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS player_leaderboard_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    battle_id TEXT,
+                    roblox_id TEXT NOT NULL,
+                    username TEXT,
+                    rank INTEGER,
+                    points BIGINT,
+                    pph NUMERIC,
+                    change_5m BIGINT,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                SELECT MAX(captured_at)
+                FROM player_leaderboard_history
+                WHERE battle_id = %s
+            """, (battle_key,))
+            last = cur.fetchone()[0]
+            if last:
+                last_dt = last if getattr(last, "tzinfo", None) else last.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - last_dt).total_seconds() < 60:
+                    return
+
+            values = []
+            for _hourly_rank, entry in enumerate(entries, start=1):
+                values.append((
+                    battle_key,
+                    str(entry.get("robloxId") or ""),
+                    str(entry.get("name") or entry.get("robloxId") or "Unknown"),
+                    int(entry.get("currentRank") or 0),
+                    int(entry.get("points") or 0),
+                    int(entry.get("pph") or 0),
+                    0,
+                ))
+
+            if values:
+                cur.executemany("""
+                    INSERT INTO player_leaderboard_history
+                        (battle_id, roblox_id, username, rank, points, pph, change_5m, captured_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                """, values)
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[hourly stats] snapshot save failed: {exc}")
 
 
 def draw_gradient_text_on_image(img, xy, text, font, left_color, right_color, shadow=True):
@@ -11648,6 +11755,13 @@ async def build_hourly_stats_payload():
     if not battle_id:
         return None
 
+    active_payload = await fetch_json_for_placement(ACTIVE_BATTLE_API)
+    active_data = active_payload.get("data", {}) if isinstance(active_payload, dict) else {}
+    active_config = active_data.get("configData", {}) if isinstance(active_data, dict) else {}
+    battle_start_ts = placement_int(active_config.get("StartTime") or active_data.get("startTime"))
+    if battle_start_ts and battle_start_ts > 10_000_000_000:
+        battle_start_ts = battle_start_ts // 1000
+
     clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
     data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
     if not isinstance(data, dict) or not data:
@@ -11676,7 +11790,7 @@ async def build_hourly_stats_payload():
         return None
 
     users = await fetch_roblox_users_for_logs(user_ids)
-    pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points)
+    pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=battle_start_ts)
 
     entries = []
     for rid in user_ids:
@@ -11690,6 +11804,13 @@ async def build_hourly_stats_payload():
             "points": int(current_points.get(rid, 0) or 0),
             "pph": pph,
         })
+
+    war_rank_by_id = {
+        entry["robloxId"]: index + 1
+        for index, entry in enumerate(sorted(entries, key=lambda item: (-int(item.get("points") or 0), item["name"].lower())))
+    }
+    for entry in entries:
+        entry["currentRank"] = war_rank_by_id.get(entry["robloxId"])
 
     entries.sort(key=lambda item: (-int(item["pph"]), item["name"].lower()))
 
@@ -11818,6 +11939,8 @@ async def generate_hourly_stats_card(payload):
     stat_box(1167, "Zero", payload.get("zero", 0), (248, 73, 82))
 
     entries = list(payload.get("entries") or [])
+    total_hourly = int(payload.get("hourlyPoints") or 0)
+    all_zero = total_hourly <= 0
     max_pph = max([int(entry.get("pph") or 0) for entry in entries] + [1])
     columns = [entries[0:25], entries[25:50], entries[50:75]]
     panel_y, panel_h = sc(208), sc(545)
@@ -11834,12 +11957,12 @@ async def generate_hourly_stats_card(payload):
                 d.rounded_rectangle((px + sc(10), y - sc(1), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(36, 39, 53, 138))
             pph = int(entry.get("pph") or 0)
             zero = pph <= 0
-            color = hourly_colour(global_idx, max(len(entries), 1), zero=zero)
+            color = (112, 122, 148) if all_zero else hourly_colour(global_idx, max(len(entries), 1), zero=zero)
             rank_text = f"{global_idx + 1:02d}"
             name = fit_text(d, str(entry.get("name") or entry.get("robloxId") or "Unknown"), fonts["row"], sc(145))
             rank_fill = color if not zero else (152, 158, 174)
-            name_fill = (240, 242, 250) if not zero else (218, 89, 104)
-            score_fill = color if not zero else (145, 151, 168)
+            name_fill = (240, 242, 250) if not zero else ((176, 184, 205) if all_zero else (218, 89, 104))
+            score_fill = color if not zero else ((152, 160, 184) if all_zero else (145, 151, 168))
             d.text((px + sc(18), y), rank_text, font=fonts["row_small"], fill=(*rank_fill, 255))
             d.text((px + sc(68), y), name, font=fonts["row"], fill=(*name_fill, 255))
 
@@ -11851,7 +11974,8 @@ async def generate_hourly_stats_card(payload):
             if fill_w > 0:
                 d.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(8)), radius=sc(4), fill=(*color, 255))
             elif zero:
-                d.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(196, 53, 73, 210))
+                marker = (90, 102, 132) if all_zero else (196, 53, 73)
+                d.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(*marker, 210))
 
             score = str(pph)
             score_bbox = d.textbbox((0, 0), score, font=fonts["row_small"])
@@ -11870,10 +11994,9 @@ async def send_hourly_stats_card(channel):
         raise ValueError("Could not load active war hourly stats.")
     image = await generate_hourly_stats_card(payload)
     file = discord.File(image, filename="mcwv-hourly-stats.png")
-    embed = discord.Embed(color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
-    embed.set_image(url="attachment://mcwv-hourly-stats.png")
-    embed.set_footer(text="Hourly points use the latest 60 minutes of MCWV leaderboard history.")
-    await channel.send(embed=embed, file=file)
+    # Send as a plain image attachment, not an embed.
+    await channel.send(file=file)
+    save_hourly_player_snapshot(payload)
 
 
 def hourly_stats_enabled():
