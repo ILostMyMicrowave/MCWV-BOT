@@ -11849,12 +11849,10 @@ async def generate_hourly_stats_card(payload):
 
     fonts = {
         "tag": font(34, True),
-        "subtitle": font(13, False),
         "badge_label": font(10, False),
         "badge_value": font(22, True),
         "stat_label": font(12, False),
         "stat_value": font(39, True),
-        "col_header": font(12, True),
         "row": font(17, True),
         "row_small": font(15, True),
         "tiny": font(10, False),
@@ -11953,7 +11951,6 @@ async def generate_hourly_stats_card(payload):
     clan_x, clan_y = sc(181), sc(111)
     draw_gradient_text_on_image(img, (clan_x, clan_y), clan_text, fonts["tag"], (45, 225, 215), (249, 91, 51))
     d = ImageDraw.Draw(img)
-    d.text((clan_x + sc(2), sc(152)), "LATEST 60 MINUTES • SORTED BY HOURLY GAIN", font=fonts["subtitle"], fill=(145, 153, 178, 255))
 
     clan_bbox = d.textbbox((0, 0), clan_text, font=fonts["tag"])
     clan_text_w = clan_bbox[2] - clan_bbox[0]
@@ -11996,12 +11993,6 @@ async def generate_hourly_stats_card(payload):
         px = panel_xs[col_idx]
         rounded_layer((px, panel_y, px + panel_w, panel_y + panel_h), 15, (10, 13, 25, 207), outline=(58, 66, 92, 190), width=2)
         dd = ImageDraw.Draw(img)
-        # Column inner highlight.
-        dd.rounded_rectangle((px + sc(2), panel_y + sc(2), px + panel_w - sc(2), panel_y + sc(24)), radius=sc(13), fill=(255, 255, 255, 10))
-        dd.text((px + sc(18), panel_y + sc(12)), "#", font=fonts["col_header"], fill=(105, 114, 139, 255))
-        dd.text((px + sc(68), panel_y + sc(12)), "PLAYER", font=fonts["col_header"], fill=(105, 114, 139, 255))
-        right_text(dd, px + panel_w - sc(18), panel_y + sc(12), "60M", fonts["col_header"], (105, 114, 139, 255))
-
         for row_idx, entry in enumerate(col_entries):
             global_idx = col_idx * 25 + row_idx
             y = sc(229) + sc(row_idx * 20.0)
