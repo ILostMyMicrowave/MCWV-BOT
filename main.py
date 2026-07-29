@@ -10824,180 +10824,155 @@ def rounded_mask(size, radius):
 
 
 async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
-    # Designed to mirror the reference #placement cards: deep navy glass,
-    # glowing blue border, top-right status pill, large rank transition bar,
-    # and yellow contribution total.
+    # Modern placement card using the supplied galaxy background as the main art.
+    # Transparent Discord-ready PNG, rendered at 2x then downsampled for smooth edges.
     S = 2
     W, H = 1080 * S, 560 * S
     improved = int(new_rank) < int(old_rank)
     diff = abs(int(old_rank) - int(new_rank))
-    accent = (116, 255, 178) if improved else (255, 112, 118)
-    accent_soft = (98, 226, 184) if improved else (232, 112, 142)
-    accent_deep = (22, 116, 105) if improved else (112, 54, 82)
+    accent = (119, 255, 180) if improved else (255, 111, 122)
+    accent_2 = (88, 211, 255) if improved else (255, 143, 96)
+    glass = (11, 18, 54)
 
     def sc(value):
         return int(round(value * S))
 
-    def color(rgb, alpha=255):
-        return (*rgb, alpha)
+    def font(size, bold=True):
+        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        return ImageFont.truetype(path, sc(size))
 
     fonts = {
-        "title": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(72)),
-        "pill": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(31)),
-        "rank": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(106)),
-        "label": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", sc(50)),
-        "points": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(56)),
-        "logo": ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", sc(30)),
+        "title": font(70, True),
+        "small": font(28, True),
+        "pill": font(30, True),
+        "rank": font(104, True),
+        "label": font(38, False),
+        "points": font(54, True),
+        "logo": font(28, True),
     }
 
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    card_xy = (sc(34), sc(27), sc(1046), sc(533))
+    card_xy = (sc(32), sc(26), sc(1048), sc(534))
     cw, ch = card_xy[2] - card_xy[0], card_xy[3] - card_xy[1]
+    ox, oy = card_xy[0], card_xy[1]
 
-    # Card base: use the uploaded purple galaxy banner as the card background,
-    # cropped/fitted into the rounded card, with a dark navy wash for readability.
+    # Background: only the supplied galaxy image, cover-cropped into the card.
     if MCWV_PLACEMENT_BG_PATH and os.path.exists(MCWV_PLACEMENT_BG_PATH):
         try:
             bg = Image.open(MCWV_PLACEMENT_BG_PATH).convert("RGBA")
             bw, bh = bg.size
             scale = max(cw / bw, ch / bh)
-            resized = bg.resize((int(bw * scale), int(bh * scale)), Image.Resampling.LANCZOS)
-            left = max(0, (resized.size[0] - cw) // 2)
-            top = max(0, (resized.size[1] - ch) // 2)
-            card = resized.crop((left, top, left + cw, top + ch))
-            wash = Image.new("RGBA", (cw, ch), (5, 12, 42, 118))
-            card.alpha_composite(wash)
+            bg = bg.resize((int(bw * scale), int(bh * scale)), Image.Resampling.LANCZOS)
+            left = (bg.size[0] - cw) // 2
+            top = (bg.size[1] - ch) // 2
+            card = bg.crop((left, top, left + cw, top + ch))
         except Exception as exc:
             print(f"[placement] background load failed: {exc}")
-            card = Image.new("RGBA", (cw, ch), (12, 20, 61, 255))
+            card = Image.new("RGBA", (cw, ch), (8, 10, 32, 255))
     else:
-        card = Image.new("RGBA", (cw, ch), (12, 20, 61, 255))
+        card = Image.new("RGBA", (cw, ch), (8, 10, 32, 255))
 
-    cd = ImageDraw.Draw(card)
-    # extra directional tint matching the original blue card style
-    for y in range(ch):
-        yy = y / max(ch - 1, 1)
-        for x in range(0, cw, sc(3)):
-            xx = x / max(cw - 1, 1)
-            a = int(42 + 46 * (1 - xx) + 18 * yy)
-            cd.rectangle((x, y, min(x + sc(3), cw), y + 1), fill=(8, 18, 68, min(128, a)))
+    # Professional readability overlays, but keep the galaxy visible.
+    overlay = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle((0, 0, cw, ch), radius=sc(54), fill=(4, 8, 28, 92))
+    od.ellipse((sc(-220), sc(250), sc(340), sc(760)), fill=(136, 70, 255, 38))
+    od.ellipse((sc(610), sc(-180), sc(1260), sc(430)), fill=(77, 111, 255, 42))
+    overlay = overlay.filter(ImageFilter.GaussianBlur(sc(1)))
+    card.alpha_composite(overlay)
 
-    # Diagonal blue panels / light streaks.
-    panel = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    pd = ImageDraw.Draw(panel)
-    pd.polygon([(sc(410), 0), (sc(540), 0), (sc(365), ch), (sc(235), ch)], fill=(70, 82, 190, 34))
-    pd.polygon([(sc(650), 0), (sc(810), 0), (sc(610), ch), (sc(455), ch)], fill=(105, 58, 180, 25))
-    glow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse((sc(500), sc(-190), sc(1170), sc(420)), fill=(63, 99, 255, 52))
-    gd.ellipse((sc(-140), sc(230), sc(250), sc(670)), fill=(45, 75, 210, 28))
-    glow = glow.filter(ImageFilter.GaussianBlur(sc(42)))
-    card.alpha_composite(panel)
-    card.alpha_composite(glow)
-    # Keep the background clean like the reference card.
-
+    # Rounded card mask + outer glow.
     mask = rounded_mask((cw, ch), sc(54))
     shaped = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     shaped.paste(card, (0, 0), mask)
 
-    # Outer glow and border.
-    shadow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    sd.rounded_rectangle((0, 0, cw - 1, ch - 1), radius=sc(54), fill=(48, 75, 205, 130))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(11)))
-    img.alpha_composite(shadow, (card_xy[0], card_xy[1]))
-    img.alpha_composite(shaped, (card_xy[0], card_xy[1]))
+    glow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.rounded_rectangle((0, 0, cw - 1, ch - 1), radius=sc(54), fill=(104, 118, 255, 145))
+    glow = glow.filter(ImageFilter.GaussianBlur(sc(14)))
+    img.alpha_composite(glow, (ox, oy))
+    img.alpha_composite(shaped, (ox, oy))
+
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle(card_xy, radius=sc(54), outline=(112, 132, 255, 255), width=sc(3))
-    d.rounded_rectangle((card_xy[0]+sc(5), card_xy[1]+sc(5), card_xy[2]-sc(5), card_xy[3]-sc(5)), radius=sc(49), outline=(255, 255, 255, 38), width=sc(1))
+    d.rounded_rectangle(card_xy, radius=sc(54), outline=(132, 142, 255, 230), width=sc(3))
+    d.rounded_rectangle((ox + sc(7), oy + sc(7), ox + cw - sc(7), oy + ch - sc(7)), radius=sc(48), outline=(255, 255, 255, 42), width=sc(1))
 
-    ox, oy = card_xy[0], card_xy[1]
+    # Glass helper.
+    def glass_panel(box, radius=26, fill_alpha=112, outline_alpha=82):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle(box, radius=sc(radius), fill=(*glass, fill_alpha), outline=(180, 190, 255, outline_alpha), width=sc(1.5))
+        ld.rounded_rectangle((box[0]+sc(2), box[1]+sc(2), box[2]-sc(2), box[1]+sc(32)), radius=sc(radius-2), fill=(255, 255, 255, 16))
+        img.alpha_composite(layer)
 
-    # Logo ring.
-    logo_box = (ox + sc(34), oy + sc(29), ox + sc(154), oy + sc(149))
-    d.ellipse(logo_box, fill=(21, 31, 86, 235), outline=(76, 105, 205, 255), width=sc(4))
-    d.ellipse((logo_box[0]+sc(9), logo_box[1]+sc(9), logo_box[2]-sc(9), logo_box[3]-sc(9)), outline=(33, 54, 125, 255), width=sc(2))
+    # Top logo orb.
+    logo = (ox + sc(36), oy + sc(31), ox + sc(151), oy + sc(146))
+    d.ellipse(logo, fill=(7, 11, 35, 150), outline=(119, 145, 255, 230), width=sc(3))
+    d.ellipse((logo[0]+sc(10), logo[1]+sc(10), logo[2]-sc(10), logo[3]-sc(10)), outline=(255, 255, 255, 38), width=sc(1))
     asset_id = extract_asset_id(icon_value)
     icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
     if icon_bytes:
         try:
-            icon = Image.open(BytesIO(icon_bytes)).convert("RGBA").resize((sc(94), sc(94)), Image.Resampling.LANCZOS)
+            icon = Image.open(BytesIO(icon_bytes)).convert("RGBA").resize((sc(88), sc(88)), Image.Resampling.LANCZOS)
             imask = Image.new("L", icon.size, 0)
             ImageDraw.Draw(imask).ellipse((0, 0, icon.size[0]-1, icon.size[1]-1), fill=255)
-            img.paste(icon, (ox + sc(47), oy + sc(42)), imask)
+            img.paste(icon, (ox + sc(49), oy + sc(44)), imask)
         except Exception:
-            draw_text_shadow(d, (ox + sc(55), oy + sc(74)), "MCWV", fonts["logo"], (174, 86, 255, 255), offset=(sc(2), sc(2)))
+            draw_text_shadow(d, (ox + sc(56), oy + sc(74)), "MCWV", fonts["logo"], (188, 86, 255, 255), offset=(sc(2), sc(2)))
     else:
-        draw_text_shadow(d, (ox + sc(55), oy + sc(74)), "MCWV", fonts["logo"], (174, 86, 255, 255), offset=(sc(2), sc(2)))
+        draw_text_shadow(d, (ox + sc(56), oy + sc(74)), "MCWV", fonts["logo"], (188, 86, 255, 255), offset=(sc(2), sc(2)))
 
-    # Title.
-    draw_text_shadow(d, (ox + sc(204), oy + sc(58)), f"[{CLAN_NAME}]", fonts["title"], (247, 249, 255, 255), shadow=(0, 0, 0, 125), offset=(sc(3), sc(4)))
-
-    # Status pill.
+    # Header title and status pill.
+    draw_text_shadow(d, (ox + sc(205), oy + sc(62)), f"[{CLAN_NAME}]", fonts["title"], (250, 251, 255, 255), shadow=(0, 0, 0, 120), offset=(sc(3), sc(4)))
     pill_text = f"Position {'Increased' if improved else 'Decreased'} by {diff}"
-    pill_w = sc(442)
-    pill_h = sc(62)
-    pill = (ox + cw - pill_w - sc(36), oy + sc(37), ox + cw - sc(36), oy + sc(37) + pill_h)
-    pill_shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    psd = ImageDraw.Draw(pill_shadow)
-    psd.rounded_rectangle((pill[0], pill[1] + sc(3), pill[2], pill[3] + sc(3)), radius=sc(20), fill=(0, 0, 0, 115))
-    pill_shadow = pill_shadow.filter(ImageFilter.GaussianBlur(sc(4)))
-    img.alpha_composite(pill_shadow)
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle(pill, radius=sc(20), fill=(*accent_deep, 132), outline=(*accent, 145), width=sc(3))
-    d.rounded_rectangle((pill[0]+sc(3), pill[1]+sc(3), pill[2]-sc(3), pill[3]-sc(3)), radius=sc(17), outline=(255, 255, 255, 28), width=sc(1))
-    text_w = d.textbbox((0, 0), pill_text, font=fonts["pill"])[2]
-    draw_text_shadow(d, (pill[0] + (pill_w - text_w) // 2, pill[1] + sc(11)), pill_text, fonts["pill"], color(accent), shadow=(0, 0, 0, 135), offset=(sc(2), sc(2)))
+    pill = (ox + sc(560), oy + sc(38), ox + cw - sc(38), oy + sc(100))
+    glass_panel(pill, radius=20, fill_alpha=118, outline_alpha=90)
+    d.rounded_rectangle(pill, radius=sc(20), outline=(*accent, 185), width=sc(2))
+    tw = d.textbbox((0, 0), pill_text, font=fonts["pill"])[2]
+    draw_text_shadow(d, (pill[0] + ((pill[2]-pill[0]) - tw)//2, pill[1] + sc(11)), pill_text, fonts["pill"], (*accent, 255), shadow=(0,0,0,135), offset=(sc(2), sc(2)))
 
-    # Rank transition bar.
-    bar = (ox + sc(36), oy + sc(181), ox + cw - sc(36), oy + sc(367))
+    # Main glass rank transition panel.
+    bar = (ox + sc(38), oy + sc(182), ox + cw - sc(38), oy + sc(368))
+    glass_panel(bar, radius=34, fill_alpha=102, outline_alpha=75)
+
+    # Accent gradient on right half.
     bar_w, bar_h = bar[2] - bar[0], bar[3] - bar[1]
-    bar_layer = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(bar_layer)
+    grad = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grad)
     for x in range(bar_w):
         t = x / max(bar_w - 1, 1)
-        if t < 0.55:
-            rgb = (31, 44, 115)
-            a = 236
+        if t < 0.47:
+            a = 0
         else:
-            mix = (t - 0.55) / 0.45
-            # Keep the right side muted like the reference card, not neon-solid.
-            target = tuple(int(v * 0.62) for v in accent_soft)
-            rgb = tuple(int((1 - mix) * b + mix * a) for b, a in zip((31, 44, 115), target))
-            a = int(188 + 18 * mix)
-        bd.line((x, 0, x, bar_h), fill=(*rgb, a))
-    bar_mask = rounded_mask((bar_w, bar_h), sc(34))
-    img.paste(bar_layer, (bar[0], bar[1]), bar_mask)
-    d.rounded_rectangle(bar, radius=sc(34), outline=(122, 145, 255, 110), width=sc(2))
-    # subtle top glass highlight and inner bottom shade
-    d.arc((bar[0]+sc(5), bar[1]+sc(4), bar[2]-sc(5), bar[1]+sc(68)), 180, 360, fill=(255, 255, 255, 34), width=sc(2))
-    d.line((bar[0]+sc(40), bar[3]-sc(2), bar[2]-sc(40), bar[3]-sc(2)), fill=(0, 0, 0, 52), width=sc(2))
+            mix = (t - 0.47) / 0.53
+            a = int(42 + 108 * mix)
+        gd.line((x, 0, x, bar_h), fill=(*accent, a))
+    img.paste(grad, (bar[0], bar[1]), rounded_mask((bar_w, bar_h), sc(34)))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle(bar, radius=sc(34), outline=(144, 157, 255, 100), width=sc(2))
 
-    # Chevrons inside bar.
-    c1 = [(ox+sc(430), bar[1]), (ox+sc(545), oy+sc(274)), (ox+sc(430), bar[3]), (ox+sc(505), bar[3]), (ox+sc(620), oy+sc(274)), (ox+sc(505), bar[1])]
-    c2 = [(ox+sc(505), bar[1]), (ox+sc(620), oy+sc(274)), (ox+sc(505), bar[3]), (ox+sc(578), bar[3]), (ox+sc(690), oy+sc(274)), (ox+sc(578), bar[1])]
-    d.polygon(c1, fill=(*accent, 18))
-    d.polygon(c2, fill=(*accent, 11))
+    # Sleek arrow mark.
+    arrow = [(ox+sc(425), bar[1]), (ox+sc(558), oy+sc(275)), (ox+sc(425), bar[3]), (ox+sc(520), bar[3]), (ox+sc(653), oy+sc(275)), (ox+sc(520), bar[1])]
+    d.polygon(arrow, fill=(*accent_2, 34))
+    d.polygon([(ox+sc(510), bar[1]), (ox+sc(642), oy+sc(275)), (ox+sc(510), bar[3]), (ox+sc(590), bar[3]), (ox+sc(723), oy+sc(275)), (ox+sc(590), bar[1])], fill=(*accent_2, 18))
 
     # Rank numbers.
-    draw_text_shadow(d, (ox + sc(82), oy + sc(232)), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255), shadow=(0, 0, 0, 128), offset=(sc(4), sc(5)))
+    draw_text_shadow(d, (ox + sc(82), oy + sc(231)), f"#{old_rank}", fonts["rank"], (248, 249, 255, 255), shadow=(0, 0, 0, 128), offset=(sc(4), sc(5)))
     new_text = f"#{new_rank}"
-    new_bbox = d.textbbox((0, 0), new_text, font=fonts["rank"])
-    new_w = new_bbox[2] - new_bbox[0]
-    draw_text_shadow(d, (ox + cw - sc(75) - new_w, oy + sc(232)), new_text, fonts["rank"], color(accent), shadow=(0, 0, 0, 130), offset=(sc(4), sc(5)))
+    new_w = d.textbbox((0, 0), new_text, font=fonts["rank"])[2]
+    draw_text_shadow(d, (ox + cw - sc(75) - new_w, oy + sc(231)), new_text, fonts["rank"], (*accent, 255), shadow=(0, 0, 0, 130), offset=(sc(4), sc(5)))
 
-    # Contributions bottom line.
+    # Bottom contribution glass chip.
+    footer = (ox + sc(230), oy + sc(398), ox + cw - sc(230), oy + sc(478))
+    glass_panel(footer, radius=28, fill_alpha=54, outline_alpha=24)
     label = "Contributions"
     pts = format_compact_points(points)
-    label_bbox = d.textbbox((0, 0), label, font=fonts["label"])
-    pts_bbox = d.textbbox((0, 0), pts, font=fonts["points"])
-    label_w = label_bbox[2] - label_bbox[0]
-    pts_w = pts_bbox[2] - pts_bbox[0]
+    label_w = d.textbbox((0, 0), label, font=fonts["label"])[2]
+    pts_w = d.textbbox((0, 0), pts, font=fonts["points"])[2]
     start_x = ox + (cw - label_w - sc(28) - pts_w) // 2
-    draw_text_shadow(d, (start_x, oy + sc(400)), label, fonts["label"], (224, 228, 242, 235), shadow=(0, 0, 0, 108), offset=(sc(2), sc(3)))
-    draw_text_shadow(d, (start_x + label_w + sc(28), oy + sc(392)), pts, fonts["points"], (255, 211, 87, 255), shadow=(0, 0, 0, 138), offset=(sc(3), sc(3)))
+    draw_text_shadow(d, (start_x, oy + sc(405)), label, fonts["label"], (233, 236, 250, 240), shadow=(0, 0, 0, 105), offset=(sc(2), sc(3)))
+    draw_text_shadow(d, (start_x + label_w + sc(28), oy + sc(397)), pts, fonts["points"], (255, 220, 94, 255), shadow=(0, 0, 0, 138), offset=(sc(3), sc(3)))
 
-    # Downsample for anti-aliased edges/text.
     img = img.resize((1080, 560), Image.Resampling.LANCZOS)
     out = BytesIO()
     img.save(out, format="PNG")
