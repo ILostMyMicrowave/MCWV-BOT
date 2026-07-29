@@ -11846,9 +11846,9 @@ async def generate_hourly_stats_card(payload):
             return ImageFont.load_default()
 
     fonts = {
-        "tag": font(36, True),
-        "badge_label": font(10, False),
-        "badge_value": font(20, True),
+        "tag": font(34, True),
+        "badge_label": font(11, False),
+        "badge_value": font(22, True),
         "stat_label": font(12, False),
         "stat_value": font(38, True),
         "row": font(17, True),
@@ -11915,17 +11915,30 @@ async def generate_hourly_stats_card(payload):
     else:
         d.text((sc(78), sc(117)), CLAN_NAME, font=font(18, True), fill=(204, 98, 255, 255))
 
-    draw_gradient_text_on_image(img, (sc(181), sc(115)), f"[{payload.get('clanName') or CLAN_NAME}]", fonts["tag"], (46, 222, 217), (249, 91, 51))
+    clan_text = f"[{payload.get('clanName') or CLAN_NAME}]"
+    clan_text_x = sc(181)
+    clan_text_y = sc(112)
+    draw_gradient_text_on_image(img, (clan_text_x, clan_text_y), clan_text, fonts["tag"], (46, 222, 217), (249, 91, 51))
     d = ImageDraw.Draw(img)
+
+    clan_bbox = d.textbbox((0, 0), clan_text, font=fonts["tag"])
+    clan_text_w = clan_bbox[2] - clan_bbox[0]
 
     def small_badge(box, label, value, accent):
         d.rounded_rectangle(box, radius=sc(10), fill=(25, 28, 45, 230), outline=(*accent, 145), width=sc(1))
-        d.text((box[0] + sc(36), box[1] + sc(8)), label, font=fonts["badge_label"], fill=(160, 165, 184, 255))
+        label_bbox = d.textbbox((0, 0), label, font=fonts["badge_label"])
+        label_w = label_bbox[2] - label_bbox[0]
+        d.text((box[0] + ((box[2] - box[0]) - label_w) // 2, box[1] + sc(8)), label, font=fonts["badge_label"], fill=(160, 165, 184, 255))
         value_bbox = d.textbbox((0, 0), value, font=fonts["badge_value"])
-        d.text((box[0] + (box[2] - box[0] - (value_bbox[2] - value_bbox[0])) // 2, box[1] + sc(22)), value, font=fonts["badge_value"], fill=(*accent, 255))
+        value_w = value_bbox[2] - value_bbox[0]
+        d.text((box[0] + ((box[2] - box[0]) - value_w) // 2, box[1] + sc(23)), value, font=fonts["badge_value"], fill=(*accent, 255))
 
-    small_badge((sc(327), sc(110), sc(445), sc(158)), "Clan Rank", f"#{payload.get('rank') or '—'}", (238, 196, 56))
-    small_badge((sc(457), sc(110), sc(576), sc(158)), "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (79, 196, 236))
+    # Keep the badges clear of the clan tag. The old layout started the Clan Rank
+    # badge too early, which made the closing bracket look clipped/covered.
+    badge1_x = max(sc(352), clan_text_x + clan_text_w + sc(32))
+    badge2_x = badge1_x + sc(132)
+    small_badge((badge1_x, sc(110), badge1_x + sc(118), sc(158)), "Clan Rank", f"#{payload.get('rank') or '—'}", (238, 196, 56))
+    small_badge((badge2_x, sc(110), badge2_x + sc(128), sc(158)), "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (79, 196, 236))
 
     def stat_box(x, label, value, accent):
         box = (sc(x), sc(94), sc(x + 135), sc(172))
