@@ -7292,7 +7292,8 @@ async def placement_test(interaction: discord.Interaction, channel: discord.Text
     else:
         old_rank, new_rank = 25, 26
     image = await generate_placement_card(old_rank, new_rank, points, icon)
-    await target.send(file=discord.File(image, filename="mcwv-placement-test.png"))
+    file = discord.File(image, filename="mcwv-placement.png")
+    await target.send(embed=build_placement_embed(old_rank, new_rank, points), file=file)
     await interaction.followup.send(f"✅ Sent test placement card in {target.mention}.", ephemeral=True)
 
 
@@ -11015,13 +11016,14 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     arrow = [(ox+sc(414), bar[1]), (ox+sc(552), oy+sc(275)), (ox+sc(414), bar[3]), (ox+sc(506), bar[3]), (ox+sc(644), oy+sc(275)), (ox+sc(506), bar[1])]
     arrow2 = [(ox+sc(494), bar[1]), (ox+sc(632), oy+sc(275)), (ox+sc(494), bar[3]), (ox+sc(580), bar[3]), (ox+sc(718), oy+sc(275)), (ox+sc(580), bar[1])]
     chevron_main = tuple(min(255, int(v * 0.98)) for v in accent)
-    chevron_second = tuple(min(255, int(v * 0.78 + 18)) for v in accent)
-    d.polygon([(x+sc(4), y+sc(5)) for x, y in arrow], fill=(0, 0, 0, 58))
-    d.polygon([(x+sc(4), y+sc(5)) for x, y in arrow2], fill=(0, 0, 0, 44))
+    chevron_second = tuple(min(255, int(v * 0.82 + 14)) for v in accent)
     d.polygon(arrow, fill=(*chevron_main, 232))
-    d.polygon(arrow2, fill=(*chevron_second, 204))
-    d.line([arrow[0], arrow[1], arrow[4], arrow[5], arrow[0]], fill=(255, 255, 255, 48), width=sc(1))
-    d.line([arrow2[0], arrow2[1], arrow2[4], arrow2[5], arrow2[0]], fill=(255, 255, 255, 34), width=sc(1))
+    d.polygon(arrow2, fill=(*chevron_second, 202))
+    # Small top-left highlight only — no dark outline, so there are no black seams.
+    highlight = [(x - sc(1), y - sc(1)) for x, y in arrow]
+    highlight2 = [(x - sc(1), y - sc(1)) for x, y in arrow2]
+    d.line([highlight[0], highlight[1], highlight[4], highlight[5]], fill=(255, 255, 255, 34), width=sc(1))
+    d.line([highlight2[0], highlight2[1], highlight2[4], highlight2[5]], fill=(255, 255, 255, 22), width=sc(1))
 
     # Rank numbers centered vertically in each half of the bar.
     draw_aligned(
@@ -11063,6 +11065,22 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     out.seek(0)
     return out
 
+def build_placement_embed(old_rank, new_rank, points):
+    improved = int(new_rank) < int(old_rank)
+    diff = abs(int(old_rank) - int(new_rank))
+    direction = "Increased" if improved else "Decreased"
+    color = discord.Color.green() if improved else discord.Color.red()
+    embed = discord.Embed(
+        title=f"MCWV Position {direction} by {diff}",
+        description=f"**#{old_rank}** → **#{new_rank}** • Contributions **{format_compact_points(points)}**",
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_image(url="attachment://mcwv-placement.png")
+    embed.set_footer(text="MCWV Placement Alert")
+    return embed
+
+
 async def send_placement_alert(snapshot, old_rank):
     channel_id = get_placement_channel_id()
     if not channel_id:
@@ -11072,11 +11090,13 @@ async def send_placement_alert(snapshot, old_rank):
         print(f"[placement] channel not found/not text: {channel_id}")
         return False
     image = await generate_placement_card(old_rank, snapshot["rank"], snapshot["points"], snapshot.get("icon"))
-    await channel.send(file=discord.File(image, filename="mcwv-placement.png"))
+    file = discord.File(image, filename="mcwv-placement.png")
+    embed = build_placement_embed(old_rank, snapshot["rank"], snapshot["points"])
+    await channel.send(embed=embed, file=file)
     return True
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=30)
 async def placement_alert_loop():
     await bot.wait_until_ready()
     if not placement_alerts_enabled():
