@@ -11736,89 +11736,77 @@ def points_at_time_for_hourly(rows, target_ms):
 
 
 def fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=None):
-    if not db_enabled() or not user_ids:
+    """Return PPH using the same baseline rule as the Hub leaderboard cards.
+
+    Hub leaderboard PPH = current live points - snapshot baseline from the same
+    battle, preferring the latest snapshot at/before NOW()-1h, otherwise the
+    earliest snapshot after NOW()-1h while history is warming up. No interpolation
+    or point_history fallback here, so the hourly card matches profile cards.
+    """
+    ids = [str(value) for value in user_ids if str(value).strip()]
+    if not ids:
         return {}
+
+    zeroes = {rid: 0 for rid in ids}
+
+    if not db_enabled():
+        return zeroes
 
     try:
         ensure_db_connection()
         battle_keys = sorted({str(battle_id), normalize_hourly_battle_key(battle_id)})
-        ids = [str(value) for value in user_ids if str(value).strip()]
-        grouped = {rid: [] for rid in ids}
-        point_history_map = {rid: 0 for rid in ids}
+        baselines = {}
 
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS exists
             """)
-            history_exists = bool(cur.fetchone()[0])
-
-            if history_exists:
-                cur.execute("""
-                    SELECT roblox_id::text, points::bigint, captured_at
-                    FROM player_leaderboard_history
-                    WHERE battle_id = ANY(%s)
-                      AND roblox_id::text = ANY(%s)
-                      AND points IS NOT NULL
-                      AND captured_at >= NOW() - INTERVAL '2 hours'
-                    ORDER BY roblox_id::text ASC, captured_at ASC
-                """, (battle_keys, ids))
-                rows = cur.fetchall()
-            else:
-                rows = []
+            if not bool(cur.fetchone()[0]):
+                return zeroes
 
             cur.execute("""
-                SELECT to_regclass('public.point_history') IS NOT NULL AS exists
-            """)
-            point_history_exists = bool(cur.fetchone()[0])
+                WITH selected AS (
+                    SELECT unnest(%s::text[]) AS roblox_id
+                )
+                SELECT
+                    s.roblox_id,
+                    h.points::bigint AS hour_points,
+                    rh.points::bigint AS recent_points
+                FROM selected s
+                LEFT JOIN LATERAL (
+                    SELECT points
+                    FROM player_leaderboard_history p
+                    WHERE p.roblox_id::text = s.roblox_id
+                      AND p.battle_id = ANY(%s)
+                      AND p.points IS NOT NULL
+                      AND p.captured_at <= NOW() - INTERVAL '1 hour'
+                    ORDER BY p.captured_at DESC
+                    LIMIT 1
+                ) h ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT points
+                    FROM player_leaderboard_history p
+                    WHERE p.roblox_id::text = s.roblox_id
+                      AND p.battle_id = ANY(%s)
+                      AND p.points IS NOT NULL
+                      AND p.captured_at >= NOW() - INTERVAL '1 hour'
+                    ORDER BY p.captured_at ASC
+                    LIMIT 1
+                ) rh ON TRUE
+            """, (ids, battle_keys, battle_keys))
 
-            if point_history_exists:
-                if battle_start_ts:
-                    cur.execute("""
-                        SELECT user_id::text, COALESCE(SUM(points_added), 0)::bigint
-                        FROM point_history
-                        WHERE user_id::text = ANY(%s)
-                          AND created_at >= NOW() - INTERVAL '1 hour'
-                          AND created_at >= to_timestamp(%s)
-                        GROUP BY user_id::text
-                    """, (ids, int(battle_start_ts)))
-                else:
-                    cur.execute("""
-                        SELECT user_id::text, COALESCE(SUM(points_added), 0)::bigint
-                        FROM point_history
-                        WHERE user_id::text = ANY(%s)
-                          AND created_at >= NOW() - INTERVAL '1 hour'
-                        GROUP BY user_id::text
-                    """, (ids,))
+            for roblox_id, hour_points, recent_points in cur.fetchall():
+                baseline = hour_points if hour_points is not None else recent_points
+                if baseline is not None:
+                    baselines[str(roblox_id)] = int(baseline or 0)
 
-                for roblox_id, points in cur.fetchall():
-                    point_history_map[str(roblox_id)] = max(0, int(points or 0))
-
-        for roblox_id, points, captured_at in rows:
-            grouped.setdefault(str(roblox_id), []).append({
-                "points": int(points or 0),
-                "time": to_ms_for_hourly(captured_at),
-            })
-
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        cutoff_ms = now_ms - 60 * 60 * 1000
         result = {}
-
         for rid in ids:
             current = int(current_points.get(rid, 0) or 0)
-            if current <= 0:
+            if current <= 0 or rid not in baselines:
                 result[rid] = 0
-                continue
-
-            baseline = points_at_time_for_hourly(grouped.get(rid, []), cutoff_ms)
-            # Exact latest-60m value when snapshot history exists:
-            # current live points now minus interpolated points at now-60m.
-            if baseline is not None:
-                result[rid] = max(0, int(round(current - baseline)))
-                continue
-
-            # Fallback only while snapshot history is warming up. point_history is
-            # already clipped to NOW() - INTERVAL '1 hour' above.
-            result[rid] = int(point_history_map.get(rid, 0) or 0)
+            else:
+                result[rid] = max(0, int(current - baselines[rid]))
 
         return result
     except Exception as exc:
@@ -11827,7 +11815,7 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle
         except Exception:
             pass
         print(f"[hourly stats] history lookup failed: {exc}")
-        return {}
+        return zeroes
 
 
 def save_hourly_player_snapshot(payload):
@@ -12387,37 +12375,29 @@ async def send_hourly_ping_followup(channel, entries, threshold, message=None):
     if not targets:
         return 0
 
-    header = f"⚠️ **Hourly PPH check:** {len(targets)} linked member(s) under **{int(threshold)} PPH**.\n"
-    chunks = []
-    current = header
-
-    for target in targets:
-        part = f"{target['mention']} "
-        if len(current) + len(part) > 1900:
-            chunks.append(current.rstrip())
-            current = f"⚠️ **Continued under {int(threshold)} PPH:**\n{part}"
-        else:
-            current += part
-
     warning = render_hourly_ping_message(message, threshold, len(targets))
-    if warning:
-        addition = f"\n\n{warning}"
-        if len(current) + len(addition) <= 1900:
-            current += addition
-        else:
-            if current.strip():
-                chunks.append(current.rstrip())
-            current = warning
+    header = f"⚠️ **Hourly PPH check:** {len(targets)} linked member(s) under **{int(threshold)} PPH**.\n"
+    footer = f"\n\n{warning}" if warning else ""
+    max_len = 1900
+    available = max_len - len(header) - len(footer) - 20
 
-    if current.strip():
-        chunks.append(current.rstrip())
+    mentions = []
+    used = 0
+    for target in targets:
+        mention = f"{target['mention']} "
+        if used + len(mention) > available:
+            break
+        mentions.append(mention)
+        used += len(mention)
 
-    for chunk in chunks[:6]:
-        await channel.send(
-            content=chunk,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-        )
-        await asyncio.sleep(0.4)
+    omitted = max(0, len(targets) - len(mentions))
+    omitted_text = f"\n…and **{omitted}** more linked member(s)." if omitted else ""
+    content = f"{header}{''.join(mentions).rstrip()}{omitted_text}{footer}".strip()
+
+    await channel.send(
+        content=content[:2000],
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
 
     try:
         record_hourly_ping_targets(targets, threshold)
@@ -12427,7 +12407,12 @@ async def send_hourly_ping_followup(channel, entries, threshold, message=None):
     return len(targets)
 
 
-async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None):
+async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None, enforce_cooldown=True):
+    if enforce_cooldown:
+        remaining = hourly_stats_cooldown_remaining_seconds()
+        if remaining > 0:
+            raise ValueError(f"Hourly stats already sent this hour. Try again in {format_hourly_cooldown(remaining)}.")
+
     payload = await build_hourly_stats_payload()
     if not payload:
         raise ValueError("Could not load active war hourly stats.")
@@ -12504,8 +12489,7 @@ def hourly_stats_due_now():
     now_minute = int(now.timestamp() // 60)
     start_time = get_hourly_stats_start_time()
 
-    last_sent = db_get_setting("mcwv_hourly_stats_last_auto_sent_at", None) or db_get_setting("mcwv_hourly_stats_last_sent_at", None)
-    last_ms = parse_iso_ms(last_sent) if last_sent else None
+    last_ms = hourly_stats_last_sent_ms()
     if last_ms is not None and (now.timestamp() * 1000 - last_ms) < max(1, interval) * 60 * 1000 - 5000:
         return False
 
@@ -12518,6 +12502,34 @@ def hourly_stats_due_now():
         return (now_minute - start_minute) % interval == 0
 
     return True
+
+
+def hourly_stats_last_sent_ms():
+    values = []
+    for key in ("mcwv_hourly_stats_last_sent_at", "mcwv_hourly_stats_last_auto_sent_at"):
+        value = db_get_setting(key, None)
+        parsed = parse_iso_ms(value) if value else None
+        if parsed is not None:
+            values.append(parsed)
+    return max(values) if values else None
+
+
+def hourly_stats_cooldown_remaining_seconds():
+    last_ms = hourly_stats_last_sent_ms()
+    if last_ms is None:
+        return 0
+    interval_ms = max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60)) * 60 * 1000
+    elapsed_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - last_ms
+    remaining_ms = interval_ms - elapsed_ms
+    return max(0, math.ceil(remaining_ms / 1000))
+
+
+def format_hourly_cooldown(seconds):
+    seconds = max(0, int(seconds or 0))
+    minutes, sec = divmod(seconds, 60)
+    if minutes > 0:
+        return f"{minutes}m {sec}s"
+    return f"{sec}s"
 
 
 def get_hourly_stats_channel_id():
