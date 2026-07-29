@@ -11810,11 +11810,15 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle
                 continue
 
             baseline = points_at_time_for_hourly(grouped.get(rid, []), cutoff_ms)
-            snapshot_gain = max(0, int(round(current - baseline))) if baseline is not None else 0
-            # point_history logs real deltas over the last 60m. Use it as a fallback
-            # when snapshot history is still warming up, matching the Hub analytics approach.
-            delta_gain = int(point_history_map.get(rid, 0) or 0)
-            result[rid] = max(snapshot_gain, delta_gain)
+            # Exact latest-60m value when snapshot history exists:
+            # current live points now minus interpolated points at now-60m.
+            if baseline is not None:
+                result[rid] = max(0, int(round(current - baseline)))
+                continue
+
+            # Fallback only while snapshot history is warming up. point_history is
+            # already clipped to NOW() - INTERVAL '1 hour' above.
+            result[rid] = int(point_history_map.get(rid, 0) or 0)
 
         return result
     except Exception as exc:
@@ -12103,20 +12107,24 @@ async def generate_hourly_stats_card(payload):
     img.alpha_composite(strip)
     d = ImageDraw.Draw(img)
 
-    # Logo: cleaner neon ring. The old segmented arcs looked uneven around the logo,
-    # so this draws a near-continuous gradient ring with one intentional gap.
+    # Logo: clean full neon ring. Keep it symmetrical and avoid the broken-looking
+    # segmented gaps that appeared around the previous version.
     logo_center = (sc(112), sc(132))
     ring_r = sc(56)
-    alpha_round((logo_center[0] - sc(62), logo_center[1] - sc(62), logo_center[0] + sc(62), logo_center[1] + sc(62)), 64, (0, 0, 0, 92), blur=6)
+    alpha_round((logo_center[0] - sc(64), logo_center[1] - sc(64), logo_center[0] + sc(64), logo_center[1] + sc(64)), 66, (0, 0, 0, 96), blur=6)
+
     ring_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     rd = ImageDraw.Draw(ring_layer)
     ring_box = (logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r)
-    ring_colours = [(93, 111, 255), (72, 214, 177), (232, 205, 54), (248, 135, 43), (93, 111, 255)]
-    # Leave a small gap at top-left for the same premium-gauge feel as the ref,
-    # but keep everything else smooth and balanced.
-    start_angle = -42
-    sweep = 318
-    steps = 120
+    ring_colours = [
+        (93, 111, 255),
+        (72, 214, 177),
+        (232, 205, 54),
+        (248, 135, 43),
+        (201, 91, 255),
+        (93, 111, 255),
+    ]
+    steps = 180
     for step in range(steps):
         t = step / max(steps - 1, 1)
         colour_pos = t * (len(ring_colours) - 1)
@@ -12124,12 +12132,18 @@ async def generate_hourly_stats_card(payload):
         local = colour_pos - idx
         c1, c2 = ring_colours[idx], ring_colours[idx + 1]
         color = tuple(int(c1[i] + (c2[i] - c1[i]) * local) for i in range(3))
-        a0 = start_angle + sweep * t
-        a1 = start_angle + sweep * min(1, t + 1 / steps)
+        a0 = -90 + 360 * t
+        a1 = -90 + 360 * min(1, t + 1 / steps)
         rd.arc(ring_box, a0, a1, fill=(*color, 255), width=sc(5))
-    img.alpha_composite(ring_layer.filter(ImageFilter.GaussianBlur(sc(0.25))))
+
+    # Subtle glow/edge for a more finished circular badge.
+    glow_ring = ring_layer.filter(ImageFilter.GaussianBlur(sc(1.2)))
+    img.alpha_composite(glow_ring)
+    img.alpha_composite(ring_layer)
     d = ImageDraw.Draw(img)
-    d.ellipse((logo_center[0] - sc(46), logo_center[1] - sc(46), logo_center[0] + sc(46), logo_center[1] + sc(46)), fill=(11, 12, 29, 236), outline=(190, 195, 255, 90), width=sc(1))
+    d.ellipse((logo_center[0] - sc(60), logo_center[1] - sc(60), logo_center[0] + sc(60), logo_center[1] + sc(60)), outline=(255, 255, 255, 28), width=sc(1))
+    d.ellipse((logo_center[0] - sc(47), logo_center[1] - sc(47), logo_center[0] + sc(47), logo_center[1] + sc(47)), fill=(11, 12, 29, 238), outline=(190, 195, 255, 88), width=sc(1))
+
     asset_id = extract_asset_id(payload.get("icon"))
     icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
     if icon_bytes:
@@ -12218,17 +12232,33 @@ async def generate_hourly_stats_card(payload):
             dd.text((px + sc(18), y), rank_text, font=fonts["row_small"], fill=(*rank_fill, 255))
             dd.text((px + sc(68), y), name, font=fonts["row"], fill=(*name_fill, 255))
 
-            bar_x = px + sc(225)
-            bar_y = y + sc(6)
-            bar_w = sc(56)
-            dd.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + sc(8)), radius=sc(4), fill=(45, 51, 66, 255))
+            bar_x = px + sc(224)
+            bar_y = y + sc(7)
+            bar_w = sc(66)
+            bar_h = sc(7)
+            track = (43, 49, 63)
+            dd.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=sc(4), fill=(*track, 255))
+            dd.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=sc(4), outline=(88, 98, 122, 95), width=sc(1))
             fill_w = int(bar_w * (pph / max_pph)) if max_pph > 0 else 0
             if fill_w > 0:
-                dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(8)), radius=sc(4), fill=(*color, 255))
-                dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(3)), radius=sc(3), fill=(255, 255, 255, 32))
+                fill_w = max(sc(4), fill_w)
+                # Smooth tiny gradient instead of the old harsh white stripe.
+                fill_img = Image.new("RGBA", (fill_w, bar_h + 1), (0, 0, 0, 0))
+                fd = ImageDraw.Draw(fill_img)
+                for bx in range(fill_w):
+                    t = bx / max(fill_w - 1, 1)
+                    shade = 0.82 + 0.18 * t
+                    grad = tuple(min(255, int(color[i] * shade + 18 * (1 - t))) for i in range(3))
+                    fd.line((bx, 0, bx, bar_h + 1), fill=(*grad, 255))
+                fd.rounded_rectangle((1, 1, max(1, fill_w - 2), max(1, sc(2))), radius=sc(2), fill=(255, 255, 255, 34))
+                fill_mask = Image.new("L", fill_img.size, 0)
+                ImageDraw.Draw(fill_mask).rounded_rectangle((0, 0, fill_img.size[0] - 1, fill_img.size[1] - 1), radius=sc(4), fill=255)
+                img.paste(fill_img, (bar_x, bar_y), fill_mask)
+                dd = ImageDraw.Draw(img)
+                dd.rounded_rectangle((bar_x, bar_y, bar_x + fill_w, bar_y + bar_h), radius=sc(4), outline=(255, 255, 255, 42), width=sc(1))
             elif zero:
-                marker = (88, 100, 128) if all_zero else (197, 55, 74)
-                dd.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(*marker, 210))
+                marker = (92, 104, 132) if all_zero else (197, 55, 74)
+                dd.rounded_rectangle((bar_x, bar_y, bar_x + sc(3), bar_y + bar_h), radius=sc(2), fill=(*marker, 220))
 
             score = str(pph)
             right_text(dd, px + panel_w - sc(18), y, score, fonts["row_small"], (*score_fill, 255))
