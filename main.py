@@ -10967,49 +10967,53 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     bar = (ox + sc(38), oy + sc(182), ox + cw - sc(38), oy + sc(368))
     glass_panel(bar, radius=34, fill_alpha=118, outline_alpha=82)
 
-    # Rank transition bar: rich blue left side, clean colour wash on the right side.
+    # Rank transition bar: smoother left-to-right flow with a broad soft blend.
     bar_w, bar_h = bar[2] - bar[0], bar[3] - bar[1]
     bar_art = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
     bd = ImageDraw.Draw(bar_art)
+    base = (30, 43, 118)
+    mid = (36, 63, 126)
+    target = tuple(int(v * 0.70) for v in accent)
     for x in range(bar_w):
         t = x / max(bar_w - 1, 1)
-        if t < 0.48:
-            # Keep the left rank zone deep and readable.
-            r, g, b = (30, 43, 118)
-            a = 142
-        else:
-            mix = (t - 0.48) / 0.52
-            base = (30, 43, 118)
-            target = tuple(int(v * 0.78) for v in accent)
-            r = int((1 - mix) * base[0] + mix * target[0])
-            g = int((1 - mix) * base[1] + mix * target[1])
-            b = int((1 - mix) * base[2] + mix * target[2])
-            a = int(74 + 74 * mix)
-        bd.line((x, 0, x, bar_h), fill=(r, g, b, a))
+        # Smoothstep begins the colour flow before the chevron and finishes near the right edge.
+        flow = max(0.0, min(1.0, (t - 0.36) / 0.58))
+        flow = flow * flow * (3 - 2 * flow)
+        pre = max(0.0, min(1.0, t / 0.46))
+        pre = pre * pre * (3 - 2 * pre)
+        blue = tuple(int((1 - pre) * base[i] + pre * mid[i]) for i in range(3))
+        rgb = tuple(int((1 - flow) * blue[i] + flow * target[i]) for i in range(3))
+        a = int(126 + 36 * flow)
+        bd.line((x, 0, x, bar_h), fill=(*rgb, a))
 
-    # Center fade so the arrow blends instead of looking pasted on.
-    for x in range(int(bar_w * 0.38), int(bar_w * 0.62)):
-        mix = 1 - abs((x / bar_w) - 0.5) / 0.12
-        if mix > 0:
-            bd.line((x, 0, x, bar_h), fill=(*accent_2, int(16 * mix)))
+    # Subtle luminous band through the center to guide the eye along the transition.
+    for x in range(int(bar_w * 0.31), int(bar_w * 0.74)):
+        t = x / max(bar_w - 1, 1)
+        band = 1 - abs(t - 0.53) / 0.22
+        if band > 0:
+            band = band * band * (3 - 2 * band)
+            bd.line((x, 0, x, bar_h), fill=(*accent_2, int(18 * band)))
 
     img.paste(bar_art, (bar[0], bar[1]), rounded_mask((bar_w, bar_h), sc(34)))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle(bar, radius=sc(34), outline=(156, 170, 255, 118), width=sc(2))
     d.rounded_rectangle((bar[0]+sc(3), bar[1]+sc(3), bar[2]-sc(3), bar[3]-sc(3)), radius=sc(31), outline=(255, 255, 255, 22), width=sc(1))
 
-    # Sleek centre arrow: visible, but glassy and not overpowering.
+    # Chevrons: layered, aligned with the gradient flow, softly transparent.
     arrow_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     agd = ImageDraw.Draw(arrow_glow)
-    arrow = [(ox+sc(422), bar[1]), (ox+sc(555), oy+sc(275)), (ox+sc(422), bar[3]), (ox+sc(520), bar[3]), (ox+sc(653), oy+sc(275)), (ox+sc(520), bar[1])]
-    arrow2 = [(ox+sc(505), bar[1]), (ox+sc(638), oy+sc(275)), (ox+sc(505), bar[3]), (ox+sc(588), bar[3]), (ox+sc(720), oy+sc(275)), (ox+sc(588), bar[1])]
-    agd.polygon(arrow, fill=(*accent_2, 54))
-    agd.polygon(arrow2, fill=(*accent_2, 30))
-    arrow_glow = arrow_glow.filter(ImageFilter.GaussianBlur(sc(1.2)))
+    arrow = [(ox+sc(414), bar[1]), (ox+sc(552), oy+sc(275)), (ox+sc(414), bar[3]), (ox+sc(505), bar[3]), (ox+sc(642), oy+sc(275)), (ox+sc(505), bar[1])]
+    arrow2 = [(ox+sc(492), bar[1]), (ox+sc(630), oy+sc(275)), (ox+sc(492), bar[3]), (ox+sc(574), bar[3]), (ox+sc(712), oy+sc(275)), (ox+sc(574), bar[1])]
+    arrow3 = [(ox+sc(570), bar[1]), (ox+sc(704), oy+sc(275)), (ox+sc(570), bar[3]), (ox+sc(640), bar[3]), (ox+sc(774), oy+sc(275)), (ox+sc(640), bar[1])]
+    agd.polygon(arrow, fill=(*accent_2, 34))
+    agd.polygon(arrow2, fill=(*accent_2, 24))
+    agd.polygon(arrow3, fill=(*accent_2, 12))
+    arrow_glow = arrow_glow.filter(ImageFilter.GaussianBlur(sc(1.4)))
     img.alpha_composite(arrow_glow)
     d = ImageDraw.Draw(img)
-    d.polygon(arrow, fill=(*accent_2, 42))
-    d.polygon(arrow2, fill=(*accent_2, 22))
+    d.polygon(arrow, fill=(*accent_2, 28))
+    d.polygon(arrow2, fill=(*accent_2, 18))
+    d.polygon(arrow3, fill=(*accent_2, 8))
 
     # Rank numbers centered vertically in each half of the bar.
     draw_aligned(
