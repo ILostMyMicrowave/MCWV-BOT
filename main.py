@@ -11832,6 +11832,8 @@ async def build_hourly_stats_payload():
 
 
 async def generate_hourly_stats_card(payload):
+    # Polished dashboard-style hourly stats card. Coordinates are authored at
+    # 1355x804 and rendered at 2x for crisp Discord output.
     S = 2
     W, H = 1355 * S, 804 * S
 
@@ -11847,61 +11849,92 @@ async def generate_hourly_stats_card(payload):
 
     fonts = {
         "tag": font(34, True),
-        "badge_label": font(11, False),
+        "subtitle": font(13, False),
+        "badge_label": font(10, False),
         "badge_value": font(22, True),
         "stat_label": font(12, False),
-        "stat_value": font(38, True),
+        "stat_value": font(39, True),
+        "col_header": font(12, True),
         "row": font(17, True),
         "row_small": font(15, True),
+        "tiny": font(10, False),
     }
 
-    img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
-    overlay = Image.new("RGBA", (W, H), (4, 7, 18, 112))
-    img.alpha_composite(overlay)
+    def rounded_layer(box, radius, fill, outline=None, width=1, blur=0):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle(box, radius=sc(radius), fill=fill, outline=outline, width=sc(width) if outline else 1)
+        if blur:
+            layer = layer.filter(ImageFilter.GaussianBlur(sc(blur)))
+        img.alpha_composite(layer)
 
-    # Faint grid, like the reference, over the supplied galaxy background.
+    def centered_text(draw, box, text, font_obj, fill):
+        bbox = draw.textbbox((0, 0), str(text), font=font_obj)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = box[0] + ((box[2] - box[0]) - tw) // 2 - bbox[0]
+        y = box[1] + ((box[3] - box[1]) - th) // 2 - bbox[1]
+        draw.text((x, y), str(text), font=font_obj, fill=fill)
+
+    def right_text(draw, right_x, y, text, font_obj, fill):
+        bbox = draw.textbbox((0, 0), str(text), font=font_obj)
+        draw.text((right_x - (bbox[2] - bbox[0]), y), str(text), font=font_obj, fill=fill)
+
+    # Background: user's galaxy asset, darkened but still visible.
+    img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
+    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 122)))
+
+    # Faint grid and vignette.
     grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grid)
     for x in range(0, W, sc(54)):
-        gd.line((x, 0, x, H), fill=(120, 145, 190, 18), width=sc(1))
+        gd.line((x, 0, x, H), fill=(125, 145, 205, 17), width=sc(1))
     for y in range(0, H, sc(54)):
-        gd.line((0, y, W, y), fill=(120, 145, 190, 14), width=sc(1))
+        gd.line((0, y, W, y), fill=(125, 145, 205, 13), width=sc(1))
     img.alpha_composite(grid)
 
-    d = ImageDraw.Draw(img)
+    vignette = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(vignette)
+    vd.rectangle((0, 0, W, H), outline=(0, 0, 0, 0))
+    vd.ellipse((sc(-260), sc(-160), W + sc(260), H + sc(180)), outline=(0, 0, 0, 0), fill=(0, 0, 0, 0))
+    # Simple side darkening.
+    for x in range(W):
+        edge = min(x / max(sc(160), 1), (W - x) / max(sc(160), 1), 1)
+        alpha = int((1 - edge) * 95)
+        if alpha:
+            vd.line((x, 0, x, H), fill=(0, 0, 0, alpha))
+    img.alpha_composite(vignette)
+
+    # Main card shadow + glass panel.
     card = (sc(31), sc(28), sc(1324), sc(776))
+    rounded_layer((card[0] + sc(3), card[1] + sc(5), card[2] + sc(3), card[3] + sc(5)), 25, (0, 0, 0, 165), blur=7)
+    rounded_layer(card, 25, (15, 18, 31, 226), outline=(72, 82, 112, 195), width=2)
+    rounded_layer((card[0] + sc(2), card[1] + sc(2), card[2] - sc(2), card[3] - sc(2)), 23, (255, 255, 255, 0), outline=(255, 255, 255, 24), width=1)
 
-    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    sd.rounded_rectangle(card, radius=sc(25), fill=(0, 0, 0, 155))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
-    img.alpha_composite(shadow)
-
-    panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    pd = ImageDraw.Draw(panel)
-    pd.rounded_rectangle(card, radius=sc(25), fill=(20, 23, 36, 232), outline=(63, 70, 95, 185), width=sc(2))
-    pd.rounded_rectangle((card[0] + sc(2), card[1] + sc(2), card[2] - sc(2), card[3] - sc(2)), radius=sc(23), outline=(255, 255, 255, 16), width=sc(1))
-    img.alpha_composite(panel)
     d = ImageDraw.Draw(img)
 
-    # Top rainbow strip.
-    strip_x1, strip_y = sc(52), sc(49)
+    # Top rainbow strip with a soft glow.
+    strip_x1, strip_y = sc(52), sc(50)
     strip_x2 = sc(1303)
-    colours = [(92, 111, 255), (75, 205, 162), (232, 202, 53), (247, 129, 42), (248, 73, 82)]
+    colours = [(93, 111, 255), (72, 214, 177), (232, 205, 54), (248, 135, 43), (250, 72, 82)]
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    glow_d = ImageDraw.Draw(glow)
     for x in range(strip_x1, strip_x2):
         t = (x - strip_x1) / max(strip_x2 - strip_x1 - 1, 1)
         idx = min(int(t * (len(colours) - 1)), len(colours) - 2)
         local = (t - idx / (len(colours) - 1)) * (len(colours) - 1)
         c1, c2 = colours[idx], colours[idx + 1]
         color = tuple(int(c1[i] + (c2[i] - c1[i]) * local) for i in range(3))
-        d.line((x, strip_y, x, strip_y + sc(5)), fill=(*color, 255), width=sc(1))
+        glow_d.line((x, strip_y, x, strip_y + sc(5)), fill=(*color, 255), width=sc(1))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(sc(1.3))))
+    img.alpha_composite(glow)
+    d = ImageDraw.Draw(img)
 
-    # Logo.
-    logo_center = (sc(113), sc(132))
+    # Logo with segmented ring.
+    logo_center = (sc(112), sc(132))
     ring_r = sc(55)
-    for start, color in [(0, (248, 129, 42)), (80, (232, 202, 53)), (165, (75, 205, 162)), (250, (92, 111, 255))]:
-        d.arc((logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r), start, start + 78, fill=(*color, 255), width=sc(5))
-    d.ellipse((logo_center[0] - sc(46), logo_center[1] - sc(46), logo_center[0] + sc(46), logo_center[1] + sc(46)), fill=(12, 13, 31, 230), outline=(190, 195, 255, 80), width=sc(1))
+    for start, color in [(315, (93, 111, 255)), (35, (72, 214, 177)), (135, (232, 205, 54)), (230, (248, 135, 43))]:
+        d.arc((logo_center[0] - ring_r, logo_center[1] - ring_r, logo_center[0] + ring_r, logo_center[1] + ring_r), start, start + 74, fill=(*color, 255), width=sc(5))
+    d.ellipse((logo_center[0] - sc(46), logo_center[1] - sc(46), logo_center[0] + sc(46), logo_center[1] + sc(46)), fill=(11, 12, 29, 236), outline=(190, 195, 255, 90), width=sc(1))
     asset_id = extract_asset_id(payload.get("icon"))
     icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
     if icon_bytes:
@@ -11911,45 +11944,44 @@ async def generate_hourly_stats_card(payload):
             ImageDraw.Draw(mask).ellipse((0, 0, icon.size[0] - 1, icon.size[1] - 1), fill=255)
             img.paste(icon, (logo_center[0] - icon.size[0] // 2, logo_center[1] - icon.size[1] // 2), mask)
         except Exception:
-            d.text((sc(78), sc(117)), CLAN_NAME, font=font(18, True), fill=(204, 98, 255, 255))
+            d.text((sc(78), sc(116)), CLAN_NAME, font=font(18, True), fill=(207, 98, 255, 255))
     else:
-        d.text((sc(78), sc(117)), CLAN_NAME, font=font(18, True), fill=(204, 98, 255, 255))
+        d.text((sc(78), sc(116)), CLAN_NAME, font=font(18, True), fill=(207, 98, 255, 255))
 
+    # Header tag.
     clan_text = f"[{payload.get('clanName') or CLAN_NAME}]"
-    clan_text_x = sc(181)
-    clan_text_y = sc(112)
-    draw_gradient_text_on_image(img, (clan_text_x, clan_text_y), clan_text, fonts["tag"], (46, 222, 217), (249, 91, 51))
+    clan_x, clan_y = sc(181), sc(111)
+    draw_gradient_text_on_image(img, (clan_x, clan_y), clan_text, fonts["tag"], (45, 225, 215), (249, 91, 51))
     d = ImageDraw.Draw(img)
+    d.text((clan_x + sc(2), sc(152)), "LATEST 60 MINUTES • SORTED BY HOURLY GAIN", font=fonts["subtitle"], fill=(145, 153, 178, 255))
 
     clan_bbox = d.textbbox((0, 0), clan_text, font=fonts["tag"])
     clan_text_w = clan_bbox[2] - clan_bbox[0]
 
-    def small_badge(box, label, value, accent):
-        d.rounded_rectangle(box, radius=sc(10), fill=(25, 28, 45, 230), outline=(*accent, 145), width=sc(1))
-        label_bbox = d.textbbox((0, 0), label, font=fonts["badge_label"])
-        label_w = label_bbox[2] - label_bbox[0]
-        d.text((box[0] + ((box[2] - box[0]) - label_w) // 2, box[1] + sc(8)), label, font=fonts["badge_label"], fill=(160, 165, 184, 255))
-        value_bbox = d.textbbox((0, 0), value, font=fonts["badge_value"])
-        value_w = value_bbox[2] - value_bbox[0]
-        d.text((box[0] + ((box[2] - box[0]) - value_w) // 2, box[1] + sc(23)), value, font=fonts["badge_value"], fill=(*accent, 255))
+    def small_badge(x, label, value, accent, width=126):
+        box = (x, sc(110), x + sc(width), sc(158))
+        rounded_layer(box, 10, (22, 25, 43, 224), outline=(*accent, 130), width=1)
+        dd = ImageDraw.Draw(img)
+        centered_text(dd, (box[0], box[1] + sc(5), box[2], box[1] + sc(20)), label.upper(), fonts["badge_label"], (155, 162, 184, 255))
+        centered_text(dd, (box[0], box[1] + sc(21), box[2], box[3] - sc(3)), value, fonts["badge_value"], (*accent, 255))
 
-    # Keep the badges clear of the clan tag. The old layout started the Clan Rank
-    # badge too early, which made the closing bracket look clipped/covered.
-    badge1_x = max(sc(352), clan_text_x + clan_text_w + sc(32))
-    badge2_x = badge1_x + sc(132)
-    small_badge((badge1_x, sc(110), badge1_x + sc(118), sc(158)), "Clan Rank", f"#{payload.get('rank') or '—'}", (238, 196, 56))
-    small_badge((badge2_x, sc(110), badge2_x + sc(128), sc(158)), "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (79, 196, 236))
+    badge1_x = max(sc(360), clan_x + clan_text_w + sc(34))
+    badge2_x = badge1_x + sc(142)
+    small_badge(badge1_x, "Clan Rank", f"#{payload.get('rank') or '—'}", (239, 198, 58), width=120)
+    small_badge(badge2_x, "Hourly Points", format_hourly_points(payload.get("hourlyPoints", 0)), (82, 200, 240), width=132)
 
+    # Top-right stat cards.
     def stat_box(x, label, value, accent):
         box = (sc(x), sc(94), sc(x + 135), sc(172))
-        d.rounded_rectangle(box, radius=sc(13), fill=(26, 29, 47, 230), outline=(*accent, 96), width=sc(1))
-        d.text((box[0] + sc(13), box[1] + sc(16)), label, font=fonts["stat_label"], fill=(160, 165, 184, 255))
-        d.text((box[0] + sc(13), box[1] + sc(34)), str(value), font=fonts["stat_value"], fill=(245, 246, 255, 255))
-        d.rounded_rectangle((box[2] - sc(24), box[1] + sc(22), box[2] - sc(12), box[3] - sc(20)), radius=sc(6), fill=(*accent, 255))
+        rounded_layer(box, 13, (22, 25, 43, 226), outline=(*accent, 110), width=1)
+        dd = ImageDraw.Draw(img)
+        dd.text((box[0] + sc(13), box[1] + sc(15)), label, font=fonts["stat_label"], fill=(158, 166, 190, 255))
+        dd.text((box[0] + sc(13), box[1] + sc(33)), str(value), font=fonts["stat_value"], fill=(247, 248, 255, 255))
+        dd.rounded_rectangle((box[2] - sc(24), box[1] + sc(22), box[2] - sc(12), box[3] - sc(20)), radius=sc(6), fill=(*accent, 255))
 
-    stat_box(858, "Players", payload.get("players", 0), (92, 111, 255))
+    stat_box(858, "Players", payload.get("players", 0), (93, 111, 255))
     stat_box(1012, "Active", payload.get("active", 0), (75, 205, 120))
-    stat_box(1167, "Zero", payload.get("zero", 0), (248, 73, 82))
+    stat_box(1167, "Zero", payload.get("zero", 0), (250, 72, 82))
 
     entries = list(payload.get("entries") or [])
     total_hourly = int(payload.get("hourlyPoints") or 0)
@@ -11962,44 +11994,60 @@ async def generate_hourly_stats_card(payload):
 
     for col_idx, col_entries in enumerate(columns):
         px = panel_xs[col_idx]
-        d.rounded_rectangle((px, panel_y, px + panel_w, panel_y + panel_h), radius=sc(15), fill=(13, 16, 29, 198), outline=(55, 61, 82, 180), width=sc(2))
+        rounded_layer((px, panel_y, px + panel_w, panel_y + panel_h), 15, (10, 13, 25, 207), outline=(58, 66, 92, 190), width=2)
+        dd = ImageDraw.Draw(img)
+        # Column inner highlight.
+        dd.rounded_rectangle((px + sc(2), panel_y + sc(2), px + panel_w - sc(2), panel_y + sc(24)), radius=sc(13), fill=(255, 255, 255, 10))
+        dd.text((px + sc(18), panel_y + sc(12)), "#", font=fonts["col_header"], fill=(105, 114, 139, 255))
+        dd.text((px + sc(68), panel_y + sc(12)), "PLAYER", font=fonts["col_header"], fill=(105, 114, 139, 255))
+        right_text(dd, px + panel_w - sc(18), panel_y + sc(12), "60M", fonts["col_header"], (105, 114, 139, 255))
+
         for row_idx, entry in enumerate(col_entries):
             global_idx = col_idx * 25 + row_idx
-            y = sc(226) + sc(row_idx * 20.4)
-            if row_idx % 2 == 0:
-                d.rounded_rectangle((px + sc(10), y - sc(1), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(36, 39, 53, 138))
+            y = sc(229) + sc(row_idx * 20.0)
             pph = int(entry.get("pph") or 0)
             zero = pph <= 0
             color = (112, 122, 148) if all_zero else hourly_colour(global_idx, max(len(entries), 1), zero=zero)
+
+            if row_idx % 2 == 0:
+                dd.rounded_rectangle((px + sc(10), y - sc(2), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(38, 42, 57, 140))
+            elif global_idx < 3 and not zero:
+                dd.rounded_rectangle((px + sc(10), y - sc(2), px + panel_w - sc(10), y + sc(18)), radius=sc(5), fill=(*color, 30))
+
             rank_text = f"{global_idx + 1:02d}"
-            name = fit_text(d, str(entry.get("name") or entry.get("robloxId") or "Unknown"), fonts["row"], sc(145))
-            rank_fill = color if not zero else (152, 158, 174)
-            name_fill = (240, 242, 250) if not zero else ((176, 184, 205) if all_zero else (218, 89, 104))
+            name = fit_text(dd, str(entry.get("name") or entry.get("robloxId") or "Unknown"), fonts["row"], sc(150))
+            rank_fill = color if not zero else (145, 154, 178)
+            name_fill = (246, 247, 252) if not zero else ((176, 184, 205) if all_zero else (226, 96, 108))
             score_fill = color if not zero else ((152, 160, 184) if all_zero else (145, 151, 168))
-            d.text((px + sc(18), y), rank_text, font=fonts["row_small"], fill=(*rank_fill, 255))
-            d.text((px + sc(68), y), name, font=fonts["row"], fill=(*name_fill, 255))
+
+            dd.text((px + sc(18), y), rank_text, font=fonts["row_small"], fill=(*rank_fill, 255))
+            dd.text((px + sc(68), y), name, font=fonts["row"], fill=(*name_fill, 255))
 
             bar_x = px + sc(225)
             bar_y = y + sc(6)
-            bar_w = sc(55)
-            d.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + sc(8)), radius=sc(4), fill=(49, 55, 68, 255))
+            bar_w = sc(56)
+            dd.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + sc(8)), radius=sc(4), fill=(45, 51, 66, 255))
             fill_w = int(bar_w * (pph / max_pph)) if max_pph > 0 else 0
             if fill_w > 0:
-                d.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(8)), radius=sc(4), fill=(*color, 255))
+                dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(8)), radius=sc(4), fill=(*color, 255))
+                dd.rounded_rectangle((bar_x, bar_y, bar_x + max(sc(3), fill_w), bar_y + sc(3)), radius=sc(3), fill=(255, 255, 255, 34))
             elif zero:
-                marker = (90, 102, 132) if all_zero else (196, 53, 73)
-                d.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(*marker, 210))
+                marker = (88, 100, 128) if all_zero else (197, 55, 74)
+                dd.rectangle((bar_x, bar_y, bar_x + sc(2), bar_y + sc(8)), fill=(*marker, 210))
 
             score = str(pph)
-            score_bbox = d.textbbox((0, 0), score, font=fonts["row_small"])
-            d.text((px + panel_w - sc(18) - (score_bbox[2] - score_bbox[0]), y), score, font=fonts["row_small"], fill=(*score_fill, 255))
+            right_text(dd, px + panel_w - sc(18), y, score, fonts["row_small"], (*score_fill, 255))
+
+    # Tiny timestamp in the bottom-right, outside the row content.
+    d = ImageDraw.Draw(img)
+    updated = datetime.now(timezone.utc).strftime("Updated %H:%M UTC")
+    right_text(d, sc(1300), sc(754), updated, fonts["tiny"], (120, 129, 155, 210))
 
     out = BytesIO()
     img = img.resize((1355, 804), Image.Resampling.LANCZOS)
     img.save(out, format="PNG")
     out.seek(0)
     return out
-
 
 async def send_hourly_stats_card(channel):
     payload = await build_hourly_stats_payload()
