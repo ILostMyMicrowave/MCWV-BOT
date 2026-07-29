@@ -11779,19 +11779,17 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
             latest_points = int(latest["points"] or 0)
             hourly_cutoff = int(latest["time"] or 0) - 60 * 60 * 1000
 
-            baseline = None
-            for row in reversed(rows):
-                if int(row["time"] or 0) <= hourly_cutoff:
-                    baseline = row
-                    break
-
+            # Exact 60-minute cutoff against the snapshot timeline. If the cutoff
+            # sits between two snapshots, interpolate the baseline at that exact
+            # timestamp instead of using an older/nearer row. If we do not have a
+            # full 60-minute window yet, do not fake a PPH value.
+            baseline = points_at_time_for_hourly(rows, hourly_cutoff)
             if baseline is None:
-                # No full 60-minute window yet. Do not fake a PPH value.
                 result[rid] = {"pph": 0, "ready": False}
                 continue
 
             result[rid] = {
-                "pph": max(0, latest_points - int(baseline.get("points") or 0)),
+                "pph": max(0, int(round(latest_points - baseline))),
                 "ready": True,
             }
 
