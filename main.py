@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from io import BytesIO
 import math
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time
 import json
 
@@ -10436,7 +10436,7 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         print("[status error]", e)
         await interaction.followup.send("❌ Error", ephemeral=True)
         import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import tasks
 
@@ -11891,10 +11891,170 @@ def draw_gradient_text_on_image(img, xy, text, font, left_color, right_color, sh
     img.paste(gradient, (x + bbox[0] - 2, y + bbox[1] - 2), mask)
 
 
-async def build_hourly_stats_payload():
+def hourly_exact_slot_iso(value):
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    else:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return dt.astimezone(timezone.utc).replace(second=0, microsecond=0).isoformat()
+
+
+def ensure_hourly_exact_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS hourly_stats_player_snapshots (
+            id BIGSERIAL PRIMARY KEY,
+            battle_id TEXT NOT NULL,
+            roblox_id TEXT NOT NULL,
+            username TEXT,
+            rank INTEGER,
+            points BIGINT NOT NULL DEFAULT 0,
+            scheduled_at TIMESTAMPTZ NOT NULL,
+            captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS hourly_stats_player_snapshots_unique_idx
+        ON hourly_stats_player_snapshots (battle_id, roblox_id, scheduled_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS hourly_stats_player_snapshots_battle_time_idx
+        ON hourly_stats_player_snapshots (battle_id, scheduled_at DESC)
+    """)
+
+
+def save_hourly_exact_snapshot(battle_id, scheduled_at, entries):
+    if not db_enabled() or not entries:
+        return False
+    try:
+        ensure_db_connection()
+        battle_key = normalize_hourly_battle_key(battle_id)
+        scheduled_dt = scheduled_at if isinstance(scheduled_at, datetime) else datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
+        scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        with conn.cursor() as cur:
+            ensure_hourly_exact_table(cur)
+            values = []
+            for entry in entries:
+                values.append((
+                    battle_key,
+                    str(entry.get("robloxId") or ""),
+                    str(entry.get("name") or entry.get("robloxId") or "Unknown"),
+                    int(entry.get("currentRank") or 0),
+                    int(entry.get("points") or 0),
+                    scheduled_dt,
+                ))
+            cur.executemany("""
+                INSERT INTO hourly_stats_player_snapshots
+                    (battle_id, roblox_id, username, rank, points, scheduled_at, captured_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (battle_id, roblox_id, scheduled_at)
+                DO UPDATE SET
+                    username = EXCLUDED.username,
+                    rank = EXCLUDED.rank,
+                    points = EXCLUDED.points,
+                    captured_at = NOW()
+            """, values)
+        conn.commit()
+        return True
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[hourly stats] exact snapshot save failed: {exc}")
+        return False
+
+
+def load_hourly_exact_entries(battle_id, scheduled_at):
+    if not db_enabled():
+        return None
+    try:
+        ensure_db_connection()
+        battle_key = normalize_hourly_battle_key(battle_id)
+        scheduled_dt = scheduled_at if isinstance(scheduled_at, datetime) else datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
+        scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        previous_dt = scheduled_dt - timedelta(minutes=max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60)))
+        with conn.cursor() as cur:
+            ensure_hourly_exact_table(cur)
+            cur.execute("""
+                SELECT
+                    c.roblox_id,
+                    c.username,
+                    c.rank,
+                    c.points,
+                    p.points AS previous_points
+                FROM hourly_stats_player_snapshots c
+                LEFT JOIN hourly_stats_player_snapshots p
+                  ON p.battle_id = c.battle_id
+                 AND p.roblox_id = c.roblox_id
+                 AND p.scheduled_at = %s
+                WHERE c.battle_id = %s
+                  AND c.scheduled_at = %s
+                ORDER BY COALESCE(c.rank, 999999), LOWER(c.username), c.roblox_id
+            """, (previous_dt, battle_key, scheduled_dt))
+            rows = cur.fetchall()
+        if not rows:
+            return None
+        entries = []
+        for roblox_id, username, rank, points, previous_points in rows:
+            ready = previous_points is not None
+            pph = max(0, int(points or 0) - int(previous_points or 0)) if ready else 0
+            entries.append({
+                "robloxId": str(roblox_id),
+                "name": str(username or roblox_id),
+                "displayName": str(username or roblox_id),
+                "points": int(points or 0),
+                "currentRank": int(rank or 0) if rank else None,
+                "pph": pph,
+                "pphReady": ready,
+            })
+        return entries
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[hourly stats] exact snapshot load failed: {exc}")
+        return None
+
+
+def get_latest_hourly_exact_slot(battle_id=None):
+    if not db_enabled():
+        return None
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            ensure_hourly_exact_table(cur)
+            if battle_id:
+                cur.execute("""
+                    SELECT MAX(scheduled_at)
+                    FROM hourly_stats_player_snapshots
+                    WHERE battle_id = %s
+                """, (normalize_hourly_battle_key(battle_id),))
+            else:
+                cur.execute("SELECT MAX(scheduled_at) FROM hourly_stats_player_snapshots")
+            row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
+async def build_hourly_stats_payload(scheduled_at=None, use_latest_exact=False):
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         return None
+
+    scheduled_dt = None
+    if use_latest_exact:
+        scheduled_dt = get_latest_hourly_exact_slot(battle_id)
+    if scheduled_dt is None:
+        scheduled_dt = scheduled_at or datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    if not isinstance(scheduled_dt, datetime):
+        scheduled_dt = datetime.fromisoformat(str(scheduled_dt).replace("Z", "+00:00"))
+    scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
     active_payload = await fetch_json_for_placement(ACTIVE_BATTLE_API)
     active_data = active_payload.get("data", {}) if isinstance(active_payload, dict) else {}
@@ -11926,8 +12086,6 @@ async def build_hourly_stats_payload():
             continue
 
     members = extract_clan_members(data)
-    # Match the roster count used by the existing hourly bot: current clan members.
-    # Fallback to contributions only if the clan Members block is unavailable.
     roster_ids = set(members.keys()) or set(current_points.keys())
     user_ids = sorted(roster_ids, key=lambda item: int(item) if str(item).isdigit() else 0)
     if not user_ids:
@@ -11935,11 +12093,11 @@ async def build_hourly_stats_payload():
 
     users = await fetch_roblox_users_for_logs(user_ids)
 
-    entries = []
+    base_entries = []
     for rid in user_ids:
         info = users.get(int(rid), {}) if str(rid).isdigit() else {}
         name = str(info.get("name") or rid)
-        entries.append({
+        base_entries.append({
             "robloxId": rid,
             "name": name,
             "displayName": str(info.get("displayName") or name),
@@ -11949,40 +12107,37 @@ async def build_hourly_stats_payload():
 
     war_rank_by_id = {
         entry["robloxId"]: index + 1
-        for index, entry in enumerate(sorted(entries, key=lambda item: (-int(item.get("points") or 0), item["name"].lower())))
+        for index, entry in enumerate(sorted(base_entries, key=lambda item: (-int(item.get("points") or 0), item["name"].lower())))
     }
-    for entry in entries:
+    for entry in base_entries:
         entry["currentRank"] = war_rank_by_id.get(entry["robloxId"])
 
-    # Save the latest live points before reading PPH. This makes the hourly card
-    # and profile cards agree after the card is sent because they share the same
-    # latest player_leaderboard_history snapshot.
-    save_hourly_player_snapshot({"battleId": battle_id, "entries": entries})
+    # For the exact scheduled hourly card, save one snapshot for the scheduled slot,
+    # then compare only against the previous scheduled slot. No interpolation, no
+    # current rolling window: exactly one interval boundary to the next.
+    save_hourly_exact_snapshot(battle_id, scheduled_dt, base_entries)
+    save_hourly_player_snapshot({"battleId": battle_id, "entries": base_entries})
 
-    pph_map = fetch_hourly_points_from_history(battle_id, user_ids, current_points, battle_start_ts=battle_start_ts)
+    entries = load_hourly_exact_entries(battle_id, scheduled_dt) or base_entries
     for entry in entries:
-        pph_info = pph_map.get(str(entry["robloxId"]), {"pph": 0, "ready": False})
-        if isinstance(pph_info, dict):
-            entry["pph"] = int(pph_info.get("pph") or 0)
-            entry["pphReady"] = bool(pph_info.get("ready"))
-        else:
-            entry["pph"] = int(pph_info or 0)
-            entry["pphReady"] = True
+        entry.setdefault("pphReady", False)
+        entry.setdefault("pph", 0)
 
-    entries.sort(key=lambda item: (not bool(item.get("pphReady")), -int(item["pph"]), item["name"].lower()))
+    entries.sort(key=lambda item: (not bool(item.get("pphReady")), -int(item.get("pph") or 0), item.get("name", "").lower()))
 
     overview = await get_big_games_index_clan_overview()
     clan_rank = (overview or {}).get("rank") or pick_first_int(battle, ("Place", "place", "Rank", "rank", "Position", "position"))
-    total_hourly = sum(int(entry["pph"] or 0) for entry in entries if entry.get("pphReady"))
+    total_hourly = sum(int(entry.get("pph") or 0) for entry in entries if entry.get("pphReady"))
 
     return {
         "battleId": battle_id,
+        "scheduledAt": scheduled_dt.isoformat(),
         "clanName": str(data.get("Name") or CLAN_NAME),
         "icon": data.get("Icon"),
         "rank": clan_rank,
         "players": len(entries),
-        "active": sum(1 for entry in entries if entry.get("pphReady") and int(entry["pph"] or 0) > 0),
-        "zero": sum(1 for entry in entries if entry.get("pphReady") and int(entry["pph"] or 0) <= 0),
+        "active": sum(1 for entry in entries if entry.get("pphReady") and int(entry.get("pph") or 0) > 0),
+        "zero": sum(1 for entry in entries if entry.get("pphReady") and int(entry.get("pph") or 0) <= 0),
         "warmingUp": sum(1 for entry in entries if not entry.get("pphReady")),
         "hourlyPoints": total_hourly,
         "entries": entries,
@@ -12325,7 +12480,11 @@ async def generate_hourly_stats_card(payload):
 
     # Tiny timestamp in the bottom-right.
     d = ImageDraw.Draw(img)
-    updated = datetime.now(timezone.utc).strftime("Updated %H:%M UTC")
+    try:
+        stamp_dt = datetime.fromisoformat(str(payload.get("scheduledAt") or "").replace("Z", "+00:00"))
+    except Exception:
+        stamp_dt = datetime.now(timezone.utc)
+    updated = stamp_dt.astimezone(timezone.utc).strftime("Slot %H:%M UTC")
     right_text(d, sc(1300), sc(754), updated, fonts["tiny"], (120, 129, 155, 190))
 
     out = BytesIO()
@@ -12479,8 +12638,8 @@ async def send_hourly_ping_followup(channel, entries, threshold, message=None):
     return len(targets)
 
 
-async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None):
-    payload = await build_hourly_stats_payload()
+async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None, ping_message=None, scheduled_at=None, use_latest_exact=False):
+    payload = await build_hourly_stats_payload(scheduled_at=scheduled_at, use_latest_exact=use_latest_exact)
     if not payload:
         raise ValueError("Could not load active war hourly stats.")
     image = await generate_hourly_stats_card(payload)
@@ -12550,25 +12709,35 @@ def parse_iso_ms(value):
         return None
 
 
-def hourly_stats_due_now():
+def get_hourly_stats_due_slot(now=None):
     interval = max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60))
-    now = datetime.now(timezone.utc)
-    now_minute = int(now.timestamp() // 60)
+    now = now or datetime.now(timezone.utc)
+    now = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
     start_time = get_hourly_stats_start_time()
-
-    last_ms = hourly_stats_last_auto_sent_ms()
-    if last_ms is not None and (now.timestamp() * 1000 - last_ms) < max(1, interval) * 60 * 1000 - 5000:
-        return False
 
     if start_time:
         hour, minute = [int(part) for part in start_time.split(":", 1)]
-        start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        start_minute = int(start.timestamp() // 60)
-        if now_minute < start_minute:
-            start_minute -= 24 * 60
-        return (now_minute - start_minute) % interval == 0
+        anchor = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        while anchor > now:
+            anchor -= timedelta(days=1)
+    else:
+        # No custom start: exact top-of-hour schedule.
+        anchor = now.replace(minute=0, second=0, microsecond=0)
 
-    return True
+    elapsed_minutes = int((now - anchor).total_seconds() // 60)
+    slot = anchor + timedelta(minutes=(elapsed_minutes // interval) * interval)
+
+    # Only collect in the first ~90 seconds of the scheduled slot. If Render is
+    # late by a minute, it still sends; if the service was asleep/deploying for
+    # longer, skip the missed slot instead of collecting inaccurate late data.
+    delay_seconds = (datetime.now(timezone.utc) - slot).total_seconds()
+    if delay_seconds < -5 or delay_seconds > 90:
+        return None
+    return slot
+
+
+def hourly_stats_due_now():
+    return get_hourly_stats_due_slot() is not None
 
 
 def hourly_stats_last_auto_sent_ms():
@@ -12589,11 +12758,18 @@ def hourly_stats_auto_cooldown_remaining_seconds():
 def reserve_hourly_stats_auto_slot():
     """Atomically reserve the next automated hourly send slot.
 
-    This protects against duplicate automated sends even if two bot loops/processes
-    briefly overlap during deploys. Manual /hourly_stats does not use this.
+    Returns the scheduled slot datetime if this process should collect/send, or
+    None if the slot is not due/already reserved. Manual /hourly_stats does not
+    use this.
     """
+    slot = get_hourly_stats_due_slot()
+    if slot is None:
+        return None
+
+    slot_iso = slot.isoformat()
+
     if not db_enabled():
-        return hourly_stats_due_now()
+        return slot
 
     lock_key = 294_729_601
     locked = False
@@ -12604,16 +12780,23 @@ def reserve_hourly_stats_auto_slot():
             locked = bool(cur.fetchone()[0])
 
         if not locked:
-            return False
+            return None
 
-        if not hourly_stats_due_now():
-            return False
+        # Re-check inside the lock to prevent overlap during deploys/restarts.
+        current_slot = get_hourly_stats_due_slot()
+        if current_slot is None or current_slot.isoformat() != slot_iso:
+            return None
 
+        last_slot = str(db_get_setting("mcwv_hourly_stats_last_auto_slot", "") or "")
+        if last_slot == slot_iso:
+            return None
+
+        db_set_setting("mcwv_hourly_stats_last_auto_slot", slot_iso)
         db_set_setting("mcwv_hourly_stats_last_auto_sent_at", _now_iso())
-        return True
+        return slot
     except Exception as exc:
         print(f"[hourly stats] auto slot reserve failed: {exc}")
-        return False
+        return None
     finally:
         if locked:
             try:
@@ -12658,12 +12841,13 @@ async def hourly_stats_loop():
         print(f"[hourly stats] channel not found/not text: {channel_id}")
         return
 
-    if not reserve_hourly_stats_auto_slot():
+    scheduled_slot = reserve_hourly_stats_auto_slot()
+    if scheduled_slot is None:
         return
 
     try:
-        await send_hourly_stats_card(channel)
-        print(f"[hourly stats] card sent to {channel_id}")
+        await send_hourly_stats_card(channel, scheduled_at=scheduled_slot)
+        print(f"[hourly stats] card sent to {channel_id} for slot {scheduled_slot.isoformat()}")
     except Exception as exc:
         print(f"[hourly stats] auto-send failed: {exc}")
 
