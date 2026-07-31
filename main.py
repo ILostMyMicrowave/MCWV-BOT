@@ -6767,7 +6767,8 @@ async def accept_application_ticket(interaction, ticket_row):
             accepted_by=interaction.user.id,
         )
         actions.append("Ticket marked accepted")
-        actions.append("Website signup is ready")
+        if MCWV_HUB_LINKS_ENABLED:
+            actions.append("Website signup is ready")
 
     status_embed = discord.Embed(
         title="Application Accepted" if ok else "Application Accept Failed",
@@ -6790,16 +6791,17 @@ async def accept_application_ticket(interaction, ticket_row):
             value="\n".join(f"⚠️ {item}" for item in errors)[:1024],
             inline=False,
         )
-    status_embed.add_field(
-        name="Hub Profile",
-        value=f"https://mcwv-hub.vercel.app/profile/{roblox_id}",
-        inline=False,
-    )
-    status_embed.add_field(
-        name="Hub Signup",
-        value="https://mcwv-hub.vercel.app/signup",
-        inline=False,
-    )
+    if MCWV_HUB_LINKS_ENABLED:
+        status_embed.add_field(
+            name="Hub Profile",
+            value=f"https://mcwv-hub.vercel.app/profile/{roblox_id}",
+            inline=False,
+        )
+        status_embed.add_field(
+            name="Hub Signup",
+            value="https://mcwv-hub.vercel.app/signup",
+            inline=False,
+        )
     status_embed.set_footer(text="Ticket stays open for next steps")
 
     if channel:
@@ -6808,23 +6810,33 @@ async def accept_application_ticket(interaction, ticket_row):
 
     if ok:
         try:
-            dm_embed = discord.Embed(
-                title="Welcome to MCWV!",
-                description=(
+            if MCWV_HUB_LINKS_ENABLED:
+                dm_description = (
                     f"You have been accepted into **MCWV**, {applicant.mention}!\n\n"
                     f"Your Roblox account has been linked as **{roblox_name}**.\n"
                     "You can now create your MCWV Hub login using the link below."
-                ),
+                )
+            else:
+                dm_description = (
+                    f"You have been accepted into **MCWV**, {applicant.mention}!\n\n"
+                    f"Your Roblox account has been linked as **{roblox_name}**.\n"
+                    "Staff will continue next steps with you in your ticket."
+                )
+
+            dm_embed = discord.Embed(
+                title="Welcome to MCWV!",
+                description=dm_description,
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc),
             )
-            dm_embed.add_field(name="Create your Hub account", value="https://mcwv-hub.vercel.app/signup", inline=False)
+            if MCWV_HUB_LINKS_ENABLED:
+                dm_embed.add_field(name="Create your Hub account", value="https://mcwv-hub.vercel.app/signup", inline=False)
             dm_embed.set_footer(text="Your ticket will stay open for next steps.")
             await applicant.send(embed=dm_embed)
             actions.append("Applicant DM sent")
         except Exception:
             if channel:
-                await channel.send("⚠️ I could not DM the applicant their Hub signup link. They may have DMs disabled.")
+                await channel.send("⚠️ I could not DM the applicant. They may have DMs disabled.")
 
     if interaction.response.is_done():
         await interaction.followup.send(
@@ -6840,6 +6852,34 @@ async def accept_application_ticket(interaction, ticket_row):
     return bool(ok)
 
 
+SCREENSHOT_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif")
+
+
+def is_image_attachment(attachment):
+    content_type = str(getattr(attachment, "content_type", "") or "").lower()
+    filename = str(getattr(attachment, "filename", "") or "").lower()
+    return content_type.startswith("image/") or filename.endswith(SCREENSHOT_IMAGE_EXTENSIONS)
+
+
+async def count_ticket_screenshot_attachments(channel, applicant_id, limit=250):
+    if channel is None or not hasattr(channel, "history"):
+        return 0
+
+    count = 0
+    try:
+        async for message in channel.history(limit=limit, oldest_first=False):
+            if getattr(message.author, "id", None) != int(applicant_id):
+                continue
+            for attachment in getattr(message, "attachments", []) or []:
+                if is_image_attachment(attachment):
+                    count += 1
+    except Exception as exc:
+        print(f"[ticket screenshots] history scan failed in {getattr(channel, 'id', 'unknown')}: {exc}")
+        return 0
+
+    return count
+
+
 class ScreenshotUploadedView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -6851,6 +6891,20 @@ class ScreenshotUploadedView(discord.ui.View):
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if interaction.user.id != int(row[3]):
             return await interaction.response.send_message("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
+
+        screenshot_count = await count_ticket_screenshot_attachments(interaction.channel, interaction.user.id)
+        if screenshot_count < MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS:
+            db_ticket_log(
+                row[0],
+                interaction.user.id,
+                "screenshots/missing",
+                f"Applicant tried to confirm screenshots before uploading enough image attachments ({screenshot_count}/{MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS})",
+            )
+            return await interaction.response.send_message(
+                "❌ Please upload your screenshot images in this ticket before pressing this button. "
+                f"I found **{screenshot_count}** image attachment(s); required: **{MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS}**.",
+                ephemeral=True,
+            )
 
         staff_mentions = " ".join(
             f"<@&{role_id}>"
