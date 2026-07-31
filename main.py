@@ -11264,6 +11264,16 @@ def format_log_number(value):
     return str(int(value))
 
 
+def get_clan_owner_id_from_data(data):
+    if not isinstance(data, dict):
+        return None
+    owner_id = data.get("Owner") or data.get("owner") or data.get("OwnerUserID") or data.get("ownerUserId")
+    try:
+        return str(int(owner_id)) if owner_id is not None and str(owner_id).strip() else None
+    except Exception:
+        return None
+
+
 def extract_clan_members(data):
     members = {}
     for member in data.get("Members", []) if isinstance(data, dict) else []:
@@ -11275,6 +11285,17 @@ def extract_clan_members(data):
             }
         except Exception:
             continue
+
+    # BIG Games legacy clan data can list Members without counting the owner.
+    # Include Owner so cards/report counts show the true in-game clan size, e.g. 75/75.
+    owner_id = get_clan_owner_id_from_data(data)
+    if owner_id and owner_id not in members:
+        members[owner_id] = {
+            "joinTime": int(data.get("Created") or 0) if isinstance(data, dict) else 0,
+            "permissionLevel": 100,
+            "isOwner": True,
+        }
+
     return members
 
 
@@ -12904,6 +12925,12 @@ async def process_clan_logs():
 
     joined_ids = sorted(set(new_members) - set(old_members), key=lambda rid: new_members.get(rid, {}).get("joinTime", 0))
     left_ids = sorted(set(old_members) - set(new_members))
+
+    # Migration safety: after adding the owner into member counts, do not send a
+    # fake "owner joined" card just because older saved state did not include Owner.
+    owner_id = get_clan_owner_id_from_data(data)
+    if owner_id and owner_id in joined_ids and owner_id not in old_members:
+        joined_ids = [rid for rid in joined_ids if rid != owner_id]
 
     diamond_events = []
     for rid, total in new_diamonds.items():
