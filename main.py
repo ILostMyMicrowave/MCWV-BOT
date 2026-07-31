@@ -878,14 +878,15 @@ def admin_ticket_panel_send():
         description = str(body.get("description") or "Ready to apply for MCWV? Open a private application ticket below.")[:4000]
         button_label = str(body.get("button_label") or body.get("buttonLabel") or "Open Application")[:80]
         accent_color = body.get("accent_color") or body.get("accentColor") or body.get("hex_color") or body.get("hexColor")
-        future = _run_on_bot_loop(_admin_send_ticket_panel(channel_id, title, description, button_label, accent_color))
+        thumbnail_url = body.get("thumbnail_url") or body.get("thumbnailUrl") or body.get("thumbnail")
+        future = _run_on_bot_loop(_admin_send_ticket_panel(channel_id, title, description, button_label, accent_color, thumbnail_url))
         payload = future.result(timeout=15)
         return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
-async def _admin_send_ticket_panel(channel_id, title, description, button_label, accent_color=None):
+async def _admin_send_ticket_panel(channel_id, title, description, button_label, accent_color=None, thumbnail_url=None):
     channel = bot.get_channel(int(channel_id))
     if channel is None:
         channel = await bot.fetch_channel(int(channel_id))
@@ -897,12 +898,16 @@ async def _admin_send_ticket_panel(channel_id, title, description, button_label,
     description = description or panel.get("description") or "Ready to apply for MCWV? Open a private application ticket below."
     button_label = button_label or panel.get("buttonLabel") or "Open Application"
     color_value = parse_hex_color(accent_color if accent_color is not None else panel.get("accentColor"), panel.get("accentColor", 0x34D399))
+    thumbnail = str(thumbnail_url if thumbnail_url is not None else panel.get("thumbnailUrl", "") or "").strip()[:2048]
+    thumbnail = thumbnail if thumbnail.startswith("https://") else ""
     embed = discord.Embed(
         title=title,
         description=description,
         color=discord.Color(color_value),
         timestamp=datetime.now(timezone.utc),
     )
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
     embed.set_footer(text="MCWV Applications")
     message = await channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
     return {"success": True, "channel_id": str(channel.id), "message_id": str(message.id)}
@@ -3090,6 +3095,8 @@ def sanitize_ticket_settings(raw):
     panel["title"] = str(panel.get("title") or DEFAULT_MCWV_TICKET_SETTINGS["panel"]["title"])[:256]
     panel["description"] = str(panel.get("description") or DEFAULT_MCWV_TICKET_SETTINGS["panel"]["description"])[:4000]
     panel["buttonLabel"] = str(panel.get("buttonLabel") or "Open Application")[:80]
+    thumbnail_url = str(panel.get("thumbnailUrl") or panel.get("thumbnail") or "").strip()[:2048]
+    panel["thumbnailUrl"] = thumbnail_url if thumbnail_url.startswith("https://") else ""
     try:
         panel["accentColor"] = int(str(panel.get("accentColor", 0x34D399)).replace("#", ""), 16) if isinstance(panel.get("accentColor"), str) else int(panel.get("accentColor", 0x34D399))
     except Exception:
@@ -4867,6 +4874,7 @@ DEFAULT_MCWV_TICKET_SETTINGS = {
         "description": "Ready to apply for MCWV? Open a private application ticket below. Inside the ticket, you’ll submit your Roblox details for staff review.",
         "buttonLabel": "Open Application",
         "accentColor": 0x34D399,
+        "thumbnailUrl": "",
     },
     "messages": {
         "welcomeTitle": "Thank you for applying for MCWV!",
@@ -7622,7 +7630,8 @@ async def hourly_stats(interaction: discord.Interaction, channel: discord.TextCh
     title="Panel title",
     description="Panel description",
     button_label="Text on the application button",
-    hex_color="Embed colour as a hex value, for example #34D399"
+    hex_color="Embed colour as a hex value, for example #34D399",
+    thumbnail_url="Optional HTTPS thumbnail image URL"
 )
 async def ticket_panel_send(
     interaction: discord.Interaction,
@@ -7631,6 +7640,7 @@ async def ticket_panel_send(
     description: str = "Ready to apply for MCWV? Open a private application ticket below.",
     button_label: str = "Open Application",
     hex_color: str = None,
+    thumbnail_url: str = None,
 ):
     if not has_mcwv_ticket_staff_permission(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
@@ -7644,6 +7654,9 @@ async def ticket_panel_send(
         color=discord.Color(parse_hex_color(hex_color, settings_panel.get("accentColor", 0x34D399))),
         timestamp=datetime.now(timezone.utc),
     )
+    thumbnail = str(thumbnail_url or settings_panel.get("thumbnailUrl") or "").strip()[:2048]
+    if thumbnail.startswith("https://"):
+        embed.set_thumbnail(url=thumbnail)
     embed.set_footer(text="MCWV Applications")
     await target_channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
     await interaction.response.send_message(f"✅ Ticket panel sent in {target_channel.mention}.", ephemeral=True)
