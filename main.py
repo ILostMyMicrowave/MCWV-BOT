@@ -3528,6 +3528,95 @@ def db_set_user_status(rid, status):
         conn.rollback()
 
 
+def db_bulk_set_user_statuses(updates):
+    """Bulk-write Roblox presence statuses off the Discord event loop.
+
+    Opening a short-lived DB connection here avoids blocking the bot heartbeat with
+    60+ sequential psycopg2 calls on the main asyncio loop.
+    """
+    cleaned = []
+    seen = set()
+    for rid, status in updates or []:
+        try:
+            rid = str(rid).strip()
+            status = int(status)
+            if not rid or status not in (0, 1, 2, 3):
+                continue
+            if rid in seen:
+                continue
+            seen.add(rid)
+            cleaned.append((rid, status))
+        except Exception:
+            continue
+
+    if not cleaned or not DATABASE_URL:
+        return
+
+    local_conn = None
+    try:
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        local_conn.autocommit = False
+        with local_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_status (
+                    roblox_id TEXT PRIMARY KEY,
+                    status INTEGER,
+                    updated_at TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS player_presence_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    previous_status TEXT,
+                    next_status TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            ids = [rid for rid, _status in cleaned]
+            cur.execute(
+                "SELECT roblox_id, status FROM user_status WHERE roblox_id = ANY(%s)",
+                (ids,),
+            )
+            previous = {str(row[0]): int(row[1]) for row in cur.fetchall() if row[1] is not None}
+
+            cur.executemany("""
+                INSERT INTO user_status (roblox_id, status, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (roblox_id)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    updated_at = NOW()
+            """, cleaned)
+
+            events = [
+                (rid, str(previous[rid]), str(status))
+                for rid, status in cleaned
+                if rid in previous and previous[rid] != status
+            ]
+            if events:
+                cur.executemany("""
+                    INSERT INTO player_presence_events (roblox_id, previous_status, next_status, created_at)
+                    VALUES (%s, %s, %s, NOW())
+                """, events)
+
+        local_conn.commit()
+    except Exception as exc:
+        print("db_bulk_set_user_statuses error:", exc)
+        try:
+            if local_conn:
+                local_conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if local_conn:
+                local_conn.close()
+        except Exception:
+            pass
+
+
 def db_get_user_status(rid):
     if not db_enabled():
         return None
@@ -6960,6 +7049,14 @@ class ApplicationModal(discord.ui.Modal):
         if not guild:
             return await interaction.followup.send("❌ This must be used in the server.", ephemeral=True)
 
+        blacklist_entry = await asyncio.to_thread(db_ticket_blacklist_get, interaction.user.id)
+        if blacklist_entry:
+            reason = str(blacklist_entry[1] or "No reason provided")[:500]
+            return await interaction.followup.send(
+                f"❌ You are currently blocked from opening MCWV application tickets. Reason: {reason}",
+                ephemeral=True,
+            )
+
         existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
         if existing:
             return await interaction.followup.send(f"You already have an open application: {existing.mention}", ephemeral=True)
@@ -7472,10 +7569,9 @@ class MCWVTicketPanelView(discord.ui.View):
         blacklist_role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
         if blacklist_role and isinstance(interaction.user, discord.Member) and blacklist_role in interaction.user.roles:
             return await interaction.response.send_message("❌ You are currently blocked from opening MCWV application tickets.", ephemeral=True)
-        blacklist_entry = db_ticket_blacklist_get(interaction.user.id)
-        if blacklist_entry:
-            reason = str(blacklist_entry[1] or "No reason provided")[:500]
-            return await interaction.response.send_message(f"❌ You are currently blocked from opening MCWV application tickets. Reason: {reason}", ephemeral=True)
+        # Keep this interaction fast: Discord requires modal responses within a
+        # few seconds. The database-backed blacklist is checked after modal submit
+        # (where we can defer), while the role blacklist is checked immediately.
         existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
         if existing:
             return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
@@ -10545,6 +10641,8 @@ async def run_initial_presence_check():
 
         now_dt = datetime.now(timezone.utc)
 
+        db_updates = []
+
         for chunk in _chunks([int(u[0]) for u in users], 50):
             data = await _roblox_presence_request(chunk)
             if not data:
@@ -10559,7 +10657,7 @@ async def run_initial_presence_check():
 
                 status_cache[rid] = status
                 status_cache_time[rid] = now_dt
-                _safe_call("db_set_user_status", None, rid, status)
+                db_updates.append((rid, status))
 
                 if status == 0:
                     offline_since[rid] = now_dt
@@ -10567,6 +10665,9 @@ async def run_initial_presence_check():
                     offline_since.pop(rid, None)
 
             await asyncio.sleep(1)
+
+        if db_updates:
+            await asyncio.to_thread(db_bulk_set_user_statuses, db_updates)
 
     except Exception as e:
         print("Initial sync error:", e)
@@ -10620,6 +10721,7 @@ async def check_loop():
     users_map = {str(u[0]).strip(): u for u in users}
 
     try:
+        db_updates = []
         for u in all_presences:
             try:
                 rid = str(u.get("userId", "")).strip()
@@ -10639,10 +10741,7 @@ async def check_loop():
                 status_cache[rid] = current
                 status_cache_time[rid] = now
 
-                try:
-                    db_set_user_status(rid, current)
-                except Exception as db_error:
-                    print("Loop DB error:", db_error)
+                db_updates.append((rid, current))
 
                 if old == current:
                     continue
@@ -10672,10 +10771,8 @@ async def check_loop():
             except Exception as inner:
                 print("Loop user error:", inner)
 
-        try:
-            conn.commit()
-        except Exception as e:
-            print("DB commit error:", e)
+        if db_updates:
+            await asyncio.to_thread(db_bulk_set_user_statuses, db_updates)
 
     except Exception as e:
         print("Loop processing error:", e)
