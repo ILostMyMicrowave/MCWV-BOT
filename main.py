@@ -4794,6 +4794,8 @@ MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROL
 MCWV_TICKET_STAFF_ROLE_IDS.add(ALLOWED_ROLE_ID)
 MCWV_TICKET_STAFF_ROLE_IDS.add(1502339420207059066)
 MCWV_TICKET_DELETE_DELAY_SECONDS = max(5, int(os.environ.get("MCWV_TICKET_DELETE_DELAY_SECONDS", "20") or "20"))
+MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS = max(1, int(os.environ.get("MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS", "1") or "1"))
+MCWV_HUB_LINKS_ENABLED = os.environ.get("MCWV_HUB_LINKS_ENABLED", "0") == "1"
 MCWV_TICKET_BANNER_PATH = os.environ.get(
     "MCWV_TICKET_BANNER_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "clan_application_banner.png"),
