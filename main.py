@@ -1052,6 +1052,8 @@ def admin_status():
             "clanLogsEnabled": _safe_call("clan_logs_enabled", False),
             "hourlyStatsChannel": _safe_call("get_hourly_stats_channel_id", None),
             "hourlyStatsEnabled": _safe_call("hourly_stats_enabled", False),
+            "hourlyStatsAutoWarToggle": bool(globals().get("MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE")),
+            "hourlyStatsAutoDisabled": _safe_call("hourly_stats_auto_disabled", False),
             "hourlyStatsIntervalMinutes": globals().get("MCWV_HOURLY_STATS_INTERVAL_MINUTES"),
             "hourlyStatsPingEnabled": _safe_call("hourly_stats_ping_enabled", False),
             "hourlyStatsPingThreshold": _safe_call("get_hourly_stats_ping_threshold", MCWV_HOURLY_STATS_PING_THRESHOLD_DEFAULT),
@@ -1355,26 +1357,77 @@ def _admin_int(value, default=0, minimum=0, maximum=None):
     return parsed
 
 
+def _hourly_stats_loop_obj_start():
+    loop_obj = globals().get("hourly_stats_loop")
+    if loop_obj is not None:
+        loop_obj.change_interval(minutes=1)
+        if not loop_obj.is_running():
+            loop_obj.start()
+
+
 async def _admin_setup_system_from_body(body):
     system = str(body.get("system") or body.get("target") or "").strip().lower().replace("-", "_")
     channel_id = body.get("channel_id") or body.get("channelId") or body.get("channel")
+    enabled_raw = body.get("enabled", body.get("isEnabled", body.get("active", None)))
 
     if system in ("placement", "placement_alert", "placement_alerts"):
+        # Enable/disable toggle from the Dashboard. Channel is not required.
+        if enabled_raw is not None and not channel_id:
+            enabled = _admin_bool(enabled_raw, True)
+            db_set_setting("mcwv_placement_alerts_enabled", "1" if enabled else "0")
+            if enabled and not get_placement_channel_id():
+                raise ValueError("Pick a channel first before enabling placement alerts.")
+            return {
+                "success": True,
+                "system": "placement_alerts",
+                "enabled": enabled,
+                "message": f"Placement alerts {'enabled' if enabled else 'disabled'}.",
+            }
+
         channel = await _validate_admin_text_channel(channel_id, require_invite=False)
         set_placement_channel_id(channel.id)
         db_set_setting("mcwv_placement_alerts_enabled", "1")
-        return {"success": True, "system": "placement_alerts", "channel_id": str(channel.id), "message": f"Placement alerts configured for #{channel.name}."}
+        return {"success": True, "system": "placement_alerts", "channel_id": str(channel.id), "enabled": True, "message": f"Placement alerts configured for #{channel.name}."}
 
     if system in ("clan_log", "clan_logs", "logs"):
+        if enabled_raw is not None and not channel_id:
+            enabled = _admin_bool(enabled_raw, True)
+            db_set_setting("mcwv_clan_logs_enabled", "1" if enabled else "0")
+            if enabled and not get_clan_log_channel_id():
+                raise ValueError("Pick a channel first before enabling clan logs.")
+            return {
+                "success": True,
+                "system": "clan_logs",
+                "enabled": enabled,
+                "message": f"Clan logs {'enabled' if enabled else 'disabled'}.",
+            }
+
         channel = await _validate_admin_text_channel(channel_id, require_invite=False)
         set_clan_log_channel_id(channel.id)
         db_set_setting("mcwv_clan_logs_enabled", "1")
-        return {"success": True, "system": "clan_logs", "channel_id": str(channel.id), "message": f"Clan logs configured for #{channel.name}."}
+        return {"success": True, "system": "clan_logs", "channel_id": str(channel.id), "enabled": True, "message": f"Clan logs configured for #{channel.name}."}
 
     if system in ("hourly", "hourly_stats", "hourly_statistics"):
+        # Pure enable/disable toggle from the Dashboard button. Manual toggle
+        # always wins over the auto war pause/resume.
+        if enabled_raw is not None and not channel_id:
+            enabled = _admin_bool(enabled_raw, True)
+            if enabled and not get_hourly_stats_channel_id():
+                raise ValueError("Pick a channel first before enabling hourly stats.")
+            set_hourly_stats_enabled(enabled, auto_disabled=False)
+            if enabled:
+                _hourly_stats_loop_obj_start()
+            return {
+                "success": True,
+                "system": "hourly_stats",
+                "enabled": enabled,
+                "message": f"Hourly stats {'enabled' if enabled else 'disabled'}.",
+            }
+
         channel = await _validate_admin_text_channel(channel_id, require_invite=False)
         set_hourly_stats_channel_id(channel.id)
-        db_set_setting("mcwv_hourly_stats_enabled", "1")
+        # Configuring the channel explicitly also turns hourly stats on.
+        set_hourly_stats_enabled(True, auto_disabled=False)
 
         if "ping_enabled" in body or "pingEnabled" in body:
             ping_enabled = _admin_bool(body.get("ping_enabled", body.get("pingEnabled")), False)
@@ -1397,17 +1450,13 @@ async def _admin_setup_system_from_body(body):
             message = str(body.get("ping_message", body.get("pingMessage")) or "")[:1200]
             db_set_setting("mcwv_hourly_stats_ping_message", message)
 
-        loop_obj = globals().get("hourly_stats_loop")
-        if loop_obj is not None:
-            loop_obj.change_interval(minutes=1)
-            if not loop_obj.is_running():
-                loop_obj.start()
+        _hourly_stats_loop_obj_start()
 
         ping_text = ""
         if _admin_bool(body.get("ping_enabled", body.get("pingEnabled")), hourly_stats_ping_enabled()):
             ping_text = f" Pings enabled under {get_hourly_stats_ping_threshold()} PPH."
 
-        return {"success": True, "system": "hourly_stats", "channel_id": str(channel.id), "message": f"Hourly stats configured for #{channel.name}.{ping_text}"}
+        return {"success": True, "system": "hourly_stats", "channel_id": str(channel.id), "enabled": True, "message": f"Hourly stats configured for #{channel.name}.{ping_text}"}
 
     raise ValueError("Unknown setup system. Use placement_alerts, clan_logs, or hourly_stats.")
 
@@ -4921,6 +4970,11 @@ MCWV_HOURLY_STATS_BG_PATH = os.environ.get(
     "MCWV_HOURLY_STATS_BG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hourly_stats_bg.webp"),
 )
+# Automatically pause hourly stats when no clan war is active and resume them
+# when the next war starts. Set MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE=0 to keep them
+# fully manual (only the /toggle_automation command and Dashboard button control them).
+MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE = os.environ.get("MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE", "1") != "0"
+HOURLY_STATS_AUTO_DISABLE_MISSES_REQUIRED = max(1, int(os.environ.get("MCWV_HOURLY_STATS_AUTO_DISABLE_MISSES", "2") or "2"))
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
 PS99_IMPORTANT_GAMEPASSES = {
     257811346: "VIP",
@@ -7718,6 +7772,70 @@ async def hourly_stats(interaction: discord.Interaction, channel: discord.TextCh
         await interaction.followup.send(f"✅ Sent hourly stats in {target.mention}.", ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ Hourly stats failed: `{type(exc).__name__}: {exc}`", ephemeral=True)
+
+
+@bot.tree.command(name="toggle_automation", description="Enable or disable an MCWV bot automation", guild=guild_obj)
+@app_commands.describe(
+    system="Which automation to toggle",
+    enabled="True = on, False = off"
+)
+@app_commands.choices(system=[
+    app_commands.Choice(name="Hourly stats", value="hourly_stats"),
+    app_commands.Choice(name="Hourly PPH pings", value="hourly_pings"),
+    app_commands.Choice(name="Placement alerts", value="placement_alerts"),
+    app_commands.Choice(name="Clan logs", value="clan_logs"),
+])
+async def toggle_automation(interaction: discord.Interaction, system: app_commands.Choice[str], enabled: bool):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    value = system.value
+    notes = []
+
+    if value == "hourly_stats":
+        # Manual toggle always wins over the auto war toggle.
+        set_hourly_stats_enabled(bool(enabled), auto_disabled=False)
+        label = "Hourly stats"
+        if enabled:
+            loop_obj = globals().get("hourly_stats_loop")
+            if loop_obj is not None and not loop_obj.is_running():
+                loop_obj.change_interval(minutes=1)
+                loop_obj.start()
+            if not get_hourly_stats_channel_id():
+                notes.append("No hourly channel set yet — run `/setup Hourly stats #channel`.")
+        elif MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE:
+            notes.append("Auto pause/resume on clan war start/end is still on, but this manual toggle wins.")
+    elif value == "hourly_pings":
+        db_set_setting("mcwv_hourly_stats_ping_enabled", "1" if enabled else "0")
+        label = "Hourly PPH pings"
+        if enabled:
+            notes.append(f"Members under {get_hourly_stats_ping_threshold()} PPH will be pinged after each hourly card.")
+    elif value == "placement_alerts":
+        db_set_setting("mcwv_placement_alerts_enabled", "1" if enabled else "0")
+        label = "Placement alerts"
+        if enabled and not get_placement_channel_id():
+            notes.append("No placement channel set yet — run `/setup Placement alerts #channel`.")
+    elif value == "clan_logs":
+        db_set_setting("mcwv_clan_logs_enabled", "1" if enabled else "0")
+        label = "Clan logs"
+        if enabled and not get_clan_log_channel_id():
+            notes.append("No clan log channel set yet — run `/setup Clan logs #channel`.")
+    else:
+        return await interaction.followup.send("❌ Unknown automation.", ephemeral=True)
+
+    description = f"**{label}** are now **{'enabled' if enabled else 'disabled'}**."
+    if notes:
+        description += "\n\n" + "\n".join(f"• {note}" for note in notes)
+
+    embed = discord.Embed(
+        title=f"{'✅' if enabled else '⏸️'} Automation toggled",
+        description=description,
+        color=discord.Color.green() if enabled else discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Changed by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
@@ -12847,6 +12965,69 @@ def hourly_stats_enabled():
     return str(raw).lower() not in ("0", "false", "off", "no")
 
 
+def set_hourly_stats_enabled(enabled, auto_disabled=False):
+    db_set_setting("mcwv_hourly_stats_enabled", "1" if enabled else "0")
+    db_set_setting("mcwv_hourly_stats_auto_disabled", "1" if auto_disabled else "0")
+
+
+def hourly_stats_auto_disabled():
+    raw = db_get_setting("mcwv_hourly_stats_auto_disabled", "0")
+    return str(raw).lower() in ("1", "true", "yes", "on")
+
+
+# Shared short cache so both hourly loops do not double-poll the war endpoints.
+hourly_stats_war_state = {"checked_at": 0.0, "active": None}
+hourly_stats_war_misses = 0
+
+
+async def hourly_stats_war_is_active():
+    now = time.time()
+    if now - float(hourly_stats_war_state.get("checked_at") or 0) < 45:
+        return hourly_stats_war_state.get("active")
+
+    battle_id = await get_active_battle_id_for_placement()
+    hourly_stats_war_state["checked_at"] = now
+    hourly_stats_war_state["active"] = bool(battle_id)
+    return hourly_stats_war_state["active"]
+
+
+async def sync_hourly_stats_with_war_state():
+    """Auto pause hourly stats when no clan war is active and auto resume them.
+
+    Returns True when hourly stats should run this tick, False when they should
+    stay paused. Manual toggles always win: the bot only re-enables automatically
+    if the auto war toggle was the one that disabled it.
+    """
+    if not MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE:
+        return hourly_stats_enabled()
+
+    global hourly_stats_war_misses
+
+    if not hourly_stats_enabled():
+        if hourly_stats_auto_disabled():
+            if await hourly_stats_war_is_active():
+                set_hourly_stats_enabled(True, auto_disabled=False)
+                hourly_stats_war_misses = 0
+                admin_log("Hourly Stats Auto-Enabled", "A clan war is active again; hourly stats resumed automatically.")
+                return True
+        return False
+
+    if await hourly_stats_war_is_active():
+        hourly_stats_war_misses = 0
+        return True
+
+    # Debounce: one API hiccup must not pause the hourly cards mid-war.
+    hourly_stats_war_misses += 1
+    if hourly_stats_war_misses < HOURLY_STATS_AUTO_DISABLE_MISSES_REQUIRED:
+        print(f"[hourly stats] active war check failed/ended ({hourly_stats_war_misses}/{HOURLY_STATS_AUTO_DISABLE_MISSES_REQUIRED})")
+        return True
+
+    hourly_stats_war_misses = 0
+    set_hourly_stats_enabled(False, auto_disabled=True)
+    admin_log("Hourly Stats Auto-Disabled", "No active clan war detected; hourly stats paused until the next war.", "warning")
+    return False
+
+
 def hourly_stats_ping_enabled():
     raw = db_get_setting("mcwv_hourly_stats_ping_enabled", "1" if MCWV_HOURLY_STATS_PING_ENABLED_DEFAULT else "0")
     return str(raw).lower() not in ("0", "false", "off", "no")
@@ -13016,8 +13197,13 @@ def set_hourly_stats_channel_id(channel_id):
 @tasks.loop(minutes=1)
 async def hourly_stats_loop():
     await bot.wait_until_ready()
-    if not hourly_stats_enabled():
-        return
+    try:
+        if not await sync_hourly_stats_with_war_state():
+            return
+    except Exception as exc:
+        print(f"[hourly stats] war-state sync failed: {exc}")
+        if not hourly_stats_enabled():
+            return
 
     channel_id = get_hourly_stats_channel_id()
     if not channel_id:
@@ -13047,8 +13233,13 @@ async def before_hourly_stats_loop():
 @tasks.loop(minutes=1)
 async def hourly_player_snapshot_loop():
     await bot.wait_until_ready()
-    if not hourly_stats_enabled():
-        return
+    try:
+        if not await sync_hourly_stats_with_war_state():
+            return
+    except Exception as exc:
+        print(f"[hourly stats] player snapshot war-state sync failed: {exc}")
+        if not hourly_stats_enabled():
+            return
     try:
         if await collect_hourly_player_snapshot():
             print("[hourly stats] player snapshot saved/refreshed")
