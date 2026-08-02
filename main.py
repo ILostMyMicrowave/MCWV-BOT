@@ -8763,6 +8763,62 @@ def db_get_points_24h_ago(battle_id):
         return {}
 
 
+def mcwv_presence_line(roblox_id, presence):
+    """Human presence string from a Roblox presence payload (+ offline timer)."""
+    presence = presence or {}
+    try:
+        ptype = int(presence.get("userPresenceType", 0) or 0)
+    except Exception:
+        ptype = 0
+    last_location = str(presence.get("lastLocation") or "").strip()
+    if ptype == 1:
+        return "🟢 Online — Website"
+    if ptype == 2:
+        return f"🎮 In Game{f' — {last_location}' if last_location else ''}"
+    if ptype == 3:
+        return "🔧 In Studio"
+    since = offline_since.get(str(roblox_id)) or offline_since.get(int(roblox_id))
+    if since:
+        try:
+            if not getattr(since, "tzinfo", None):
+                since = since.replace(tzinfo=timezone.utc)
+            elapsed = datetime.now(timezone.utc) - since
+            return f"⚫ Offline for {fmt_hm(elapsed.total_seconds())}"
+        except Exception:
+            pass
+    return "⚫ Offline"
+
+
+def db_get_member_war_career(roblox_id):
+    """(wars_played, career_points) from the hourly snapshot archive.
+    None when the archive is unavailable — callers fall back to API counts."""
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS e")
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return None
+            cur.execute("""
+                SELECT COUNT(DISTINCT battle_id), COALESCE(SUM(points), 0)::bigint
+                FROM (
+                    SELECT DISTINCT ON (battle_id) battle_id, points::bigint AS points
+                    FROM player_leaderboard_history
+                    WHERE roblox_id = %s AND points IS NOT NULL
+                    ORDER BY battle_id, captured_at DESC
+                ) s
+            """, (str(roblox_id),))
+            row = cur.fetchone()
+            if not row or not int(row[0] or 0):
+                return None
+            return int(row[0]), int(row[1] or 0)
+    except Exception as exc:
+        print(f"[profile] career query failed: {exc}")
+        return None
+
+
+
 
 @bot.tree.command(name="warinfo", description="Show current PS99 clan war details", guild=guild_obj)
 async def warinfo(interaction: discord.Interaction):
@@ -9532,10 +9588,8 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         MEMBER_ROLE_ID = 1501986780667314246
 
         clan_role = None
-
         if discord_member:
             role_ids = {r.id for r in discord_member.roles}
-
             if OWNER_ROLE_ID in role_ids:
                 clan_role = "Owner"
             elif OFFICER_ROLE_ID in role_ids:
@@ -9550,10 +9604,25 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 
         timeout = aiohttp.ClientTimeout(total=10)
 
+        # ---------------- PRESENCE (best-effort) ----------------
+        presence = None
+        try:
+            async with session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": [roblox_id]},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as pres_r:
+                if pres_r.status == 200:
+                    pres_payload = await pres_r.json(content_type=None)
+                    presence = (pres_payload.get("userPresences") or [{}])[0]
+        except Exception as pres_exc:
+            print(f"[profile] presence failed: {pres_exc}")
+
         # ---------------- WAR DATA ----------------
         battle = None
         points = 0
         rank = None
+        share = None
         war_count = 0
 
         try:
@@ -9562,28 +9631,30 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
                     clan_data = await clan_r.json()
                     battles = (clan_data.get("data") or {}).get("Battles") or {}
 
-                    now = datetime.now(timezone.utc).timestamp()
+                    now_ts = datetime.now(timezone.utc).timestamp()
 
                     for b_id, b_data in battles.items():
+                        if not isinstance(b_data, dict):
+                            continue
                         start = b_data.get("StartTime", 0) or 0
                         end = b_data.get("FinishTime", 0) or 0
                         contributions = b_data.get("PointContributions", [])
 
-                        if any(int(e.get("UserID", 0)) == roblox_id for e in contributions):
+                        if any(int(e.get("UserID", 0) or 0) == roblox_id for e in contributions):
                             war_count += 1
 
-                        if start <= now <= end:
+                        if start <= now_ts <= end:
                             battle = b_data
-
                             contributions = sorted(
                                 battle.get("PointContributions", []),
-                                key=lambda x: x.get("Points", 0),
-                                reverse=True
+                                key=lambda x: int(x.get("Points", 0) or 0),
+                                reverse=True,
                             )
-
+                            total_clan = int(battle.get("Points") or sum(int(c.get("Points", 0) or 0) for c in contributions) or 0)
                             for i, entry in enumerate(contributions, start=1):
-                                if int(entry.get("UserID", 0)) == roblox_id:
+                                if int(entry.get("UserID", 0) or 0) == roblox_id:
                                     points = int(entry.get("Points", 0) or 0)
+                                    share = (points / total_clan * 100) if total_clan else None
                                     rank = i
                                     break
                             break
@@ -9591,7 +9662,24 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         except Exception as e:
             print("[profile] war API error:", e)
 
-        # ---------------- PROFILE BUNDLE (FIX: FORCE REFRESH + TYPE SAFETY) ----------------
+        # ---------------- CAREER + ALTS (best-effort, MCWV archive) ----------------
+        career = None
+        try:
+            career = db_get_member_war_career(roblox_id)
+        except Exception as career_exc:
+            print(f"[profile] career failed: {career_exc}")
+
+        alt_names = []
+        if discord_id:
+            try:
+                for row in db_get_alts(discord_id) or []:
+                    alt_name = row[2] if len(row) > 2 else None
+                    if alt_name and str(alt_name).lower() != roblox_name.lower():
+                        alt_names.append(str(alt_name))
+            except Exception as alt_exc:
+                print(f"[profile] alts failed: {alt_exc}")
+
+        # ---------------- PROFILE BUNDLE (for the tab buttons) ----------------
         extended_data, profile_data, inventory_data, public_views = await get_profile_bundle(
             session,
             roblox_id,
@@ -9599,48 +9687,63 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
         )
 
         # ---------------- AVATAR ----------------
-        avatar_url = (
-            discord_member.display_avatar.url
-            if discord_member
-            else interaction.user.display_avatar.url
-        )
+        avatar_url = None
+        try:
+            avatar_url = await get_roblox_headshot_url(roblox_id)
+        except Exception:
+            avatar_url = None
+        if not avatar_url:
+            avatar_url = (
+                discord_member.display_avatar.url
+                if discord_member
+                else interaction.user.display_avatar.url
+            )
 
         # ---------------- EMBED ----------------
-        embed = discord.Embed(
-            title=f"📇 Player Profile — {roblox_name}",
-            color=discord.Color.blurple()
-        )
+        role_colors = {
+            "Owner": discord.Color.gold(),
+            "Officer": discord.Color.from_rgb(56, 189, 248),
+            "Member": discord.Color(MCWV_BRAND_COLOR),
+        }
+        color = role_colors.get(clan_role, discord.Color(MCWV_BRAND_COLOR))
 
+        embed = discord.Embed(
+            title=f"📇 {roblox_name}",
+            description=f"[Roblox Profile ↗](https://www.roblox.com/users/{roblox_id}/profile)",
+            color=color,
+        )
         embed.set_thumbnail(url=avatar_url)
 
-        embed.add_field(name="🎮 Username", value=roblox_name, inline=False)
-        embed.add_field(name="💬 Discord", value=discord_display, inline=False)
-        embed.add_field(name="🆔 Roblox ID", value=str(roblox_id), inline=False)
-        embed.add_field(name="🔗 Account Status", value=linked_status, inline=False)
-        embed.add_field(name="🏷️ Clan Role", value=clan_role or "None", inline=False)
+        embed.add_field(name="🆔 Roblox ID", value=f"`{roblox_id}`", inline=True)
+        embed.add_field(name="💬 Discord", value=discord_display, inline=True)
+        embed.add_field(name="🏷️ Clan Role", value=clan_role or "—", inline=True)
 
-        if battle:
+        embed.add_field(name="🔗 Account Status", value=linked_status, inline=True)
+        embed.add_field(name="🟢 Presence", value=mcwv_presence_line(roblox_id, presence), inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+        if battle and rank:
+            war_value = f"**{format_points(points)}** · rank **#{rank}**"
+            if share is not None:
+                war_value += f" · **{share:.1f}%**"
+            embed.add_field(name="⚔️ This War", value=war_value, inline=True)
+
+        if career:
+            career_wars, career_points = career
             embed.add_field(
-                name="⚔️ War Activity",
-                value=(
-                    f"Points: **{points:,}**\n"
-                    f"Rank: **#{rank if rank else 'N/A'}**\n"
-                    f"Wars: **{war_count}**"
-                ),
-                inline=False
+                name="🗡️ War Career",
+                value=f"**{format_points(career_points)}** pts across **{career_wars}** wars",
+                inline=True,
             )
-        else:
-            embed.add_field(
-                name="⚔️ War Activity",
-                value="No active war participation",
-                inline=False
-            )
+        elif war_count:
+            embed.add_field(name="🗡️ War Career", value=f"**{war_count}** wars on record", inline=True)
 
-        embed.set_footer(
-            text=f"MCWV Profile Dashboard • Requested by {interaction.user.display_name}"
-        )
+        if alt_names:
+            embed.add_field(name="🧩 Alts", value=", ".join(f"`{a}`" for a in alt_names[:6]), inline=False)
 
-        # ---------------- VIEW ----------------
+        mcwv_footer(embed, "PS99 live + MCWV archive")
+
+        # ---------------- VIEW (unchanged tab buttons) ----------------
         view = ProfileView(
             extended_data,
             inventory_data,
@@ -9659,7 +9762,7 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
             f"❌ Profile failed: `{e}`",
             ephemeral=True
         )
-        
+
 @bot.tree.command(
     name="clanstats",
     description="Show MCWV clan overview — level, members, gems, and battle history",
@@ -9825,44 +9928,23 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
 
         async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as war_r:
             if war_r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the PS99 war API.",
-                    ephemeral=True
-                )
-
+                return await interaction.followup.send("❌ Could not reach the PS99 war API.", ephemeral=True)
             if "application/json" not in war_r.headers.get("Content-Type", ""):
-                text = await war_r.text()
-                print("[COMPARE] War API non-JSON:", text[:200])
-                return await interaction.followup.send(
-                    "❌ PS99 war API returned invalid data.",
-                    ephemeral=True
-                )
-
+                print("[COMPARE] War API non-JSON")
+                return await interaction.followup.send("❌ PS99 war API returned invalid data.", ephemeral=True)
             war_data = await war_r.json()
 
         async with session.get(CLAN_API, timeout=timeout) as clan_r:
             if clan_r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the PS99 clan API.",
-                    ephemeral=True
-                )
-
+                return await interaction.followup.send("❌ Could not reach the PS99 clan API.", ephemeral=True)
             if "application/json" not in clan_r.headers.get("Content-Type", ""):
-                text = await clan_r.text()
-                print("[COMPARE] Clan API non-JSON:", text[:200])
-                return await interaction.followup.send(
-                    "❌ PS99 clan API returned invalid data.",
-                    ephemeral=True
-                )
-
+                print("[COMPARE] Clan API non-JSON")
+                return await interaction.followup.send("❌ PS99 clan API returned invalid data.", ephemeral=True)
             clan_data = await clan_r.json()
 
     except Exception as e:
         print("[COMPARE ERROR]", repr(e))
-        return await interaction.followup.send(
-            "❌ API request failed.",
-            ephemeral=True
-        )
+        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
 
     war_config = war_data.get("data", {}).get("configData", {})
     active_battle_id = war_config.get("Title") or war_data.get("data", {}).get("configName")
@@ -9880,33 +9962,44 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     battle = battles[battle_id]
     contributions = sorted(
         battle.get("PointContributions", []),
-        key=lambda x: x.get("Points", 0),
-        reverse=True
+        key=lambda x: int(x.get("Points", 0) or 0),
+        reverse=True,
     )
+    clan_total = int(battle.get("Points") or sum(int(c.get("Points", 0) or 0) for c in contributions) or 0)
 
     def get_entry(rid):
-        entry = next((e for e in contributions if int(e.get("UserID", 0)) == rid), None)
-        rank = next((i + 1 for i, e in enumerate(contributions) if int(e.get("UserID", 0)) == rid), None)
-        pts = entry["Points"] if entry else 0
+        entry = next((e for e in contributions if int(e.get("UserID", 0) or 0) == rid), None)
+        rank = next((i + 1 for i, e in enumerate(contributions) if int(e.get("UserID", 0) or 0) == rid), None)
+        pts = int(entry.get("Points", 0) or 0) if entry else 0
         return pts, rank
 
     pts1, rank1 = get_entry(rid1)
     pts2, rank2 = get_entry(rid2)
+    share1 = (pts1 / clan_total * 100) if clan_total else 0
+    share2 = (pts2 / clan_total * 100) if clan_total else 0
 
-    friendly = re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', battle_id)).strip()
+    # 24h deltas (best-effort).
+    delta1 = delta2 = None
+    try:
+        old_points = db_get_points_24h_ago(battle_id)
+        old1, old2 = old_points.get(str(rid1)), old_points.get(str(rid2))
+        delta1 = (pts1 - int(old1)) if old1 is not None else None
+        delta2 = (pts2 - int(old2)) if old2 is not None else None
+    except Exception as delta_exc:
+        print(f"[compare] delta lookup failed: {delta_exc}")
+
+    friendly = _friendly_battle_name(battle_id)
     now = datetime.now(timezone.utc).timestamp()
     finish_ts = war_config.get("FinishTime")
     is_active = finish_ts and war_config.get("StartTime", 0) <= now <= finish_ts
-    color = discord.Color.red() if is_active else discord.Color.dark_gold()
 
     total = pts1 + pts2
     if total > 0:
-        share1 = int((pts1 / total) * 20)
-        share2 = 20 - share1
+        share1_bar = int((pts1 / total) * 20)
+        share2_bar = 20 - share1_bar
     else:
-        share1 = share2 = 10
-
-    hth_bar = f"{'█' * share1}{'░' * share2}"
+        share1_bar = share2_bar = 10
+    hth_bar = f"{'█' * share1_bar}{'░' * share2_bar}"
     pct1 = (pts1 / total * 100) if total else 50.0
     pct2 = 100 - pct1
 
@@ -9914,28 +10007,78 @@ async def compare(interaction: discord.Interaction, member1: discord.Member, mem
     rank1_display = medals.get(rank1, f"#{rank1}") if rank1 else "—"
     rank2_display = medals.get(rank2, f"#{rank2}") if rank2 else "—"
 
+    def crown(v1, v2, higher_better=True):
+        """Return (suffix1, suffix2) crowning the better value."""
+        if v1 is None or v2 is None or v1 == v2:
+            return "", ""
+        first_wins = (v1 > v2) if higher_better else (v1 < v2)
+        return (" 🏆", "") if first_wins else ("", " 🏆")
+
+    pts_t1, pts_t2 = crown(pts1, pts2)
+    rank_t1, rank_t2 = crown(rank1, rank2, higher_better=False) if (rank1 and rank2) else ("", "")
+    shr_t1, shr_t2 = crown(share1, share2)
+    dlt_t1, dlt_t2 = crown(delta1, delta2)
+
+    def delta_txt(d):
+        if d is None:
+            return "—"
+        return f"{'▲' if d >= 0 else '▼'} {format_points(abs(d))}"
+
+    col1 = (
+        f"**{format_points(pts1)}**{pts_t1}\n"
+        f"**{rank1_display}**{rank_t1}\n"
+        f"**{share1:.1f}%**{shr_t1}\n"
+        f"**{delta_txt(delta1)}**{dlt_t1}"
+    )
+    col2 = (
+        f"**{format_points(pts2)}**{pts_t2}\n"
+        f"**{rank2_display}**{rank_t2}\n"
+        f"**{share2:.1f}%**{shr_t2}\n"
+        f"**{delta_txt(delta2)}**{dlt_t2}"
+    )
+    categories = "⚔️ Points\n🏅 Clan Rank\n📈 Share\n▲ 24h"
+
     if pts1 > pts2:
-        winner = f"\n🏆 **{name1}** is ahead"
+        diff = pts1 - pts2
+        verdict = f"🏆 **{name1}** leads by **{format_points(diff)}**"
+        winner_id = rid1
     elif pts2 > pts1:
-        winner = f"\n🏆 **{name2}** is ahead"
+        diff = pts2 - pts1
+        verdict = f"🏆 **{name2}** leads by **{format_points(diff)}**"
+        winner_id = rid2
     else:
-        winner = "\n🤝 Tied!"
+        verdict = "🤝 Dead even!"
+        winner_id = rid1
+
+    # Winner's avatar as the thumbnail (best-effort).
+    avatar_url = None
+    try:
+        avatar_url = await get_roblox_headshot_url(winner_id)
+    except Exception:
+        avatar_url = None
+
+    color = discord.Color.red() if is_active else discord.Color(MCWV_BRAND_COLOR)
 
     embed = discord.Embed(
-        title=f"⚔️  {name1}  vs  {name2}",
-        description=f"**{friendly}**{winner}",
-        color=color
+        title=f"⚔️ {name1} vs {name2}",
+        description=f"**{friendly}**\n{verdict}",
+        color=color,
     )
-    embed.add_field(name=f"📊 {name1}", value=f"**{format_points(pts1)}** pts\nRank: {rank1_display}", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
-    embed.add_field(name=f"📊 {name2}", value=f"**{format_points(pts2)}** pts\nRank: {rank2_display}", inline=True)
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    embed.add_field(name="\u200b", value=categories, inline=True)
+    embed.add_field(name=f"📊 {name1}", value=col1, inline=True)
+    embed.add_field(name=f"📊 {name2}", value=col2, inline=True)
+
     embed.add_field(
         name="Head-to-Head",
         value=f"`{hth_bar}`\n{name1} **{pct1:.0f}%** — **{pct2:.0f}%** {name2}",
-        inline=False
+        inline=False,
     )
-    status_str = "⚔️ Active" if is_active else "🏁 Ended"
-    embed.set_footer(text=f"{status_str} • ps99.biggamesapi.io")
+
+    embed.timestamp = datetime.now(timezone.utc)
+    embed.set_footer(text=f"MCWV • PS99 live • {'⚔️ War active' if is_active else '🏁 War ended'}")
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="accept", description="Accept an applicant inside a Tickets v2 ticket", guild=guild_obj)
@@ -10987,9 +11130,11 @@ async def memberedit(
         )
         
 # ---------------- STATUS COMMAND ----------------
-@bot.tree.command(name="status", description="Check Roblox status", guild=guild_obj)
+@bot.tree.command(name="status", description="Check a member's Roblox status", guild=guild_obj)
 async def status(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
+
+    global session
 
     try:
         users = db_get_all()
@@ -11001,33 +11146,48 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         roblox_id = int(target[0])
         roblox_name = target[2]
 
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
         async with session.post(
             "https://presence.roblox.com/v1/presence/users",
-            json={"userIds": [roblox_id]}
+            json={"userIds": [roblox_id]},
+            timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
 
             if r.status != 200:
                 return await interaction.followup.send("❌ Roblox API error", ephemeral=True)
 
             data = await r.json()
-            pres = data.get("userPresences", [{}])[0]
-            current = pres.get("userPresenceType", 0)
+            pres = (data.get("userPresences") or [{}])[0]
 
-        status_map = {
-            0: "⚫ Offline",
-            1: "🟢 Website",
-            2: "🎮 In Game",
-            3: "🔧 Studio"
-        }
+        ptype = int(pres.get("userPresenceType", 0) or 0)
+        line = mcwv_presence_line(roblox_id, pres)
 
-        await interaction.followup.send(
-            f"{status_map.get(current, '❓ Unknown')} **{roblox_name}**",
-            ephemeral=True
+        color = discord.Color.green() if ptype else discord.Color.dark_gray()
+
+        embed = discord.Embed(
+            title=f"🛰 {roblox_name}",
+            description=f"**{line}**",
+            color=color,
         )
+        embed.add_field(name="Discord", value=member.mention, inline=True)
+        embed.add_field(name="🆔 Roblox ID", value=f"`{roblox_id}`", inline=True)
+
+        try:
+            avatar_url = await get_roblox_headshot_url(roblox_id)
+        except Exception:
+            avatar_url = None
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
+
+        mcwv_footer(embed, "Roblox presence")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     except Exception as e:
         print("[status error]", e)
         await interaction.followup.send("❌ Error", ephemeral=True)
+
         import asyncio
 from datetime import datetime, timezone, timedelta
 import discord
