@@ -8591,6 +8591,113 @@ async def clanwar(interaction: discord.Interaction):
 
 ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
 
+# ---------------- MEMBER COMMAND DESIGN SYSTEM ----------------
+MCWV_BRAND_COLOR = 0x8B5CF6
+
+
+def mcwv_bar(pct, length=16):
+    pct = max(0.0, min(1.0, float(pct or 0)))
+    filled = int(round(pct * length))
+    return "▰" * filled + "▱" * (length - filled)
+
+
+def mcwv_rank_flair(rank):
+    try:
+        rank = int(rank)
+    except Exception:
+        return "⚔️"
+    if rank == 1:
+        return "🥇"
+    if rank == 2:
+        return "🥈"
+    if rank == 3:
+        return "🥉"
+    if rank <= 10:
+        return "🔥"
+    if rank <= 25:
+        return "🏅"
+    return "⚔️"
+
+
+def mcwv_footer(embed, source="PS99 live"):
+    embed.timestamp = datetime.now(timezone.utc)
+    embed.set_footer(text=f"MCWV • {source}")
+    return embed
+
+
+def fmt_hm(seconds):
+    seconds = max(0, int(seconds or 0))
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
+def _as_utc(dt):
+    if not hasattr(dt, "replace"):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def db_get_clan_war_overview(recent_limit=3):
+    """Recent + best completed wars from the shared Hub DB (war_snapshots + battles).
+    Returns None when those tables don't exist or the DB is unavailable —
+    callers should fall back to API data or hide the section."""
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.war_snapshots') IS NOT NULL AS e")
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return None
+            cur.execute("""
+                SELECT ws.battle_id, ws.rank, ws.battle_points, ws.captured_at, b.battle_name, b.end_time
+                FROM war_snapshots ws
+                LEFT JOIN battles b ON b.battle_id = ws.battle_id
+                WHERE LOWER(ws.clan_name) = LOWER(%s)
+                ORDER BY ws.captured_at DESC
+                LIMIT 400
+            """, (CLAN_NAME,))
+            rows = cur.fetchall()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[war overview] query failed: {exc}")
+        return None
+
+    best_by_battle = {}
+    for battle_id, rank, points, captured_at, battle_name, end_time in rows:
+        key = str(battle_id)
+        existing = best_by_battle.get(key)
+        if existing is None:
+            best_by_battle[key] = {
+                "battleId": key,
+                "name": battle_name or key,
+                "rank": int(rank) if rank is not None else None,
+                "points": int(points or 0),
+                "when": end_time or captured_at,
+            }
+        elif points and int(points) > int(existing["points"] or 0):
+            existing["points"] = int(points)
+
+    wars = list(best_by_battle.values())
+
+    def sort_key(war):
+        when = war.get("when")
+        return when.timestamp() if hasattr(when, "timestamp") else 0
+
+    wars.sort(key=sort_key, reverse=True)
+    ranked = [w for w in wars if w.get("rank")]
+    best = min(ranked, key=lambda w: w["rank"]) if ranked else None
+    return {"recent": wars[:recent_limit], "best": best, "count": len(wars)}
+
+
 @bot.tree.command(name="warinfo", description="Show current PS99 clan war details", guild=guild_obj)
 async def warinfo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
@@ -8598,67 +8705,32 @@ async def warinfo(interaction: discord.Interaction):
     try:
         async with session.get(ACTIVE_BATTLE_API) as r:
             if r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the PS99 war API right now.",
-                    ephemeral=True
-                )
-
+                return await interaction.followup.send("❌ Could not reach the PS99 war API right now.", ephemeral=True)
             if "application/json" not in r.headers.get("Content-Type", ""):
-                text = await r.text()
-                print("[warinfo] war api returned non-JSON:", text[:200])
-                return await interaction.followup.send(
-                    "❌ War API returned invalid data.",
-                    ephemeral=True
-                )
-
+                print("[warinfo] war api returned non-JSON:", (await r.text())[:200])
+                return await interaction.followup.send("❌ War API returned invalid data.", ephemeral=True)
             war_data = await r.json()
 
         async with session.get(CLAN_API) as r:
             if r.status != 200:
-                return await interaction.followup.send(
-                    "❌ Could not reach the clan API right now.",
-                    ephemeral=True
-                )
-
+                return await interaction.followup.send("❌ Could not reach the clan API right now.", ephemeral=True)
             if "application/json" not in r.headers.get("Content-Type", ""):
-                text = await r.text()
-                print("[warinfo] clan api returned non-JSON:", text[:200])
-                return await interaction.followup.send(
-                    "❌ Clan API returned invalid data.",
-                    ephemeral=True
-                )
-
+                print("[warinfo] clan api returned non-JSON:", (await r.text())[:200])
+                return await interaction.followup.send("❌ Clan API returned invalid data.", ephemeral=True)
             clan_data = await r.json()
-
     except Exception as e:
         print("[warinfo error]", repr(e))
-        return await interaction.followup.send(
-            "❌ API request failed.",
-            ephemeral=True
-        )
+        return await interaction.followup.send("❌ API request failed.", ephemeral=True)
 
     battle_id, battle = get_current_war(war_data, clan_data)
-
     if not battle:
-        return await interaction.followup.send(
-            "❌ Could not determine current war.",
-            ephemeral=True
-        )
+        return await interaction.followup.send("❌ Could not determine current war.", ephemeral=True)
 
     war_config = war_data.get("data", {}).get("configData", {})
-
-    start_ts = battle.get("StartTime")
-    finish_ts = battle.get("FinishTime")
-
+    start_ts = battle.get("StartTime") or war_config.get("StartTime")
+    finish_ts = battle.get("FinishTime") or war_config.get("FinishTime")
     if not start_ts or not finish_ts:
-        start_ts = start_ts or war_config.get("StartTime")
-        finish_ts = finish_ts or war_config.get("FinishTime")
-
-    if not start_ts or not finish_ts:
-        return await interaction.followup.send(
-            "❌ War timing data missing.",
-            ephemeral=True
-        )
+        return await interaction.followup.send("❌ War timing data missing.", ephemeral=True)
 
     now = datetime.now(timezone.utc).timestamp()
     total_duration = max(finish_ts - start_ts, 1)
@@ -8667,91 +8739,78 @@ async def warinfo(interaction: discord.Interaction):
 
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     finish_dt = datetime.fromtimestamp(finish_ts, tz=timezone.utc)
+    friendly_name = _friendly_battle_name(battle_id)
 
-    friendly_name = re.sub(
-        r'(\d+)',
-        r' \1',
-        re.sub(r'([A-Z])', r' \1', str(battle_id))
-    ).strip()
+    contributions = sorted(battle.get("PointContributions", []), key=lambda x: int(x.get("Points", 0) or 0), reverse=True)
+    total_points = int(battle.get("Points") or sum(int(c.get("Points", 0) or 0) for c in contributions) or 0)
 
-    contributions = sorted(
-        battle.get("PointContributions", []),
-        key=lambda x: x.get("Points", 0),
-        reverse=True
-    )
+    # Live rank: same source the placement alert cards use (Big Games index + API fallback).
+    placement = None
+    try:
+        placement = await get_mcwv_placement_snapshot()
+    except Exception as placement_exc:
+        print(f"[warinfo] placement snapshot failed: {placement_exc}")
+    live_rank = (placement or {}).get("rank")
+    total_points = int((placement or {}).get("points") or total_points)
 
-    total_points = battle.get("Points", 0)
-    contributor_count = len(contributions)
+    # Resolve contributor Roblox IDs to linked usernames/Discords for the top 5.
+    linked_by_roblox = {}
+    try:
+        for u in db_get_all() or []:
+            linked_by_roblox[int(u[0])] = (u[2], u[1])
+    except Exception as link_exc:
+        print(f"[warinfo] link map failed: {link_exc}")
 
-    top_name = "Unknown"
-    top_discord = "Not linked"
-    top_points = 0
+    top_lines = []
+    medals = ["🥇", "🥈", "🥉", "4.", "5."]
+    for index, entry in enumerate(contributions[:5], start=1):
+        rid = int(entry.get("UserID", 0) or 0)
+        pts = int(entry.get("Points", 0) or 0)
+        share = (pts / total_points * 100) if total_points else 0
+        linked = linked_by_roblox.get(rid)
+        name = (linked[0] if linked else None) or str(rid)
+        mention = f" <@{linked[1]}>" if linked and linked[1] else ""
+        top_lines.append(f"{medals[index - 1]} **{name}**{mention} — {format_points(pts)} · {share:.1f}%")
+    top_block = "\n".join(top_lines) if top_lines else "No contributions tracked yet."
 
-    if contributions:
-        top = contributions[0]
-        top_points = top.get("Points", 0)
-        top_user_id = int(top.get("UserID", 0))
+    elapsed_hours = max(elapsed / 3600, 0.25)
+    pace = (total_points / elapsed_hours) if total_points else 0
+    projected = int(pace * (total_duration / 3600)) if pace else 0
 
-        db_users = db_get_all()
-        linked = next((u for u in db_users if int(u[0]) == top_user_id), None)
-
-        if linked:
-            top_name = linked[2]
-            top_discord = f"<@{linked[1]}>"
-        else:
-            top_name = str(top_user_id)
+    member_count = len((clan_data.get("data", {}) or {}).get("Members", []) or [])
 
     if now < start_ts:
-        status_line = "⏳ UPCOMING"
+        status_line = "⏳ UPCOMING — war hasn't started"
         color = discord.Color.gold()
-        bar = "`" + "░" * 20 + "`"
         time_field = f"Starts {discord.utils.format_dt(start_dt, 'R')}"
-
     elif now > finish_ts:
         status_line = "🏁 WAR ENDED"
         color = discord.Color.dark_gray()
-        bar = "`" + "█" * 20 + "`"
+        progress = 1.0
         time_field = f"Ended {discord.utils.format_dt(finish_dt, 'R')}"
-
     else:
-        status_line = "⚔️ ACTIVE — IN PROGRESS"
+        status_line = "⚔️ IN PROGRESS"
         color = discord.Color.red()
+        time_field = f"Ends {discord.utils.format_dt(finish_dt, 'R')} · **{fmt_hm(finish_ts - now)} left**"
 
-        filled = int(progress * 20)
-        bar = "`" + "█" * filled + "░" * (20 - filled) + f"` {int(progress * 100)}%"
+    embed = discord.Embed(title=f"⚔️ {friendly_name}", description=f"**{status_line}**", color=color)
+    embed.add_field(name="Progress", value=f"`{mcwv_bar(progress)}` **{int(progress * 100)}%**", inline=False)
 
-        secs_left = int(finish_ts - now)
-        h, rem = divmod(secs_left, 3600)
-        m = rem // 60
-        time_field = f"Ends {discord.utils.format_dt(finish_dt, 'R')} ({h}h {m}m left)"
+    if live_rank:
+        embed.add_field(name=f"{mcwv_rank_flair(live_rank)} Clan Rank", value=f"**#{live_rank}**", inline=True)
+    embed.add_field(name="🔢 Points", value=f"**{format_points(total_points)}**", inline=True)
+    if start_ts <= now <= finish_ts and pace:
+        embed.add_field(name="📈 Pace", value=f"**{format_points(int(pace))}**/hr\n→ ~**{format_points(projected)}** at end", inline=True)
 
-    embed = discord.Embed(
-        title=f"🎮 {friendly_name}",
-        description=f"**{status_line}**",
-        color=color
-    )
+    embed.add_field(name="🕐 Start", value=discord.utils.format_dt(start_dt, "f"), inline=True)
+    embed.add_field(name="🏁 End", value=discord.utils.format_dt(finish_dt, "f"), inline=True)
+    embed.add_field(name="⏱ Time", value=time_field, inline=True)
+    if member_count:
+        embed.add_field(name="👥 Contributors", value=f"**{len(contributions)}**/{member_count}", inline=True)
 
-    embed.add_field(name="Progress", value=bar, inline=False)
-    embed.add_field(name="🕐 Start", value=discord.utils.format_dt(start_dt, 'F'), inline=True)
-    embed.add_field(name="🏁 End", value=discord.utils.format_dt(finish_dt, 'F'), inline=True)
-    embed.add_field(name="⏱ Time", value=time_field, inline=False)
-    embed.add_field(
-        name="🥇 Top Contributor",
-        value=f"**{top_name}**\n{top_discord}\n**{format_points(top_points)} pts**",
-        inline=True
-    )
-    embed.add_field(
-        name="🔢 Clan Total",
-        value=f"**{format_points(total_points)} pts**",
-        inline=True
-    )
-    embed.add_field(
-        name="👥 Contributors",
-        value=f"**{contributor_count}**",
-        inline=True
-    )
+    embed.add_field(name="🏆 Top Contributors", value=top_block, inline=False)
 
-    embed.set_footer(text="Data from ps99.biggamesapi.io • Updates every 5 min")
+    mcwv_footer(embed, "PS99 live")
     await interaction.followup.send(embed=embed)
 
 
@@ -9563,23 +9622,11 @@ async def clanstats(interaction: discord.Interaction):
                     f"❌ Could not reach the PS99 API. (status {r.status})",
                     ephemeral=True
                 )
-
             raw = await r.json(content_type=None)
-            if not isinstance(raw, dict):
-                print(f"[clanstats] Invalid JSON root type: {type(raw)}")
-                return await interaction.followup.send(
-                    "❌ Invalid API response.",
-                    ephemeral=True
-                )
-
-            data = raw.get("data", {})
-            if not isinstance(data, dict):
-                print(f"[clanstats] Missing/invalid data block: {raw}")
-                return await interaction.followup.send(
-                    "❌ Invalid API response data.",
-                    ephemeral=True
-                )
-
+            if not isinstance(raw, dict) or not isinstance(raw.get("data"), dict):
+                print(f"[clanstats] Invalid API payload: {str(raw)[:200]}")
+                return await interaction.followup.send("❌ Invalid API response data.", ephemeral=True)
+            data = raw["data"]
     except Exception as e:
         print(f"[clanstats] API request failed: {e}")
         traceback.print_exc()
@@ -9589,116 +9636,112 @@ async def clanstats(interaction: discord.Interaction):
         )
 
     name = data.get("Name", CLAN_NAME)
-    level = data.get("Level", "?")
 
     members = data.get("Members", [])
     if not isinstance(members, list):
-        print(f"[clanstats] Members not a list: {type(members)}")
         members = []
+
+    level = pick_first_int(data, ("Level", "ClanLevel", "level", "Lvl", "lvl"))
+
+    # Gems: only when the API actually reports a value (never show a fake 0).
+    gem_candidates = [
+        data.get("Diamonds"), data.get("diamonds"), data.get("Bank"),
+        data.get("ClanBank"), data.get("TotalDiamonds"),
+    ]
+    if isinstance(data.get("Stats"), dict):
+        gem_candidates.append(data["Stats"].get("Diamonds"))
+    if isinstance(data.get("Economy"), dict):
+        gem_candidates.append(data["Economy"].get("Diamonds"))
+    gems = next((int(g) for g in gem_candidates if isinstance(g, (int, float)) and int(g) > 0), None)
+
+    # War record: prefer the shared Hub DB (real captured ranks/points per war),
+    # fall back to the PS99 battles dict when the DB has nothing.
+    overview = None
+    try:
+        overview = db_get_clan_war_overview()
+    except Exception as overview_exc:
+        print(f"[clanstats] war overview failed: {overview_exc}")
+        overview = None
 
     battles = data.get("Battles", {})
     if not isinstance(battles, dict):
-        print(f"[clanstats] Battles not a dict: {type(battles)}")
         battles = {}
 
-    # Robust gem / clan bank detection
-    gems = (
-        data.get("Diamonds")
-        or data.get("diamonds")
-        or data.get("Bank")
-        or data.get("ClanBank")
-        or data.get("TotalDiamonds")
-        or data.get("Stats", {}).get("Diamonds")
-        or data.get("Economy", {}).get("Diamonds")
-        or 0
-    )
-
-    if gems == 0:
-        print(f"[clanstats] Gems resolved to 0. Top-level keys: {list(data.keys())}")
-        if isinstance(data.get("Stats"), dict):
-            print(f"[clanstats] Stats keys: {list(data['Stats'].keys())}")
-        if isinstance(data.get("Economy"), dict):
-            print(f"[clanstats] Economy keys: {list(data['Economy'].keys())}")
-
-    # Best placement tracking
-    total_battles = len(battles)
-    best_battle = ""
-    best_placement = None
-
+    api_total = len(battles)
+    api_best_placement = None
+    api_best_battle = None
     for bid, b in battles.items():
         if not isinstance(b, dict):
-            print(f"[clanstats] Battle entry not a dict for {bid}: {type(b)}")
             continue
-
-        placement = (
-            b.get("Placement")
-            or b.get("Rank")
-            or b.get("Position")
-            or b.get("ClanPlacement")
-            or b.get("LeaderboardPosition")
+        placement = pick_first_int(
+            b,
+            ("Placement", "placement", "Rank", "rank", "Position", "position",
+             "ClanPlacement", "LeaderboardPosition", "Place", "place"),
         )
-
-        if placement is None:
+        if not placement:
             continue
+        if api_best_placement is None or placement < api_best_placement:
+            api_best_placement = placement
+            api_best_battle = bid
 
-        try:
-            placement = int(placement)
-        except Exception:
-            print(f"[clanstats] Bad placement value for {bid}: {placement}")
-            continue
+    total_wars = overview["count"] if overview else api_total
 
-        # Lower placement is better, e.g. Top 38 is better than Top 120
-        if best_placement is None or placement < best_placement:
-            best_placement = placement
-            best_battle = bid
+    best = overview["best"] if overview else None
+    if not best and api_best_placement:
+        best = {"name": _friendly_battle_name(api_best_battle), "rank": api_best_placement, "points": None}
 
-    def friendly_battle(bid):
-        if not bid:
-            return "—"
-        return re.sub(r'(\d+)', r' \1', re.sub(r'([A-Z])', r' \1', str(bid))).strip()
+    embed = discord.Embed(title=f"🏰 {name} — Clan Overview", color=discord.Color(MCWV_BRAND_COLOR))
 
+    # Clan icon when the API exposes an asset id.
+    icon = data.get("Icon")
+    icon_id = None
     try:
-        embed = discord.Embed(
-            title=f"🏰 {name} — Clan Overview",
-            color=discord.Color.blurple()
-        )
+        if icon is not None and str(icon).isdigit():
+            icon_id = int(str(icon))
+    except Exception:
+        icon_id = None
+    if icon_id:
+        embed.set_thumbnail(url=f"https://www.roblox.com/asset-thumbnail/image?assetId={icon_id}&width=150&height=150&format=png")
 
-        embed.add_field(name="👥 Members", value=f"**{len(members)}**", inline=True)
-        embed.add_field(name="💎 Gems", value=f"**{format_points(gems)}**", inline=True)
+    embed.add_field(name="👥 Members", value=f"**{len(members)}**", inline=True)
+    if level:
         embed.add_field(name="🏅 Clan Level", value=f"**{level}**", inline=True)
+    if gems:
+        embed.add_field(name="💎 Gems", value=f"**{format_points(gems)}**", inline=True)
+    if total_wars:
+        embed.add_field(name="⚔️ Wars Fought", value=f"**{total_wars}**", inline=True)
+    if best and best.get("rank"):
+        best_line = f"**#{best['rank']}** · {_friendly_battle_name(best.get('name'))}"
+        if best.get("points"):
+            best_line += f"\n{format_points(best['points'])} pts"
+        embed.add_field(name=f"{mcwv_rank_flair(best['rank'])} Best War", value=best_line, inline=True)
 
-        embed.add_field(
-            name="\u200b",
-            value="─────────────────────── **Battle History** ───────────────────────",
-            inline=False
-        )
+    # Live war chip — light check, details belong to /warinfo.
+    try:
+        async with session.get(ACTIVE_BATTLE_API) as r:
+            if r.status == 200 and "application/json" in r.headers.get("Content-Type", ""):
+                war_data = await r.json()
+                live_battle_id, live_battle = get_current_war(war_data, {"data": data})
+                if live_battle and live_battle_id:
+                    embed.description = f"⚔️ **War in progress: {_friendly_battle_name(live_battle_id)}** — full details with `/warinfo`"
+    except Exception as live_exc:
+        print(f"[clanstats] live war check failed: {live_exc}")
 
-        embed.add_field(name="⚔️ Battles", value=f"**{total_battles}**", inline=True)
+    recent = overview["recent"] if overview else []
+    if recent:
+        lines = []
+        for war in recent:
+            war_name = _friendly_battle_name(war["name"])
+            flair = mcwv_rank_flair(war["rank"]) if war.get("rank") else "⚔️"
+            rank_txt = f"**#{war['rank']}**" if war.get("rank") else "—"
+            pts_txt = f" · {format_points(war['points'])} pts" if war.get("points") else ""
+            when = _as_utc(war.get("when"))
+            date_txt = f" · {discord.utils.format_dt(when, 'd')}" if when else ""
+            lines.append(f"{flair} **{war_name}** → {rank_txt}{pts_txt}{date_txt}")
+        embed.add_field(name="🗓 Recent Wars", value="\n".join(lines), inline=False)
 
-        embed.add_field(
-            name="🔥 Best War",
-            value=(
-                f"**{friendly_battle(best_battle)}**\n"
-                f"🥇 Top {best_placement if best_placement is not None else '—'}"
-            ),
-            inline=True
-        )
-
-        if best_placement is None:
-            print("[clanstats] No placement found in any battle entry.")
-
-        embed.set_footer(text="ps99.biggamesapi.io")
-        await interaction.followup.send(embed=embed)
-
-    except Exception as e:
-        print(f"[clanstats] Embed build/send failed: {e}")
-        traceback.print_exc()
-        await interaction.followup.send(
-            f"❌ Failed to build clan stats: `{type(e).__name__}`",
-            ephemeral=True
-        )
-
-ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
+    mcwv_footer(embed, "PS99 live + MCWV war archive")
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="compare", description="Compare two linked clan members head-to-head in the current war", guild=guild_obj)
 async def compare(interaction: discord.Interaction, member1: discord.Member, member2: discord.Member):
