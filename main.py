@@ -704,7 +704,9 @@ async def _admin_ticket_close(ticket_id, actor_id, reason):
     await delete_ticket_control_message(guild, ticket_id=ticket["ticketId"])
     if channel:
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
-        await channel.delete(reason=f"MCWV ticket closed from Hub: {reason}")
+        deleted = await safe_delete_ticket_channel(channel, reason=f"MCWV ticket closed from Hub: {reason}")
+        if not deleted:
+            print(f"[ticket] admin close of {ticket['ticketId']}: channel auto-delete blocked by protection; channel left in place")
     return {"success": True}
 
 
@@ -4932,7 +4934,7 @@ TICKET_IGNORE_ROLE_IDS.add(1502339420207059066)
 MCWV_TICKET_CATEGORY_ID = int(os.environ.get("MCWV_TICKET_CATEGORY_ID", "1503106486392328333"))
 MCWV_TICKET_PANEL_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_PANEL_CHANNEL_ID", "1501613434364760174"))
 MCWV_TICKET_LOG_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_LOG_CHANNEL_ID", "1501997396610125876"))
-MCWV_TICKET_REVIEW_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_REVIEW_CHANNEL_ID", "1531603629063143424"))
+MCWV_TICKET_REVIEW_CHANNEL_ID = int(os.environ.get("MCWV_TICKET_REVIEW_CHANNEL_ID", "1533390721145372784"))
 MCWV_TICKET_MEMBER_ROLE_ID = int(os.environ.get("MCWV_TICKET_MEMBER_ROLE_ID", str(CLAN_MEMBER_ROLE_ID)))
 MCWV_TICKET_BLACKLIST_ROLE_ID = int(os.environ.get("MCWV_TICKET_BLACKLIST_ROLE_ID", "1516151211735257259"))
 MCWV_TICKET_STAFF_ROLE_IDS = _parse_id_set(os.environ.get("MCWV_TICKET_STAFF_ROLE_IDS")) or {ALLOWED_ROLE_ID, 1502339420207059066}
@@ -6777,6 +6779,195 @@ async def send_ticket_application_banner(channel, mention=None):
     return False
 
 
+# ---------------- TICKET CHANNEL DELETE PROTECTION ----------------
+# The ticket system must NEVER delete its own infrastructure channels. (The
+# ticket-control channel was deleted once when a Close click fell back to the
+# channel the button was pressed in.) These guards make that class of bug
+# impossible: deletes only happen for provably-real ticket channels.
+TICKET_PROTECTED_CHANNEL_IDS = {
+    cid
+    for cid in (
+        int(MCWV_TICKET_PANEL_CHANNEL_ID or 0),
+        int(MCWV_TICKET_REVIEW_CHANNEL_ID or 0),
+        int(MCWV_TICKET_LOG_CHANNEL_ID or 0),
+    )
+    if cid
+}
+
+
+def is_protected_guild_channel(channel):
+    cid = getattr(channel, "id", 0) or 0
+    return cid in TICKET_PROTECTED_CHANNEL_IDS
+
+
+def looks_like_ticket_channel(channel):
+    """True only for channels that match the real ticket naming pattern."""
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    if is_protected_guild_channel(channel):
+        return False
+    name = (getattr(channel, "name", "") or "").lower()
+    if name == "ticket-control":
+        return False
+    return name.startswith("ticket-") or name.startswith("⭐")
+
+
+async def safe_delete_ticket_channel(channel, reason):
+    """Delete a ticket channel ONLY when it provably belongs to the ticket system.
+
+    Protected (panel/review/log) channels can never be deleted, and every other
+    channel requires the ticket name pattern or a DB ticket row pointing at it.
+    When in doubt: refuse. Failing safe beats deleting the wrong channel ever again.
+    """
+    if channel is None:
+        return False
+    if is_protected_guild_channel(channel):
+        print(f"[ticket] REFUSED to delete protected channel {getattr(channel, 'id', '?')} ({getattr(channel, 'name', '?')})")
+        return False
+    if not looks_like_ticket_channel(channel):
+        row = None
+        try:
+            row = db_get_ticket_by_channel(channel.id)
+        except Exception:
+            row = None
+        if not row:
+            print(f"[ticket] REFUSED to delete unverified channel {getattr(channel, 'id', '?')} ({getattr(channel, 'name', '?')})")
+            return False
+    try:
+        await channel.delete(reason=reason)
+        return True
+    except Exception as exc:
+        print(f"[ticket] channel delete failed for {getattr(channel, 'id', '?')}: {exc}")
+        return False
+
+
+async def resolve_ticket_channel_for_close(guild, row, interaction_channel):
+    """Resolve which channel a Close should delete — or None ('touch nothing').
+
+    The old code blindly fell back to the channel the Close button was clicked
+    in; when the ticket record couldn't be loaded that channel was the staff
+    review channel, and the bot deleted it. Never again.
+    """
+    if guild is not None and row and row[1]:
+        try:
+            resolved = guild.get_channel(int(row[1]))
+            if resolved is None:
+                resolved = await guild.fetch_channel(int(row[1]))
+            if resolved is not None and not is_protected_guild_channel(resolved):
+                return resolved
+        except Exception:
+            return None
+        return None
+
+    # No usable DB record: only allow the channel the button was pressed in when
+    # it is a VERIFIED ticket channel (name pattern AND a DB row pointing at it).
+    if looks_like_ticket_channel(interaction_channel):
+        try:
+            if db_get_ticket_by_channel(interaction_channel.id):
+                return interaction_channel
+        except Exception:
+            return None
+    return None
+
+
+async def restore_application_review_messages(guild):
+    """Re-send any missing 'MCWV Application Ready for Review' messages.
+
+    Self-heals after the review channel is deleted/recreated: for every ticket
+    with a pending application, checks the review channel history for its review
+    message and re-posts it (with working buttons) when absent.
+    Returns the number of messages re-sent.
+    """
+    restored = 0
+    try:
+        if guild is None or not db_enabled():
+            return 0
+
+        review_channel = guild.get_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
+        if review_channel is None:
+            try:
+                review_channel = await guild.fetch_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
+            except Exception:
+                review_channel = None
+        if not isinstance(review_channel, discord.TextChannel):
+            print("[ticket] review restore skipped: review channel unavailable")
+            return 0
+
+        # Index review messages already present so we never double-post.
+        existing = set()
+        try:
+            async for message in review_channel.history(limit=200):
+                for embed in message.embeds:
+                    if (embed.title or "") != "MCWV Application Ready for Review":
+                        continue
+                    for field in embed.fields:
+                        if str(field.name).lower() == "ticket":
+                            existing.add(str(field.value).replace("`", "").strip())
+        except Exception as exc:
+            # Cannot verify what exists -> do nothing rather than risk duplicates.
+            print(f"[ticket] review restore history scan failed: {exc}")
+            return 0
+
+        db_ensure_mcwv_ticket_tables()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.ticket_id, t.channel_id, t.opener_discord_id, t.claimed_by,
+                       a.roblox_username, a.roblox_id, a.afk_247, a.activity, a.liquid_gems, a.why_accept
+                FROM mcwv_tickets t
+                JOIN mcwv_ticket_applications a ON a.ticket_id = t.ticket_id
+                WHERE t.status = 'pending'
+                ORDER BY t.updated_at DESC
+                LIMIT 25
+                """
+            )
+            rows = cur.fetchall()
+
+        for row in rows or []:
+            ticket_id = str(row[0])
+            if ticket_id in existing:
+                continue
+            try:
+                applicant = guild.get_member(int(row[2]))
+                if applicant is None:
+                    try:
+                        applicant = await guild.fetch_member(int(row[2]))
+                    except Exception:
+                        applicant = None
+                if applicant is None:
+                    print(f"[ticket] review restore skipped {ticket_id}: applicant no longer in server")
+                    continue
+
+                avatar_url = await get_roblox_headshot_url(row[5])
+                embed = build_application_review_embed(
+                    ticket_id,
+                    applicant,
+                    row[4] or "Unknown",
+                    row[5] or "0",
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
+                    claimed_by=row[3] or None,
+                    avatar_url=avatar_url,
+                )
+                ticket_channel = guild.get_channel(int(row[1])) if row[1] else None
+                if isinstance(ticket_channel, discord.TextChannel):
+                    embed.add_field(name="Ticket Channel", value=ticket_channel.mention, inline=False)
+                await review_channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
+                existing.add(ticket_id)
+                restored += 1
+                await asyncio.sleep(1.0)
+            except Exception as exc:
+                print(f"[ticket] review restore failed for {ticket_id}: {exc}")
+    except Exception as exc:
+        print(f"[ticket] review restore error: {exc}")
+
+    if restored:
+        print(f"[ticket] restored {restored} application review message(s) in the review channel")
+    return restored
+
+
 async def delete_ticket_control_message(guild, ticket_id=None, channel_id=None, message_id=None):
     """Delete the staff review/control message once an application is finished."""
     if not guild:
@@ -7370,19 +7561,19 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         self.control_message_id = control_message_id
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(self.ticket_id)
+        if not row and looks_like_ticket_channel(interaction.channel):
+            row = db_get_ticket_by_channel(interaction.channel.id)
         opener_id = int(row[3]) if row else None
         opened_at = row[8] if row and len(row) > 8 else None
-        ticket_channel = interaction.channel
-        if interaction.guild and row and row[1]:
-            ticket_channel = interaction.guild.get_channel(int(row[1]))
-            if ticket_channel is None:
-                try:
-                    ticket_channel = await interaction.guild.fetch_channel(int(row[1]))
-                except Exception:
-                    ticket_channel = interaction.channel
-        transcript = await build_ticket_transcript(ticket_channel)
-        db_save_ticket_transcript(self.ticket_id, ticket_channel.id, transcript)
+
+        # SAFETY: resolve the channel to delete. If we cannot prove which
+        # channel belongs to this ticket, we touch nothing (this guard exists
+        # because the old fallback once deleted the ticket-control channel).
+        ticket_channel = await resolve_ticket_channel_for_close(interaction.guild, row, interaction.channel)
+
+        transcript = await build_ticket_transcript(ticket_channel) if ticket_channel else "Channel unavailable."
+        db_save_ticket_transcript(self.ticket_id, ticket_channel.id if ticket_channel else 0, transcript)
         db_update_ticket_status(self.ticket_id, "closed", interaction.user.id, closed_at=datetime.now(timezone.utc), closed_by=interaction.user.id, close_reason=str(self.reason.value))
         await send_ticket_close_outputs(interaction.guild, ticket_channel, self.ticket_id, opener_id, interaction.user.id, opened_at, str(self.reason.value), transcript)
         await delete_ticket_control_message(
@@ -7391,12 +7582,20 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             channel_id=self.control_channel_id,
             message_id=self.control_message_id,
         )
-        await interaction.followup.send("✅ Transcript saved, sent, and the control message was removed. Deleting ticket shortly.", ephemeral=True)
+
+        if ticket_channel is None:
+            await interaction.followup.send(
+                "⚠️ Ticket marked as closed and transcript saved, but I could not verify the ticket's channel, "
+                "so **no channel was deleted** (safety lock). Please delete the channel manually if it still exists.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send("✅ Transcript saved and sent, control message removed. Deleting the ticket channel shortly.", ephemeral=True)
         await asyncio.sleep(MCWV_TICKET_DELETE_DELAY_SECONDS)
-        try:
-            await ticket_channel.delete(reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
-        except Exception as exc:
-            print("ticket delete error:", exc)
+        deleted = await safe_delete_ticket_channel(ticket_channel, reason=f"MCWV ticket closed by {interaction.user}: {self.reason.value}")
+        if not deleted:
+            print(f"[ticket] close of {self.ticket_id}: channel auto-delete blocked by protection; channel left in place")
 
 
 class AcceptConfirmView(discord.ui.View):
@@ -7874,6 +8073,15 @@ async def ticket_panel_send(
     embed.set_footer(text="MCWV Applications")
     await target_channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
     await interaction.response.send_message(f"✅ Ticket panel sent in {target_channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="ticket_review_restore", description="Re-send any missing application review messages in the review channel", guild=guild_obj)
+async def ticket_review_restore(interaction: discord.Interaction):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    restored = await restore_application_review_messages(interaction.guild)
+    await interaction.followup.send(f"✅ Done — {restored} review message(s) re-sent to the review channel.", ephemeral=True)
 
 
 @bot.tree.command(name="guide", description="Officer tutorial for MCWV-BOT and Hub tools", guild=guild_obj)
@@ -13811,6 +14019,16 @@ async def on_ready():
         print("🎁 Giveaway state synced")
     except Exception as e:
         print(f"❌ Giveaway sync error: {e}")
+
+    # ---------------- TICKET REVIEW SELF-HEAL ----------------
+    # If the staff review channel was deleted/recreated, re-post any missing
+    # 'MCWV Application Ready for Review' messages for pending applications.
+    try:
+        guild = bot.get_guild(GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+        restored = await restore_application_review_messages(guild)
+        print(f"🎫 Ticket review restore done ({restored} re-posted)")
+    except Exception as e:
+        print(f"❌ Ticket review restore error: {e}")
 
     print("✅ ON_READY DONE")
 # ---------------- CLEANUP ----------------
