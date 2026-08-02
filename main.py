@@ -3877,7 +3877,10 @@ async def resolve_roblox_username(username: str):
 # ---------------- ROLE CHECK ----------------
 def require_role():
     async def predicate(interaction: discord.Interaction) -> bool:
-        role_ids = [r.id for r in interaction.user.roles]
+        # The server owner can always run staff commands, even without the role.
+        if interaction.guild and interaction.guild.owner_id == interaction.user.id:
+            return True
+        role_ids = [r.id for r in getattr(interaction.user, "roles", [])]
         return ALLOWED_ROLE_ID in role_ids
     return app_commands.check(predicate)
 
@@ -4278,7 +4281,7 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="giveaway_start", guild=guild_obj)
+@bot.tree.command(name="giveaway_start", description="Start the MCWV invite giveaway", guild=guild_obj)
 @require_role()
 @app_commands.describe(
     prize="What is being given away",
@@ -4374,7 +4377,7 @@ async def giveaway_start(
         )
 
 
-@bot.tree.command(name="giveaway_edit", guild=guild_obj)
+@bot.tree.command(name="giveaway_edit", description="Edit the active invite giveaway settings", guild=guild_obj)
 async def giveaway_edit(
     interaction: discord.Interaction,
     prize: str = None,
@@ -4442,7 +4445,7 @@ async def giveaway_edit(
         )
 
 
-@bot.tree.command(name="giveaway_end", guild=guild_obj)
+@bot.tree.command(name="giveaway_end", description="End the invite giveaway and pick winners", guild=guild_obj)
 @require_role()
 async def giveaway_end(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -4568,7 +4571,7 @@ class InviteView(discord.ui.View):
 
 # ---------------- INVITE DEBUG TOOLKIT ----------------
 
-@bot.tree.command(name="invite_debug", guild=guild_obj)
+@bot.tree.command(name="invite_debug", description="Staff diagnostic: show invite tracking state", guild=guild_obj)
 @require_role()
 async def invite_debug(interaction: discord.Interaction):
     event = get_active_event()
@@ -4585,7 +4588,7 @@ async def invite_debug(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@bot.tree.command(name="invite_snapshot_refresh", guild=guild_obj)
+@bot.tree.command(name="invite_snapshot_refresh", description="Refresh the invite snapshot cache", guild=guild_obj)
 @require_role()
 async def invite_snapshot_refresh(interaction: discord.Interaction):
     guild = interaction.guild
@@ -4612,7 +4615,7 @@ async def invite_snapshot_refresh(interaction: discord.Interaction):
             ephemeral=True
         )
 
-@bot.tree.command(name="invite_simulate", guild=guild_obj)
+@bot.tree.command(name="invite_simulate", description="Simulate invite joins for a member (test)", guild=guild_obj)
 @require_role()
 async def invite_simulate(interaction: discord.Interaction, amount: int = 1):
 
@@ -4643,7 +4646,7 @@ async def invite_simulate(interaction: discord.Interaction, amount: int = 1):
         )
 
 
-@bot.tree.command(name="invite_full_test", guild=guild_obj)
+@bot.tree.command(name="invite_full_test", description="Run a full invite-system self test", guild=guild_obj)
 @require_role()
 async def invite_full_test(interaction: discord.Interaction):
     try:
@@ -4673,7 +4676,7 @@ async def invite_full_test(interaction: discord.Interaction):
             ephemeral=True
         )
 
-@bot.tree.command(name="host_invite_event", guild=guild_obj)
+@bot.tree.command(name="host_invite_event", description="Host a timed invite event with a prize", guild=guild_obj)
 @require_role()
 @app_commands.describe(duration_hours="Event duration")
 async def host_invite_event(interaction: discord.Interaction, duration_hours: int):
@@ -4734,7 +4737,7 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
             ephemeral=True
         )
         
-@bot.tree.command(name="end_invite_event", guild=guild_obj)
+@bot.tree.command(name="end_invite_event", description="End the current invite event and announce winners", guild=guild_obj)
 @require_role()
 async def end_invite_event(interaction: discord.Interaction):
 
@@ -4848,7 +4851,7 @@ async def on_member_remove(member: discord.Member):
         WHERE user_id = ?
     """, (inviter_id,))
 
-@bot.tree.command(name="inviteleaderboard", guild=guild_obj)
+@bot.tree.command(name="inviteleaderboard", description="Show the MCWV invite leaderboard", guild=guild_obj)
 async def inviteleaderboard(interaction: discord.Interaction):
     rows = db_fetchall("""
         SELECT user_id, invites
@@ -8301,7 +8304,7 @@ async def broadcast_ticket_sync(
         await interaction.followup.send(message[:1900], ephemeral=True)
 
 
-@bot.tree.command(name="refreshprofile", guild=guild_obj)
+@bot.tree.command(name="refreshprofile", description="Refresh a member's cached Roblox profile data", guild=guild_obj)
 @require_role()
 @app_commands.describe(roblox_id="Roblox user ID to refresh")
 async def refreshprofile(interaction: discord.Interaction, roblox_id: str):
@@ -8352,7 +8355,8 @@ async def refreshprofile(interaction: discord.Interaction, roblox_id: str):
             ephemeral=True
         )
         
-@bot.tree.command(name="statstest", guild=guild_obj)
+@bot.tree.command(name="statstest", description="Staff diagnostic: sample one tracked DB row", guild=guild_obj)
+@require_role()
 async def statstest(interaction: discord.Interaction):
     try:
         users = db_get_all()
@@ -8361,7 +8365,8 @@ async def statstest(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"ERROR: {e}", ephemeral=True)
 
-@bot.tree.command(name="dbtest", guild=guild_obj)
+@bot.tree.command(name="dbtest", description="Staff diagnostic: check DB and profile cache health", guild=guild_obj)
+@require_role()
 async def dbtest(interaction: discord.Interaction):
     try:
         users = db_get_all() or []
