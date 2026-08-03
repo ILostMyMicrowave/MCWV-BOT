@@ -5348,7 +5348,36 @@ async def resolve_broadcast_recipients(interaction, audience, value=None, role=N
     else:
         raise ValueError("Unknown broadcast audience filter.")
 
-    return dedupe_recipients(selected)
+    # Enrich recipients with competitive + war context for template variables.
+    next_by_id = {}
+    for index, item in enumerate(users):
+        above = users[index - 1] if index > 0 else None
+        next_by_id[item["discord_id"]] = (
+            above["username"] if above else "—",
+            max(0, (above["points"] - item["points"])) if above else 0,
+        )
+
+    war_time_left = "—"
+    clan_rank = None
+    try:
+        context = await get_broadcast_war_context()
+        finish = context.get("finish")
+        if finish:
+            remaining = int(finish - time.time())
+            war_time_left = (fmt_hm(remaining) + " left") if remaining > 0 else "ended"
+        clan_rank = context.get("clan_rank")
+    except Exception as exc:
+        print(f"[broadcast] context vars failed: {exc}")
+
+    deduped = dedupe_recipients(selected)
+    for item in deduped:
+        above_name, gap = next_by_id.get(item["discord_id"], ("—", 0))
+        item["next_player"] = above_name
+        item["next_rank_gap"] = gap
+        item["war_time_left"] = war_time_left
+        item["clan_rank"] = clan_rank
+
+    return deduped
 
 
 def render_broadcast_message(template, recipient):
@@ -5366,7 +5395,11 @@ def render_broadcast_message(template, recipient):
         .replace("{role}", str(recipient.get("role") or "member")) \
         .replace("{ticket}", ticket) \
         .replace("{pph}", str(recipient.get("pph", 0))) \
-        .replace("{change5m}", str(recipient.get("change5m", 0)))
+        .replace("{change5m}", str(recipient.get("change5m", 0))) \
+        .replace("{next_player}", str(recipient.get("next_player") or "—")) \
+        .replace("{next_rank_gap}", str(recipient.get("next_rank_gap", 0))) \
+        .replace("{war_time_left}", str(recipient.get("war_time_left") or "—")) \
+        .replace("{clan_rank}", (f"#{recipient.get('clan_rank')}" if recipient.get("clan_rank") else "—"))
 
 
 def broadcast_embed_for(message, recipient):
@@ -5548,14 +5581,40 @@ async def _admin_broadcast_send_from_body(body):
 
     sent = 0
     failed = []
+    results = []
 
     for recipient in recipients:
         ok, _where, error = await send_broadcast_to_recipient(guild, recipient, delivery, style, message)
+        results.append({
+            "roblox_id": recipient.get("roblox_id"),
+            "discord_id": recipient.get("discord_id"),
+            "username": recipient.get("username"),
+            "points_at_send": recipient.get("points", 0),
+            "delivered": bool(ok),
+            "error": error,
+        })
         if ok:
             sent += 1
         else:
             failed.append((recipient, error))
         await asyncio.sleep(0.8)
+
+    try:
+        _ctx = await get_broadcast_war_context()
+        db_record_broadcast_send(
+            source="hub",
+            actor=actor_name,
+            actor_discord_id=None,
+            audience=audience,
+            value=value,
+            delivery=delivery,
+            style=style,
+            message=message,
+            results=results,
+            battle_key=_ctx.get("battle_key") or "",
+        )
+    except Exception as exc:
+        print(f"[broadcast] hub send record failed: {exc}")
 
     metadata = {
         "sender": actor_name,
@@ -5596,9 +5655,769 @@ async def _admin_broadcast_send_from_body(body):
     }
 
 
+# ---------------- BROADCAST FEATURE TABLES ----------------
+
+_BROADCAST_TABLES_READY = False
+
+
+def ensure_broadcast_feature_tables():
+    """Create the broadcast template/log/schedule tables (idempotent)."""
+    global _BROADCAST_TABLES_READY
+    if _BROADCAST_TABLES_READY or not db_enabled():
+        return
+
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS broadcast_templates (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    audience TEXT NOT NULL DEFAULT 'everyone',
+                    value TEXT NOT NULL DEFAULT '',
+                    delivery TEXT NOT NULL DEFAULT 'dm',
+                    style TEXT NOT NULL DEFAULT 'plain',
+                    message TEXT NOT NULL,
+                    created_by TEXT,
+                    updated_by TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS broadcast_sends (
+                    id BIGSERIAL PRIMARY KEY,
+                    actor TEXT,
+                    actor_discord_id TEXT,
+                    source TEXT NOT NULL DEFAULT 'discord',
+                    template_id BIGINT,
+                    audience TEXT,
+                    value TEXT,
+                    delivery TEXT,
+                    style TEXT,
+                    message TEXT NOT NULL,
+                    battle_key TEXT,
+                    matched_count INTEGER NOT NULL DEFAULT 0,
+                    sent_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'done',
+                    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    conversion_checked_at TIMESTAMPTZ,
+                    conversion_zero_at_send INTEGER,
+                    conversion_scorers INTEGER,
+                    conversion_points BIGINT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS broadcast_recipients (
+                    id BIGSERIAL PRIMARY KEY,
+                    send_id BIGINT NOT NULL REFERENCES broadcast_sends(id) ON DELETE CASCADE,
+                    roblox_id TEXT,
+                    discord_id TEXT,
+                    username TEXT,
+                    points_at_send BIGINT NOT NULL DEFAULT 0,
+                    delivered BOOLEAN NOT NULL DEFAULT FALSE,
+                    error TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS broadcast_recipients_send_idx
+                ON broadcast_recipients (send_id)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS broadcast_schedules (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    audience TEXT NOT NULL DEFAULT 'everyone',
+                    value TEXT NOT NULL DEFAULT '',
+                    delivery TEXT NOT NULL DEFAULT 'dm',
+                    style TEXT NOT NULL DEFAULT 'plain',
+                    message TEXT NOT NULL DEFAULT '',
+                    top_n INTEGER,
+                    hours_before_end NUMERIC,
+                    run_at TIMESTAMPTZ,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_by TEXT,
+                    last_fired_at TIMESTAMPTZ,
+                    last_fired_battle TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # Seed sensible defaults on first run only (all editable in the hub).
+            cur.execute("SELECT COUNT(*) FROM broadcast_schedules")
+            if int(cur.fetchone()[0] or 0) == 0:
+                cur.executemany("""
+                    INSERT INTO broadcast_schedules
+                        (name, kind, audience, value, delivery, style, message, top_n, hours_before_end, enabled, created_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, [
+                    (
+                        "🏆 Auto congrats — war end",
+                        "war_end_congrats",
+                        "everyone",
+                        "",
+                        "dm",
+                        "embed",
+                        "🏆 War's over {username}! You finished **#{rank}** with **{points}** points. Absolute legend — rest up, next war soon 💜",
+                        10,
+                        None,
+                        True,
+                        "system",
+                    ),
+                    (
+                        "⚠️ Final 24h lock-in (zero pointers)",
+                        "war_final_hours",
+                        "zero_points",
+                        "",
+                        "dm",
+                        "plain",
+                        "⚠️ {username}, war ends in {war_time_left} and you're still on 0 points. Get ANY score on the board or it's a warning! ⏳",
+                        None,
+                        24,
+                        False,
+                        "system",
+                    ),
+                    (
+                        "⚔️ Mid-war push (low scorers)",
+                        "war_midpoint",
+                        "zero_points",
+                        "",
+                        "dm",
+                        "plain",
+                        "⚔️ {username}, we're halfway through the war and you're on {points} points — jump in, every point counts. Clan rank: {clan_rank}! 🔥",
+                        None,
+                        None,
+                        False,
+                        "system",
+                    ),
+                ])
+        conn.commit()
+        _BROADCAST_TABLES_READY = True
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] table setup failed: {exc}")
+
+
+# ---------------- BROADCAST TEMPLATE CRUD ----------------
+
+def db_list_broadcast_templates(limit=100):
+    if not db_enabled():
+        return []
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, audience, value, delivery, style, message, created_by, updated_by, updated_at
+                FROM broadcast_templates
+                ORDER BY name ASC
+                LIMIT %s
+            """, (int(limit),))
+            rows = cur.fetchall()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] list templates failed: {exc}")
+        return []
+
+    return [
+        {
+            "id": int(row[0]),
+            "name": str(row[1] or ""),
+            "audience": str(row[2] or "everyone"),
+            "value": str(row[3] or ""),
+            "delivery": str(row[4] or "dm"),
+            "style": str(row[5] or "plain"),
+            "message": str(row[6] or ""),
+            "created_by": str(row[7]) if row[7] else None,
+            "updated_by": str(row[8]) if row[8] else None,
+        }
+        for row in rows
+    ]
+
+
+def db_get_broadcast_template(ref):
+    """Look up a template by numeric id or exact (case-insensitive) name."""
+    if not db_enabled() or ref is None:
+        return None
+    ref_text = str(ref).strip()
+    if not ref_text:
+        return None
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            if ref_text.isdigit():
+                cur.execute("""
+                    SELECT id, name, audience, value, delivery, style, message
+                    FROM broadcast_templates WHERE id = %s
+                """, (int(ref_text),))
+            else:
+                cur.execute("""
+                    SELECT id, name, audience, value, delivery, style, message
+                    FROM broadcast_templates WHERE LOWER(name) = LOWER(%s)
+                """, (ref_text,))
+            row = cur.fetchone()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] get template failed: {exc}")
+        return None
+
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "name": str(row[1] or ""),
+        "audience": str(row[2] or "everyone"),
+        "value": str(row[3] or ""),
+        "delivery": str(row[4] or "dm"),
+        "style": str(row[5] or "plain"),
+        "message": str(row[6] or ""),
+    }
+
+
+def db_create_broadcast_template(name, audience, delivery, style, message, value, actor):
+    ensure_broadcast_feature_tables()
+    if not db_enabled():
+        raise ValueError("Database is not available.")
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO broadcast_templates (name, audience, value, delivery, style, message, created_by, updated_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (name, audience, value or "", delivery, style, message, actor, actor))
+        new_id = cur.fetchone()[0]
+    conn.commit()
+    return int(new_id)
+
+
+def db_delete_broadcast_template(ref):
+    if not db_enabled():
+        return False
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            if str(ref).strip().isdigit():
+                cur.execute("DELETE FROM broadcast_templates WHERE id = %s", (int(ref),))
+            else:
+                cur.execute("DELETE FROM broadcast_templates WHERE LOWER(name) = LOWER(%s)", (str(ref).strip(),))
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted > 0
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] delete template failed: {exc}")
+        return False
+
+
+# ---------------- BROADCAST SEND LOG + RECIPIENTS ----------------
+
+def db_record_broadcast_send(*, source, actor, actor_discord_id, audience, value, delivery, style,
+                             message, results, battle_key, template_id=None):
+    """Persist a broadcast send + per-recipient rows for history & conversion."""
+    ensure_broadcast_feature_tables()
+    if not db_enabled():
+        return None
+
+    results = list(results or [])
+    sent = sum(1 for item in results if item.get("delivered"))
+    failed = len(results) - sent
+    status = "done" if failed == 0 else ("partial" if sent > 0 else "failed")
+    zero_at_send = sum(1 for item in results if int(item.get("points_at_send") or 0) <= 0)
+
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO broadcast_sends
+                    (actor, actor_discord_id, source, template_id, audience, value, delivery, style,
+                     message, battle_key, matched_count, sent_count, failed_count, status, conversion_zero_at_send)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                actor,
+                str(actor_discord_id) if actor_discord_id else None,
+                source,
+                template_id,
+                audience,
+                value or "",
+                delivery,
+                style,
+                message,
+                battle_key or None,
+                len(results),
+                sent,
+                failed,
+                status,
+                zero_at_send,
+            ))
+            send_id = int(cur.fetchone()[0])
+
+            if results:
+                cur.executemany("""
+                    INSERT INTO broadcast_recipients
+                        (send_id, roblox_id, discord_id, username, points_at_send, delivered, error)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, [
+                    (
+                        send_id,
+                        str(item.get("roblox_id") or ""),
+                        str(item.get("discord_id") or ""),
+                        str(item.get("username") or ""),
+                        int(item.get("points_at_send") or 0),
+                        bool(item.get("delivered")),
+                        str(item.get("error"))[:300] if item.get("error") else None,
+                    )
+                    for item in results
+                ])
+        conn.commit()
+        return send_id
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] send log failed: {exc}")
+        return None
+
+
+# ---------------- BROADCAST WAR CONTEXT (cached) ----------------
+
+_BROADCAST_WAR_CACHE = {"ts": 0.0, "data": {}}
+
+
+async def get_broadcast_war_context(force=False):
+    """Cached active-war info for broadcast vars: battle id/key, start/finish, clan rank."""
+    now = time.time()
+    if not force and _BROADCAST_WAR_CACHE["data"] and now - _BROADCAST_WAR_CACHE["ts"] < 300:
+        return _BROADCAST_WAR_CACHE["data"]
+
+    context = {"battle_id": None, "battle_key": "", "start": None, "finish": None, "clan_rank": None}
+    try:
+        battle_id = await get_active_battle_id_for_placement()
+        if battle_id:
+            context["battle_id"] = battle_id
+            context["battle_key"] = normalize_hourly_battle_key(battle_id)
+
+        active_payload = await fetch_json_for_placement(ACTIVE_BATTLE_API)
+        active_data = active_payload.get("data", {}) if isinstance(active_payload, dict) else {}
+        config = active_data.get("configData", {}) if isinstance(active_data, dict) else {}
+        start = pick_first_int(config, ("StartTime", "startTime", "start_time")) or pick_first_int(active_data, ("startTime",))
+        finish = pick_first_int(config, ("FinishTime", "finishTime", "finish_time")) or pick_first_int(active_data, ("finishTime",))
+        if start and start > 10_000_000_000:
+            start //= 1000
+        if finish and finish > 10_000_000_000:
+            finish //= 1000
+        context["start"] = start
+        context["finish"] = finish
+
+        snapshot = await get_mcwv_placement_snapshot()
+        if isinstance(snapshot, dict):
+            context["clan_rank"] = snapshot.get("rank")
+    except Exception as exc:
+        print(f"[broadcast] war context failed: {exc}")
+
+    _BROADCAST_WAR_CACHE["ts"] = now
+    _BROADCAST_WAR_CACHE["data"] = context
+    return context
+
+
+# ---------------- BROADCAST CONVERSION CHECKS ----------------
+
+def db_run_broadcast_conversion_checks(limit=5):
+    """24h after a send, measure: zero-at-send recipients who scored, and points gained."""
+    ensure_broadcast_feature_tables()
+    if not db_enabled():
+        return
+
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, battle_key
+                FROM broadcast_sends
+                WHERE conversion_checked_at IS NULL
+                  AND sent_at <= NOW() - INTERVAL '24 hours'
+                ORDER BY sent_at ASC
+                LIMIT %s
+            """, (int(limit),))
+            pending = cur.fetchall()
+
+            for send_id, battle_key in pending:
+                if not battle_key:
+                    cur.execute("""
+                        UPDATE broadcast_sends
+                        SET conversion_checked_at = NOW()
+                        WHERE id = %s
+                    """, (send_id,))
+                    continue
+
+                cur.execute("""
+                    WITH recip AS (
+                        SELECT roblox_id, points_at_send
+                        FROM broadcast_recipients
+                        WHERE send_id = %s AND delivered
+                    ),
+                    latest AS (
+                        SELECT DISTINCT ON (roblox_id)
+                            roblox_id, points
+                        FROM player_leaderboard_history
+                        WHERE regexp_replace(lower(battle_id), '[^a-z0-9]+', '', 'g') = %s
+                          AND points IS NOT NULL
+                        ORDER BY roblox_id, captured_at DESC
+                    )
+                    SELECT
+                        COUNT(*) FILTER (
+                            WHERE r.points_at_send <= 0 AND COALESCE(l.points, 0) > 0
+                        ) AS zero_starters,
+                        COALESCE(SUM(GREATEST(0, COALESCE(l.points, r.points_at_send) - r.points_at_send)), 0) AS gained
+                    FROM recip r
+                    LEFT JOIN latest l ON l.roblox_id = r.roblox_id
+                """, (send_id, battle_key))
+                row = cur.fetchone() or (0, 0)
+                cur.execute("""
+                    UPDATE broadcast_sends
+                    SET conversion_checked_at = NOW(),
+                        conversion_scorers = %s,
+                        conversion_points = %s
+                    WHERE id = %s
+                """, (send_id, int(row[0] or 0), int(row[1] or 0)))
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] conversion check failed: {exc}")
+
+
+# ---------------- BROADCAST SCHEDULER ----------------
+
+def db_get_enabled_broadcast_schedules():
+    if not db_enabled():
+        return []
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, kind, audience, value, delivery, style, message,
+                       top_n, hours_before_end, run_at, last_fired_at, last_fired_battle
+                FROM broadcast_schedules
+                WHERE enabled
+                ORDER BY id ASC
+            """)
+            rows = cur.fetchall()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] schedule list failed: {exc}")
+        return []
+
+    schedules = []
+    for row in rows:
+        schedules.append({
+            "id": int(row[0]),
+            "name": str(row[1] or "Broadcast"),
+            "kind": str(row[2] or "one_time"),
+            "audience": str(row[3] or "everyone"),
+            "value": str(row[4] or ""),
+            "delivery": str(row[5] or "dm"),
+            "style": str(row[6] or "plain"),
+            "message": str(row[7] or ""),
+            "top_n": int(row[8]) if row[8] is not None else None,
+            "hours_before_end": float(row[9]) if row[9] is not None else None,
+            "run_at": row[10],
+            "last_fired_at": row[11],
+            "last_fired_battle": str(row[12]) if row[12] else "",
+        })
+    return schedules
+
+
+def db_mark_schedule_fired(schedule_id, battle_key=None, disable=False):
+    if not db_enabled():
+        return
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            if disable:
+                cur.execute("""
+                    UPDATE broadcast_schedules
+                    SET last_fired_at = NOW(), last_fired_battle = COALESCE(%s, last_fired_battle), enabled = FALSE
+                    WHERE id = %s
+                """, (battle_key or None, int(schedule_id)))
+            else:
+                cur.execute("""
+                    UPDATE broadcast_schedules
+                    SET last_fired_at = NOW(), last_fired_battle = COALESCE(%s, last_fired_battle)
+                    WHERE id = %s
+                """, (battle_key or None, int(schedule_id)))
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] schedule mark failed: {exc}")
+
+
+async def build_war_end_congrats_recipients(top_n):
+    """Top N scorers of the most recently ENDED war, matched to linked Discord users."""
+    clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    battles = (data.get("Battles") or {}) if isinstance(data, dict) else {}
+    if not isinstance(battles, dict) or not battles:
+        return None, []
+
+    now = time.time()
+    ended = []
+    for key, battle in battles.items():
+        if not isinstance(battle, dict):
+            continue
+        finish = pick_first_int(battle, ("FinishTime", "finishTime", "finish_time", "EndTime", "endTime"))
+        if finish and finish > 10_000_000_000:
+            finish //= 1000
+        ended.append((finish or 0, key, battle))
+
+    ended.sort(key=lambda item: item[0], reverse=True)
+    if not ended:
+        return None, []
+
+    _finish, battle_id, battle = ended[0]
+    contributions = battle.get("PointContributions") or battle.get("pointContributions") or []
+    scorers = []
+    for entry in contributions if isinstance(contributions, list) else []:
+        try:
+            rid = str(int(entry.get("UserID") or entry.get("userId") or 0))
+            pts = int(entry.get("Points") or entry.get("points") or 0)
+            if rid and pts > 0:
+                scorers.append((rid, pts))
+        except Exception:
+            continue
+    scorers.sort(key=lambda item: item[1], reverse=True)
+    scorers = scorers[:max(1, int(top_n or 10))]
+
+    rows = _safe_call("db_get_broadcast_users", []) or []
+    by_roblox = {str(row[0]).strip(): row for row in rows if len(row) > 0 and row[0] is not None}
+
+    recipients = []
+    for index, (rid, pts) in enumerate(scorers, start=1):
+        row = by_roblox.get(rid)
+        if not row:
+            continue
+        user = broadcast_user_from_row(row, {}, {})
+        user["points"] = pts
+        user["rank"] = index
+        user["war_time_left"] = "ended"
+        user["next_player"] = "—"
+        user["next_rank_gap"] = 0
+        user["clan_rank"] = None
+        recipients.append(user)
+
+    battle_key = normalize_hourly_battle_key(battle_id)
+    return (battle_key, dedupe_recipients(recipients)) if battle_key else (None, [])
+
+
+async def fire_broadcast_schedule(row, context):
+    """Execute one schedule row: resolve recipients, rate-limited send, log it."""
+    guild = broadcast_primary_guild()
+    if not guild:
+        raise ValueError("Broadcast guild unavailable")
+
+    kind = row["kind"]
+    battle_key = context.get("battle_key") or ""
+
+    if kind == "war_end_congrats":
+        battle_key, recipients = await build_war_end_congrats_recipients(row.get("top_n"))
+        if not battle_key:
+            raise ValueError("No ended battle found for congrats broadcast")
+    else:
+        fake_context = type("BroadcastContext", (), {"guild": guild})()
+        recipients = await resolve_broadcast_recipients(
+            fake_context,
+            row.get("audience") or "everyone",
+            value=row.get("value") or "",
+        )
+
+    if not recipients:
+        raise ValueError("Schedule matched zero recipients")
+
+    results = []
+    sent = 0
+    for recipient in recipients:
+        ok, _where, error = await send_broadcast_to_recipient(
+            guild, recipient, row.get("delivery") or "dm", row.get("style") or "plain", row["message"]
+        )
+        results.append({
+            "roblox_id": recipient.get("roblox_id"),
+            "discord_id": recipient.get("discord_id"),
+            "username": recipient.get("username"),
+            "points_at_send": recipient.get("points", 0),
+            "delivered": bool(ok),
+            "error": error,
+        })
+        if ok:
+            sent += 1
+        await asyncio.sleep(0.8)
+
+    db_record_broadcast_send(
+        source="auto_congrats" if kind == "war_end_congrats" else "scheduler",
+        actor=row.get("name") or "Broadcast Scheduler",
+        actor_discord_id=None,
+        audience="top_n" if kind == "war_end_congrats" else row.get("audience"),
+        value=str(row.get("top_n") or "") if kind == "war_end_congrats" else (row.get("value") or ""),
+        delivery=row.get("delivery") or "dm",
+        style=row.get("style") or "plain",
+        message=row["message"],
+        results=results,
+        battle_key=battle_key,
+    )
+
+    db_log_admin_action(
+        "info",
+        "Scheduled Broadcast Sent",
+        f"'{row.get('name')}' fired: {sent}/{len(recipients)} delivered ({kind}).",
+        "broadcast/schedule",
+        row.get("name") or "Scheduler",
+        {"kind": kind, "sent": sent, "matched": len(recipients)},
+    )
+    return sent, len(recipients)
+
+
+_CONGRATS_BATTLE_CACHE = {"ts": 0.0, "key": ""}
+
+
+async def get_ended_battle_key_for_congrats():
+    """Most recent ENDED battle's normalized key (cached 5 min)."""
+    now = time.time()
+    if _CONGRATS_BATTLE_CACHE["key"] and now - _CONGRATS_BATTLE_CACHE["ts"] < 300:
+        return _CONGRATS_BATTLE_CACHE["key"]
+
+    key = ""
+    try:
+        clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+        data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+        battles = (data.get("Battles") or {}) if isinstance(data, dict) else {}
+        ended = []
+        for battle_id, battle in battles.items() if isinstance(battles, dict) else []:
+            if not isinstance(battle, dict):
+                continue
+            finish = pick_first_int(battle, ("FinishTime", "finishTime", "finish_time", "EndTime", "endTime"))
+            if finish and finish > 10_000_000_000:
+                finish //= 1000
+            ended.append((finish or 0, battle_id))
+        ended.sort(key=lambda item: item[0], reverse=True)
+        if ended:
+            key = normalize_hourly_battle_key(ended[0][1])
+    except Exception as exc:
+        print(f"[broadcast] congrats battle lookup failed: {exc}")
+
+    _CONGRATS_BATTLE_CACHE["ts"] = now
+    _CONGRATS_BATTLE_CACHE["key"] = key
+    return key
+
+
+@tasks.loop(seconds=60)
+async def broadcast_scheduler_loop():
+    if not db_enabled():
+        return
+
+    ensure_broadcast_feature_tables()
+
+    # Conversion checks run every tick (cheap, age-gated per send).
+    db_run_broadcast_conversion_checks()
+
+    rows = db_get_enabled_broadcast_schedules()
+    if not rows:
+        return
+
+    context = await get_broadcast_war_context()
+    now = time.time()
+    now_dt = datetime.now(timezone.utc)
+
+    for row in rows:
+        try:
+            kind = row["kind"]
+
+            if kind == "one_time":
+                run_at = row.get("run_at")
+                if not run_at or row.get("last_fired_at"):
+                    continue
+                run_dt = run_at if getattr(run_at, "tzinfo", None) else run_at.replace(tzinfo=timezone.utc)
+                if run_dt > now_dt:
+                    continue
+                db_mark_schedule_fired(row["id"], context.get("battle_key") or None, disable=True)
+                await fire_broadcast_schedule(row, context)
+                continue
+
+            battle_key = context.get("battle_key") or ""
+            start = context.get("start")
+            finish = context.get("finish")
+
+            if kind == "war_midpoint":
+                if not battle_key or not start or not finish:
+                    continue
+                if row["last_fired_battle"] == battle_key:
+                    continue
+                if not (start <= now <= finish):
+                    continue
+                midpoint = start + (finish - start) / 2
+                if now < midpoint:
+                    continue
+                db_mark_schedule_fired(row["id"], battle_key)
+                await fire_broadcast_schedule(row, context)
+                continue
+
+            if kind == "war_final_hours":
+                if not battle_key or not finish:
+                    continue
+                if row["last_fired_battle"] == battle_key:
+                    continue
+                hours = float(row.get("hours_before_end") or 24)
+                if not (now >= finish - hours * 3600 and now <= finish):
+                    continue
+                db_mark_schedule_fired(row["id"], battle_key)
+                await fire_broadcast_schedule(row, context)
+                continue
+
+            if kind == "war_end_congrats":
+                ended_key = await get_ended_battle_key_for_congrats()
+                if not ended_key:
+                    continue
+                if row["last_fired_battle"] == ended_key:
+                    continue
+                # Only fire once the ACTIVE battle has moved past this battle too.
+                if battle_key and battle_key == ended_key and finish and now <= finish:
+                    continue
+                db_mark_schedule_fired(row["id"], ended_key)
+                await fire_broadcast_schedule(row, context)
+                continue
+
+        except Exception as exc:
+            print(f"[broadcast] schedule {row.get('id')} failed: {exc}")
+
+
+@broadcast_scheduler_loop.before_loop
+async def before_broadcast_scheduler_loop():
+    await bot.wait_until_ready()
+
+
+
 class BroadcastConfirmView(discord.ui.View):
-    def __init__(self, *, sender_id, actor_name, recipients, audience, value, delivery, style, message):
-        super().__init__(timeout=120)
+    def __init__(self, *, sender_id, actor_name, recipients, audience, value, delivery, style, message, template_id=None):
+        super().__init__(timeout=300)
         self.sender_id = sender_id
         self.actor_name = actor_name
         self.recipients = recipients
@@ -5607,6 +6426,7 @@ class BroadcastConfirmView(discord.ui.View):
         self.delivery = delivery
         self.style = style
         self.message = message
+        self.template_id = template_id
         self.done = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -5636,6 +6456,7 @@ class BroadcastConfirmView(discord.ui.View):
 
         sent = 0
         failed = []
+        results = []
 
         for recipient in self.recipients:
             ok, _where, error = await send_broadcast_to_recipient(
@@ -5645,11 +6466,37 @@ class BroadcastConfirmView(discord.ui.View):
                 self.style,
                 self.message,
             )
+            results.append({
+                "roblox_id": recipient.get("roblox_id"),
+                "discord_id": recipient.get("discord_id"),
+                "username": recipient.get("username"),
+                "points_at_send": recipient.get("points", 0),
+                "delivered": bool(ok),
+                "error": error,
+            })
             if ok:
                 sent += 1
             else:
                 failed.append((recipient, error))
             await asyncio.sleep(0.8)
+
+        try:
+            _ctx = await get_broadcast_war_context()
+            db_record_broadcast_send(
+                source="discord",
+                actor=self.actor_name,
+                actor_discord_id=interaction.user.id,
+                audience=self.audience,
+                value=self.value,
+                delivery=self.delivery,
+                style=self.style,
+                message=self.message,
+                results=results,
+                battle_key=_ctx.get("battle_key") or "",
+                template_id=self.template_id,
+            )
+        except Exception as exc:
+            print(f"[broadcast] send record failed: {exc}")
 
         metadata = {
             "senderDiscordId": str(interaction.user.id),
@@ -5703,6 +6550,25 @@ class BroadcastConfirmView(discord.ui.View):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @discord.ui.button(label="🧪 Test send to me", style=discord.ButtonStyle.primary)
+    async def testme(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sample = next(
+            (r for r in self.recipients if int(r.get("discord_id") or 0) == interaction.user.id),
+            self.recipients[0],
+        )
+        test_message = "🧪 **TEST BROADCAST — only you see this.**\n\n" + self.message
+        ok, where, error = await send_broadcast_to_recipient(
+            interaction.guild, sample, self.delivery, self.style, test_message
+        )
+        if ok:
+            spot = "your DMs" if where == "dm" else "your ticket channel"
+            await interaction.response.send_message(
+                f"🧪 Test broadcast sent to **{spot}** — check it renders how you want, then hit Send Broadcast.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(f"❌ Test broadcast failed: {error}", ephemeral=True)
+
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.done = True
@@ -5713,13 +6579,15 @@ class BroadcastConfirmView(discord.ui.View):
 
 @bot.tree.command(name="broadcast", description="Send a staff broadcast to selected MCWV members", guild=guild_obj)
 @app_commands.describe(
+    template="Pick a saved template (auto-fills audience/delivery/style/message)",
     audience="Who should receive the broadcast",
     delivery="Where to deliver the broadcast",
     style="Send as plain text or embed",
-    message="Message to send. Supports {username}, {points}, {rank}",
+    message="Message to send. Vars: {username} {points} {rank} {ping} {pph} {next_player} {next_rank_gap} {war_time_left} {clan_rank} {ticket}",
     value="Threshold, N, or custom Discord IDs depending on audience",
     role="Discord role for the discord_role audience",
     user="Specific user for custom_user audience",
+    save_as_template="Save this exact broadcast setup as a new template with this name",
 )
 @app_commands.choices(
     audience=[
@@ -5745,23 +6613,50 @@ class BroadcastConfirmView(discord.ui.View):
 )
 async def broadcast_command(
     interaction: discord.Interaction,
-    audience: app_commands.Choice[str],
-    delivery: app_commands.Choice[str],
-    style: app_commands.Choice[str],
-    message: str,
+    template: str = "",
+    audience: app_commands.Choice[str] = None,
+    delivery: app_commands.Choice[str] = None,
+    style: app_commands.Choice[str] = None,
+    message: str = "",
     value: str = "",
     role: discord.Role = None,
     user: discord.Member = None,
+    save_as_template: str = "",
 ):
     if not has_broadcast_permission(interaction.user):
         return await interaction.response.send_message("❌ You do not have permission to use broadcasts.", ephemeral=True)
+
+    ensure_broadcast_feature_tables()
+
+    tpl = None
+    if str(template or "").strip():
+        tpl = db_get_broadcast_template(str(template).strip())
+        if not tpl:
+            return await interaction.response.send_message(
+                f"❌ No broadcast template found for `{template}`.", ephemeral=True
+            )
+
+    audience_value = audience.value if audience else (tpl["audience"] if tpl else "everyone")
+    audience_label = audience.name if audience else (f"template: {tpl['audience']}" if tpl else "everyone")
+    delivery_value = delivery.value if delivery else (tpl["delivery"] if tpl else "dm")
+    delivery_label = delivery.name if delivery else (tpl["delivery"].upper() if tpl else "DM")
+    style_value = style.value if style else (tpl["style"] if tpl else "plain")
+    style_label = style.name if style else (tpl["style"].capitalize() if tpl else "Plain")
+    message = str(message or "").strip() or (tpl["message"] if tpl else "")
+    value = str(value or "").strip() or (tpl["value"] if tpl else "")
+
+    if not message:
+        return await interaction.response.send_message(
+            "❌ A message is required — type one, or pick a template.",
+            ephemeral=True,
+        )
 
     await interaction.response.defer(ephemeral=True)
 
     try:
         recipients = await resolve_broadcast_recipients(
             interaction,
-            audience.value,
+            audience_value,
             value=value,
             role=role,
             user=user,
@@ -5775,11 +6670,23 @@ async def broadcast_command(
     missing_ticket_recipients = []
     deliverable_count = len(recipients)
 
-    if delivery.value == "ticket":
+    if delivery_value == "ticket":
         missing_ticket_recipients = [item for item in recipients if not item.get("ticket_channel_id")]
         deliverable_count = len(recipients) - len(missing_ticket_recipients)
 
     actor_name = broadcast_actor_name(interaction)
+
+    saved_note = ""
+    if str(save_as_template or "").strip():
+        tpl_name = str(save_as_template).strip()
+        try:
+            db_create_broadcast_template(
+                tpl_name, audience_value, delivery_value, style_value, message, value, actor_name
+            )
+            saved_note = f"💾 Saved as template **{tpl_name}**\n"
+        except Exception:
+            saved_note = f"⚠️ Could not save template **{tpl_name}** (name may already exist)\n"
+
     sample = recipients[:10]
     sample_text = "\n".join(
         f"• {item['username']} — {item['points']} pts — <@{item['discord_id']}>"
@@ -5789,13 +6696,15 @@ async def broadcast_command(
     embed = discord.Embed(
         title="Broadcast Preview",
         description=(
-            f"**Audience:** {audience.name}\n"
+            f"{saved_note}"
+            f"**Template:** {tpl['name'] if tpl else '—'}\n"
+            f"**Audience:** {audience_label}\n"
             f"**Value:** {value or '—'}\n"
-            f"**Delivery:** {delivery.name}\n"
-            f"**Style:** {style.name}\n"
+            f"**Delivery:** {delivery_label}\n"
+            f"**Style:** {style_label}\n"
             f"**Recipients matched:** {len(recipients)}\n"
-            f"**Will attempt:** {deliverable_count if delivery.value == 'ticket' else len(recipients)}\n"
-            f"**Will fail / no ticket:** {len(missing_ticket_recipients) if delivery.value == 'ticket' else 0}\n\n"
+            f"**Will attempt:** {deliverable_count if delivery_value == 'ticket' else len(recipients)}\n"
+            f"**Will fail / no ticket:** {len(missing_ticket_recipients) if delivery_value == 'ticket' else 0}\n\n"
             f"**Message:**\n{message[:1200]}"
         ),
         color=discord.Color.orange(),
@@ -5820,14 +6729,152 @@ async def broadcast_command(
         sender_id=interaction.user.id,
         actor_name=actor_name,
         recipients=recipients,
-        audience=audience.value,
+        audience=audience_value,
         value=value,
-        delivery=delivery.value,
-        style=style.value,
+        delivery=delivery_value,
+        style=style_value,
         message=message,
+        template_id=tpl["id"] if tpl else None,
     )
 
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+@broadcast_command.autocomplete("template")
+async def broadcast_template_autocomplete(interaction: discord.Interaction, current: str):
+    if not has_broadcast_permission(interaction.user):
+        return []
+    try:
+        templates = db_list_broadcast_templates(limit=25)
+        needle = str(current or "").strip().lower()
+        matches = [
+            app_commands.Choice(name=f"{t['name']} ({t['audience']})", value=str(t["id"]))
+            for t in templates
+            if not needle or needle in t["name"].lower()
+        ]
+        return matches[:25]
+    except Exception:
+        return []
+
+
+@bot.tree.command(name="broadcast_templates", description="Manage saved broadcast templates", guild=guild_obj)
+@app_commands.describe(
+    action="List, create or delete templates",
+    name="Template name (create/delete)",
+    message="Template message text (create)",
+    audience="Default audience (create)",
+    delivery="Default delivery (create)",
+    style="Default style (create)",
+    value="Default value/threshold (create)",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="List", value="list"),
+        app_commands.Choice(name="Create", value="create"),
+        app_commands.Choice(name="Delete", value="delete"),
+    ],
+    audience=[
+        app_commands.Choice(name="Everyone", value="everyone"),
+        app_commands.Choice(name="Below X points", value="below_points"),
+        app_commands.Choice(name="Above X points", value="above_points"),
+        app_commands.Choice(name="Exactly 0 points", value="zero_points"),
+        app_commands.Choice(name="Bottom N players", value="bottom_n"),
+        app_commands.Choice(name="Top N players", value="top_n"),
+        app_commands.Choice(name="Members", value="members"),
+        app_commands.Choice(name="Officers", value="officers"),
+    ],
+    delivery=[
+        app_commands.Choice(name="DM", value="dm"),
+        app_commands.Choice(name="Ticket", value="ticket"),
+    ],
+    style=[
+        app_commands.Choice(name="Plain text", value="plain"),
+        app_commands.Choice(name="Embed", value="embed"),
+    ],
+)
+async def broadcast_templates_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    name: str = "",
+    message: str = "",
+    audience: app_commands.Choice[str] = None,
+    delivery: app_commands.Choice[str] = None,
+    style: app_commands.Choice[str] = None,
+    value: str = "",
+):
+    if not has_broadcast_permission(interaction.user):
+        return await interaction.response.send_message("❌ You do not have permission to manage broadcast templates.", ephemeral=True)
+
+    ensure_broadcast_feature_tables()
+    actor_name = broadcast_actor_name(interaction)
+
+    if action.value == "list":
+        templates = db_list_broadcast_templates(limit=25)
+        if not templates:
+            return await interaction.response.send_message(
+                "No broadcast templates yet — create one with `/broadcast_templates create`.",
+                ephemeral=True,
+            )
+        lines = []
+        for tpl in templates:
+            short = tpl["message"][:60] + ("…" if len(tpl["message"]) > 60 else "")
+            lines.append(f"**#{tpl['id']} {tpl['name']}**\n   {tpl['audience']} · {tpl['delivery']} · {tpl['style']}\n   _{short}_")
+        embed = discord.Embed(
+            title=f"📋 Broadcast Templates ({len(templates)})",
+            description="\n".join(lines)[:4000],
+            color=MCWV_BRAND_COLOR if "MCWV_BRAND_COLOR" in globals() else discord.Color.blurple(),
+        )
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    if action.value == "create":
+        if not name.strip():
+            return await interaction.response.send_message("❌ Give the template a name.", ephemeral=True)
+        if not message.strip():
+            return await interaction.response.send_message("❌ Give the template a message.", ephemeral=True)
+        try:
+            new_id = db_create_broadcast_template(
+                name.strip(),
+                audience.value if audience else "everyone",
+                delivery.value if delivery else "dm",
+                style.value if style else "plain",
+                message.strip(),
+                value.strip(),
+                actor_name,
+            )
+            return await interaction.response.send_message(
+                f"✅ Template **{name.strip()}** created (#{new_id}). Use it via `/broadcast template:` — variables like {{username}} {{points}} {{rank}} work.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            return await interaction.response.send_message(
+                f"❌ Could not create template: {exc}", ephemeral=True
+            )
+
+    if action.value == "delete":
+        if not name.strip():
+            return await interaction.response.send_message("❌ Give the template name or id to delete.", ephemeral=True)
+        deleted = db_delete_broadcast_template(name.strip())
+        if deleted:
+            return await interaction.response.send_message(f"🗑️ Template `{name.strip()}` deleted.", ephemeral=True)
+        return await interaction.response.send_message(f"❌ No template found for `{name.strip()}`.", ephemeral=True)
+
+    return await interaction.response.send_message("Unknown action.", ephemeral=True)
+
+
+@broadcast_templates_command.autocomplete("name")
+async def broadcast_templates_name_autocomplete(interaction: discord.Interaction, current: str):
+    if not has_broadcast_permission(interaction.user):
+        return []
+    try:
+        templates = db_list_broadcast_templates(limit=25)
+        needle = str(current or "").strip().lower()
+        return [
+            app_commands.Choice(name=t["name"], value=t["name"])
+            for t in templates
+            if not needle or needle in t["name"].lower()
+        ][:25]
+    except Exception:
+        return []
 
 
 def likely_ticket_channel(channel):
@@ -14192,6 +15239,9 @@ def start_bot_loops():
 
     if not hourly_player_snapshot_loop.is_running():
         hourly_player_snapshot_loop.start()
+
+    if not broadcast_scheduler_loop.is_running():
+        broadcast_scheduler_loop.start()
 
     if HUB_BASE_URL and not hub_war_collect_loop.is_running():
         hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
