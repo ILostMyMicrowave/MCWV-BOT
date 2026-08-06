@@ -5402,7 +5402,18 @@ def render_broadcast_message(template, recipient):
         .replace("{clan_rank}", (f"#{recipient.get('clan_rank')}" if recipient.get("clan_rank") else "—"))
 
 
-def broadcast_embed_for(message, recipient):
+_BROADCAST_IMAGE_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def clean_broadcast_image_url(value, max_len=1000):
+    """Direct http(s) image link for broadcast artwork — '' when absent/invalid."""
+    text = str(value or "").strip()[:max_len]
+    if not text or not _BROADCAST_IMAGE_RE.match(text):
+        return ""
+    return text
+
+
+def broadcast_embed_for(message, recipient, image_url=""):
     embed = discord.Embed(
         title="📢 MCWV Broadcast",
         description=render_broadcast_message(message, recipient),
@@ -5410,6 +5421,8 @@ def broadcast_embed_for(message, recipient):
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_footer(text="MCWV Staff Broadcast")
+    if image_url:
+        embed.set_image(url=image_url)
     return embed
 
 
@@ -5445,10 +5458,15 @@ async def _admin_broadcast_access_from_body(discord_id):
     }
 
 
-async def send_broadcast_to_recipient(guild, recipient, delivery, style, message):
+async def send_broadcast_to_recipient(guild, recipient, delivery, style, message, image_url=""):
+    image_url = clean_broadcast_image_url(image_url)
     rendered = render_broadcast_message(message, recipient)
-    embed = broadcast_embed_for(message, recipient) if style == "embed" else None
+    embed = broadcast_embed_for(message, recipient, image_url) if style == "embed" else None
     content = None if embed else f"📢 **MCWV Broadcast**\n{rendered}"
+    # Plain style has no embed — a bare image link still gets Discord's big
+    # image preview, so artwork reaches DMs/tickets either way.
+    if not embed and image_url:
+        content = f"{content}\n{image_url}"
 
     async def _send_once():
         if delivery == "dm":
@@ -5557,6 +5575,9 @@ async def _admin_broadcast_send_from_body(body):
     delivery = broadcast_payload_value(body, "delivery", default="dm")
     style = broadcast_payload_value(body, "style", default="plain")
     message = broadcast_payload_value(body, "message", default="")
+    image_url = clean_broadcast_image_url(
+        broadcast_payload_value(body, "image_url", "imageUrl", "image", default="")
+    )
     actor_name = broadcast_payload_value(body, "requested_by", "sender", default="Hub Admin")
 
     if delivery not in ("dm", "ticket"):
@@ -5570,7 +5591,7 @@ async def _admin_broadcast_send_from_body(body):
     if not recipients:
         raise ValueError("No recipients matched that broadcast filter.")
 
-    fingerprint = f"web:{actor_name}:{audience}:{value}:{delivery}:{style}:{message}:{','.join(str(r['discord_id']) for r in recipients)}"
+    fingerprint = f"web:{actor_name}:{audience}:{value}:{delivery}:{style}:{message}:{image_url}:{','.join(str(r['discord_id']) for r in recipients)}"
     now = time.time()
     for key, created in list(BROADCAST_RECENT.items()):
         if now - created > 300:
@@ -5584,7 +5605,7 @@ async def _admin_broadcast_send_from_body(body):
     results = []
 
     for recipient in recipients:
-        ok, _where, error = await send_broadcast_to_recipient(guild, recipient, delivery, style, message)
+        ok, _where, error = await send_broadcast_to_recipient(guild, recipient, delivery, style, message, image_url)
         results.append({
             "roblox_id": recipient.get("roblox_id"),
             "discord_id": recipient.get("discord_id"),
@@ -5610,6 +5631,7 @@ async def _admin_broadcast_send_from_body(body):
             delivery=delivery,
             style=style,
             message=message,
+            image_url=image_url,
             results=results,
             battle_key=_ctx.get("battle_key") or "",
         )
@@ -5623,6 +5645,7 @@ async def _admin_broadcast_send_from_body(body):
         "delivery": delivery,
         "style": style,
         "message": message,
+        "image_url": image_url,
         "recipientCount": len(recipients),
         "sent": sent,
         "failed": len(failed),
@@ -5745,6 +5768,11 @@ def ensure_broadcast_feature_tables():
                 )
             """)
 
+            # Broadcast artwork columns (older DBs predate them). The hub runs
+            # the same idempotent ALTERs, so either deploy order is safe.
+            cur.execute("ALTER TABLE broadcast_templates ADD COLUMN IF NOT EXISTS image_url TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE broadcast_sends ADD COLUMN IF NOT EXISTS image_url TEXT NOT NULL DEFAULT ''")
+
             # Seed sensible defaults on first run only (all editable in the hub).
             cur.execute("SELECT COUNT(*) FROM broadcast_schedules")
             if int(cur.fetchone()[0] or 0) == 0:
@@ -5812,7 +5840,7 @@ def db_list_broadcast_templates(limit=100):
         ensure_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, name, audience, value, delivery, style, message, created_by, updated_by, updated_at
+                SELECT id, name, audience, value, delivery, style, message, image_url, created_by, updated_by, updated_at
                 FROM broadcast_templates
                 ORDER BY name ASC
                 LIMIT %s
@@ -5835,8 +5863,9 @@ def db_list_broadcast_templates(limit=100):
             "delivery": str(row[4] or "dm"),
             "style": str(row[5] or "plain"),
             "message": str(row[6] or ""),
-            "created_by": str(row[7]) if row[7] else None,
-            "updated_by": str(row[8]) if row[8] else None,
+            "image_url": str(row[7] or ""),
+            "created_by": str(row[8]) if row[8] else None,
+            "updated_by": str(row[9]) if row[9] else None,
         }
         for row in rows
     ]
@@ -5854,12 +5883,12 @@ def db_get_broadcast_template(ref):
         with conn.cursor() as cur:
             if ref_text.isdigit():
                 cur.execute("""
-                    SELECT id, name, audience, value, delivery, style, message
+                    SELECT id, name, audience, value, delivery, style, message, image_url
                     FROM broadcast_templates WHERE id = %s
                 """, (int(ref_text),))
             else:
                 cur.execute("""
-                    SELECT id, name, audience, value, delivery, style, message
+                    SELECT id, name, audience, value, delivery, style, message, image_url
                     FROM broadcast_templates WHERE LOWER(name) = LOWER(%s)
                 """, (ref_text,))
             row = cur.fetchone()
@@ -5881,19 +5910,20 @@ def db_get_broadcast_template(ref):
         "delivery": str(row[4] or "dm"),
         "style": str(row[5] or "plain"),
         "message": str(row[6] or ""),
+        "image_url": str(row[7] or ""),
     }
 
 
-def db_create_broadcast_template(name, audience, delivery, style, message, value, actor):
+def db_create_broadcast_template(name, audience, delivery, style, message, value, actor, image_url=""):
     ensure_broadcast_feature_tables()
     if not db_enabled():
         raise ValueError("Database is not available.")
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO broadcast_templates (name, audience, value, delivery, style, message, created_by, updated_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO broadcast_templates (name, audience, value, delivery, style, message, image_url, created_by, updated_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
-        """, (name, audience, value or "", delivery, style, message, actor, actor))
+        """, (name, audience, value or "", delivery, style, message, clean_broadcast_image_url(image_url), actor, actor))
         new_id = cur.fetchone()[0]
     conn.commit()
     return int(new_id)
@@ -5924,7 +5954,7 @@ def db_delete_broadcast_template(ref):
 # ---------------- BROADCAST SEND LOG + RECIPIENTS ----------------
 
 def db_record_broadcast_send(*, source, actor, actor_discord_id, audience, value, delivery, style,
-                             message, results, battle_key, template_id=None):
+                             message, results, battle_key, template_id=None, image_url=None):
     """Persist a broadcast send + per-recipient rows for history & conversion."""
     ensure_broadcast_feature_tables()
     if not db_enabled():
@@ -5942,8 +5972,8 @@ def db_record_broadcast_send(*, source, actor, actor_discord_id, audience, value
             cur.execute("""
                 INSERT INTO broadcast_sends
                     (actor, actor_discord_id, source, template_id, audience, value, delivery, style,
-                     message, battle_key, matched_count, sent_count, failed_count, status, conversion_zero_at_send)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     message, image_url, battle_key, matched_count, sent_count, failed_count, status, conversion_zero_at_send)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 actor,
@@ -5955,6 +5985,7 @@ def db_record_broadcast_send(*, source, actor, actor_discord_id, audience, value
                 delivery,
                 style,
                 message,
+                clean_broadcast_image_url(image_url),
                 battle_key or None,
                 len(results),
                 sent,
@@ -6416,7 +6447,7 @@ async def before_broadcast_scheduler_loop():
 
 
 class BroadcastConfirmView(discord.ui.View):
-    def __init__(self, *, sender_id, actor_name, recipients, audience, value, delivery, style, message, template_id=None):
+    def __init__(self, *, sender_id, actor_name, recipients, audience, value, delivery, style, message, template_id=None, image_url=""):
         super().__init__(timeout=300)
         self.sender_id = sender_id
         self.actor_name = actor_name
@@ -6427,6 +6458,7 @@ class BroadcastConfirmView(discord.ui.View):
         self.style = style
         self.message = message
         self.template_id = template_id
+        self.image_url = clean_broadcast_image_url(image_url)
         self.done = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -6440,7 +6472,7 @@ class BroadcastConfirmView(discord.ui.View):
         if self.done:
             return await interaction.response.send_message("This broadcast has already been handled.", ephemeral=True)
 
-        fingerprint = f"{self.sender_id}:{self.audience}:{self.value}:{self.delivery}:{self.style}:{self.message}:{','.join(str(r['discord_id']) for r in self.recipients)}"
+        fingerprint = f"{self.sender_id}:{self.audience}:{self.value}:{self.delivery}:{self.style}:{self.message}:{self.image_url}:{','.join(str(r['discord_id']) for r in self.recipients)}"
         now = time.time()
         for key, created in list(BROADCAST_RECENT.items()):
             if now - created > 300:
@@ -6465,6 +6497,7 @@ class BroadcastConfirmView(discord.ui.View):
                 self.delivery,
                 self.style,
                 self.message,
+                self.image_url,
             )
             results.append({
                 "roblox_id": recipient.get("roblox_id"),
@@ -6491,6 +6524,7 @@ class BroadcastConfirmView(discord.ui.View):
                 delivery=self.delivery,
                 style=self.style,
                 message=self.message,
+                image_url=self.image_url,
                 results=results,
                 battle_key=_ctx.get("battle_key") or "",
                 template_id=self.template_id,
@@ -6558,7 +6592,7 @@ class BroadcastConfirmView(discord.ui.View):
         )
         test_message = "🧪 **TEST BROADCAST — only you see this.**\n\n" + self.message
         ok, where, error = await send_broadcast_to_recipient(
-            interaction.guild, sample, self.delivery, self.style, test_message
+            interaction.guild, sample, self.delivery, self.style, test_message, self.image_url
         )
         if ok:
             spot = "your DMs" if where == "dm" else "your ticket channel"
@@ -6587,6 +6621,7 @@ class BroadcastConfirmView(discord.ui.View):
     value="Threshold, N, or custom Discord IDs depending on audience",
     role="Discord role for the discord_role audience",
     user="Specific user for custom_user audience",
+    image_url="Optional direct image link (https://…) shown with the broadcast",
     save_as_template="Save this exact broadcast setup as a new template with this name",
 )
 @app_commands.choices(
@@ -6621,6 +6656,7 @@ async def broadcast_command(
     value: str = "",
     role: discord.Role = None,
     user: discord.Member = None,
+    image_url: str = "",
     save_as_template: str = "",
 ):
     if not has_broadcast_permission(interaction.user):
@@ -6644,6 +6680,16 @@ async def broadcast_command(
     style_label = style.name if style else (tpl["style"].capitalize() if tpl else "Plain")
     message = str(message or "").strip() or (tpl["message"] if tpl else "")
     value = str(value or "").strip() or (tpl["value"] if tpl else "")
+
+    # Explicit option wins; otherwise inherit the template's saved artwork.
+    raw_image = str(image_url or "").strip()
+    if raw_image and not clean_broadcast_image_url(raw_image):
+        return await interaction.response.send_message(
+            "❌ Image URL must start with http:// or https:// (or be left empty).", ephemeral=True
+        )
+    image_url = clean_broadcast_image_url(raw_image) or clean_broadcast_image_url(
+        (tpl or {}).get("image_url")
+    )
 
     if not message:
         return await interaction.response.send_message(
@@ -6681,7 +6727,8 @@ async def broadcast_command(
         tpl_name = str(save_as_template).strip()
         try:
             db_create_broadcast_template(
-                tpl_name, audience_value, delivery_value, style_value, message, value, actor_name
+                tpl_name, audience_value, delivery_value, style_value, message, value, actor_name,
+                image_url=image_url,
             )
             saved_note = f"💾 Saved as template **{tpl_name}**\n"
         except Exception:
@@ -6702,6 +6749,7 @@ async def broadcast_command(
             f"**Value:** {value or '—'}\n"
             f"**Delivery:** {delivery_label}\n"
             f"**Style:** {style_label}\n"
+            f"**Image:** {'shown below 🖼️' if image_url else '—'}\n"
             f"**Recipients matched:** {len(recipients)}\n"
             f"**Will attempt:** {deliverable_count if delivery_value == 'ticket' else len(recipients)}\n"
             f"**Will fail / no ticket:** {len(missing_ticket_recipients) if delivery_value == 'ticket' else 0}\n\n"
@@ -6709,6 +6757,8 @@ async def broadcast_command(
         ),
         color=discord.Color.orange(),
     )
+    if image_url:
+        embed.set_image(url=image_url)
     embed.add_field(name="Sample recipients", value=sample_text[:1024] or "—", inline=False)
 
     if missing_ticket_recipients:
@@ -6735,6 +6785,7 @@ async def broadcast_command(
         style=style_value,
         message=message,
         template_id=tpl["id"] if tpl else None,
+        image_url=image_url,
     )
 
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -6766,6 +6817,7 @@ async def broadcast_template_autocomplete(interaction: discord.Interaction, curr
     delivery="Default delivery (create)",
     style="Default style (create)",
     value="Default value/threshold (create)",
+    image_url="Optional image link saved on the template (create)",
 )
 @app_commands.choices(
     action=[
@@ -6801,6 +6853,7 @@ async def broadcast_templates_command(
     delivery: app_commands.Choice[str] = None,
     style: app_commands.Choice[str] = None,
     value: str = "",
+    image_url: str = "",
 ):
     if not has_broadcast_permission(interaction.user):
         return await interaction.response.send_message("❌ You do not have permission to manage broadcast templates.", ephemeral=True)
@@ -6818,7 +6871,8 @@ async def broadcast_templates_command(
         lines = []
         for tpl in templates:
             short = tpl["message"][:60] + ("…" if len(tpl["message"]) > 60 else "")
-            lines.append(f"**#{tpl['id']} {tpl['name']}**\n   {tpl['audience']} · {tpl['delivery']} · {tpl['style']}\n   _{short}_")
+            art = " · 🖼️" if tpl.get("image_url") else ""
+            lines.append(f"**#{tpl['id']} {tpl['name']}**\n   {tpl['audience']} · {tpl['delivery']} · {tpl['style']}{art}\n   _{short}_")
         embed = discord.Embed(
             title=f"📋 Broadcast Templates ({len(templates)})",
             description="\n".join(lines)[:4000],
@@ -6831,6 +6885,11 @@ async def broadcast_templates_command(
             return await interaction.response.send_message("❌ Give the template a name.", ephemeral=True)
         if not message.strip():
             return await interaction.response.send_message("❌ Give the template a message.", ephemeral=True)
+        clean_image = clean_broadcast_image_url(image_url)
+        if str(image_url or "").strip() and not clean_image:
+            return await interaction.response.send_message(
+                "❌ Image URL must start with http:// or https:// (or be left empty).", ephemeral=True
+            )
         try:
             new_id = db_create_broadcast_template(
                 name.strip(),
@@ -6840,9 +6899,11 @@ async def broadcast_templates_command(
                 message.strip(),
                 value.strip(),
                 actor_name,
+                image_url=clean_image,
             )
+            art_note = " with 🖼️ artwork" if clean_image else ""
             return await interaction.response.send_message(
-                f"✅ Template **{name.strip()}** created (#{new_id}). Use it via `/broadcast template:` — variables like {{username}} {{points}} {{rank}} work.",
+                f"✅ Template **{name.strip()}** created (#{new_id}){art_note}. Use it via `/broadcast template:` — variables like {{username}} {{points}} {{rank}} work.",
                 ephemeral=True,
             )
         except Exception as exc:
