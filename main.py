@@ -5021,17 +5021,27 @@ MCWV_HOURLY_STATS_BG_PATH = os.environ.get(
 MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE = os.environ.get("MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE", "1") != "0"
 HOURLY_STATS_AUTO_DISABLE_MISSES_REQUIRED = max(1, int(os.environ.get("MCWV_HOURLY_STATS_AUTO_DISABLE_MISSES", "2") or "2"))
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
-PS99_IMPORTANT_GAMEPASSES = {
-    257811346: "VIP",
+# Full official PS99 store gamepass list (id -> clean label). The runtime map
+# is refreshed daily from Roblox's store page by _get_ps99_gamepass_map() and
+# falls back to this baked copy when Roblox refuses to play nice.
+PS99_STORE_PLACE_ID = 8737899170
+PS99_GAMEPASSES = {
+    205379487: "Lucky",
     257803774: "Ultra Lucky",
-    655859720: "+15 Eggs",
-    264808140: "Huge Hunter",
-    690997523: "Super Drops",
+    257811346: "VIP",
     258567677: "Magic Eggs",
     259437976: "+15 Pets",
-    975558264: "Super Shiny Hunter",
+    264808140: "Huge Hunter",
+    265320491: "Auto Farm",
+    265324265: "Auto Tap",
+    651611000: "Daycare Slots",
+    655859720: "+15 Eggs",
+    690997523: "Super Drops",
     720275150: "Double Stars",
+    975558264: "Super Shiny Hunter",
 }
+_GAMEPASS_LIST_CACHE = {"at": 0.0, "passes": dict(PS99_GAMEPASSES)}
+_GAMEPASS_LIST_TTL = 24 * 60 * 60
 KNOWN_PS99_BATTLE_IDS = [
     "GummyBattle2026",
     "LunarBattle2026",
@@ -7401,45 +7411,106 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
     return embed
 
 
-async def check_ps99_gamepasses(roblox_id):
+async def _fetch_ps99_store_gamepasses():
+    """Crawl Roblox's store page for the COMPLETE PS99 gamepass list."""
     global session
     if session is None or session.closed:
         session = aiohttp.ClientSession()
 
-    results = []
+    from html import unescape
+
+    found = {}
     timeout = aiohttp.ClientTimeout(total=15)
-    for pass_id, label in PS99_IMPORTANT_GAMEPASSES.items():
-        url = f"https://inventory.roblox.com/v1/users/{roblox_id}/items/GamePass/{pass_id}/is-owned"
+    for start in range(0, 300, 50):
+        url = (
+            "https://www.roblox.com/games/getgamepassesinnerpartial"
+            f"?startIndex={start}&maxRows=50&placeId={PS99_STORE_PLACE_ID}"
+        )
         try:
             async with session.get(url, timeout=timeout) as res:
-                if res.status == 200:
-                    owned = await res.json(content_type=None)
-                    results.append({"id": pass_id, "label": label, "owned": bool(owned), "unknown": False})
-                else:
-                    results.append({"id": pass_id, "label": label, "owned": False, "unknown": True})
+                if res.status != 200:
+                    break
+                text = await res.text()
         except Exception:
-            results.append({"id": pass_id, "label": label, "owned": False, "unknown": True})
-        await asyncio.sleep(0.08)
+            break
+        ids = re.findall(r'href="/game-pass/(\d+)/[^"]*"', text)
+        names = re.findall(r'class="text-overflow store-card-name"[^>]*>\s*([^<]+?)\s*<', text)
+        if not ids:
+            break
+        for pid, name in zip(ids, names):
+            label = unescape(name)
+            label = re.sub(r"[^\w+\- ]+", " ", label)  # kills "!" + emoji soup
+            label = " ".join(label.split()).strip()
+            try:
+                found[int(pid)] = label or name.strip()
+            except ValueError:
+                continue
+        if len(ids) < 50:
+            break
+        await asyncio.sleep(0.3)
+    return found
 
-    return results
+
+async def _get_ps99_gamepass_map():
+    """Live store list if Roblox cooperates, baked copy otherwise (24h cache)."""
+    if _GAMEPASS_LIST_CACHE["passes"] and time.time() - _GAMEPASS_LIST_CACHE["at"] < _GAMEPASS_LIST_TTL:
+        return dict(_GAMEPASS_LIST_CACHE["passes"])
+    live = await _fetch_ps99_store_gamepasses()
+    if live:
+        _GAMEPASS_LIST_CACHE["at"] = time.time()
+        _GAMEPASS_LIST_CACHE["passes"] = dict(live)
+    elif not _GAMEPASS_LIST_CACHE["passes"]:
+        _GAMEPASS_LIST_CACHE["passes"] = dict(PS99_GAMEPASSES)
+    return dict(_GAMEPASS_LIST_CACHE["passes"])
+
+
+async def check_ps99_gamepasses(roblox_id):
+    """Ownership of EVERY PS99 store gamepass — owned first, then missing/unknown."""
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    passes = await _get_ps99_gamepass_map()
+    timeout = aiohttp.ClientTimeout(total=15)
+    sem = asyncio.Semaphore(5)
+
+    async def probe(pass_id, label):
+        url = f"https://inventory.roblox.com/v1/users/{roblox_id}/items/GamePass/{pass_id}/is-owned"
+        for _ in range(2):
+            try:
+                async with sem:
+                    async with session.get(url, timeout=timeout) as res:
+                        if res.status == 200:
+                            owned = await res.json(content_type=None)
+                            return {"id": pass_id, "label": label, "owned": owned is True, "unknown": False}
+                        if res.status == 429:
+                            await asyncio.sleep(1.5)
+                            continue
+                        break
+            except Exception:
+                await asyncio.sleep(0.5)
+        return {"id": pass_id, "label": label, "owned": False, "unknown": True}
+
+    results = await asyncio.gather(*(probe(pid, label) for pid, label in passes.items()))
+    order = {pid: i for i, pid in enumerate(passes)}
+    return sorted(results, key=lambda r: (not r["owned"], order.get(r["id"], 999)))
 
 
 def format_gamepass_results(results):
     if not results:
         return "No gamepasses configured."
-    lines = []
-    for item in results:
-        if item.get("unknown"):
-            icon = "⚠️"
-            suffix = "unknown"
-        elif item.get("owned"):
-            icon = "✅"
-            suffix = "owned"
-        else:
-            icon = "❌"
-            suffix = "not owned"
-        lines.append(f"{icon} **{item['label']}** — {suffix}")
-    return "\n".join(lines)[:1024]
+    owned = [r for r in results if r.get("owned")]
+    missing = [r["label"] for r in results if not r.get("owned") and not r.get("unknown")]
+    unknown = [r["label"] for r in results if r.get("unknown")]
+    lines = [f"**Owns {len(owned)}/{len(results)} PS99 passes** 🎫"]
+    lines += [f"✅ **{r['label']}**" for r in owned]
+    if missing:
+        lines.append("")
+        lines.append(f"❌ Missing ({len(missing)}): {', '.join(missing)}")
+    if unknown:
+        lines.append(f"⚠️ Couldn't verify: {', '.join(unknown)}")
+    text = "\n".join(lines)
+    return text[:1021] + "…" if len(text) > 1024 else text
 
 
 def _safe_int(value, default=0):
