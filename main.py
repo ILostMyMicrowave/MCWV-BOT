@@ -13557,6 +13557,8 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     shadow = shadow.filter(ImageFilter.GaussianBlur(sc(7)))
     img.alpha_composite(shadow)
 
+    await asyncio.sleep(0)
+
     # Clean dark background similar to the reference card.
     card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     cd = ImageDraw.Draw(card)
@@ -13583,6 +13585,11 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     d = ImageDraw.Draw(img)
     d.rounded_rectangle(card_box, radius=sc(36), outline=(225, 230, 255, 185), width=sc(2))
     d.rounded_rectangle((sc(11), sc(11), W - sc(11), H - sc(15)), radius=sc(33), outline=(255, 255, 255, 28), width=sc(1))
+
+    # Yield after the heaviest compositing (per-pixel gradient + sc(42) blur)
+    # so the event loop can ack Discord heartbeats. Critical here because this
+    # generator runs in a loop (one card per joined/left member).
+    await asyncio.sleep(0)
 
     # Text positions copied from the clean reference layout.
     draw_text_shadow(d, (sc(50), sc(42)), small_label, fonts["eyebrow"], (*label_color, 255), shadow=(0, 0, 0, 115), offset=(sc(2), sc(2)))
@@ -13660,6 +13667,8 @@ async def generate_clan_member_log_card(kind, user_id, user_info, member_count, 
     avatar_mask = Image.new("L", avatar.size, 0)
     ImageDraw.Draw(avatar_mask).ellipse((0, 0, avatar.size[0] - 1, avatar.size[1] - 1), fill=255)
     img.paste(avatar, (center[0] - avatar.size[0] // 2, center[1] - avatar.size[1] // 2), avatar_mask)
+
+    await asyncio.sleep(0)
 
     img = img.resize((1250, 420), Image.Resampling.LANCZOS)
     out = BytesIO()
@@ -14357,6 +14366,9 @@ async def generate_hourly_stats_card(payload):
         gd.line((0, y, W, y), fill=(125, 145, 205, 12), width=sc(1))
     img.alpha_composite(grid)
 
+    # Let the event loop ack Discord heartbeats between heavy render sections.
+    await asyncio.sleep(0)
+
     # Main panel.
     card = (sc(31), sc(28), sc(1324), sc(776))
     alpha_round((card[0] + sc(4), card[1] + sc(7), card[2] + sc(4), card[3] + sc(7)), 25, (0, 0, 0, 145), blur=8)
@@ -14381,6 +14393,8 @@ async def generate_hourly_stats_card(payload):
     img.alpha_composite(strip.filter(ImageFilter.GaussianBlur(sc(1.2))))
     img.alpha_composite(strip)
     d = ImageDraw.Draw(img)
+
+    await asyncio.sleep(0)
 
     # Logo: clean full neon ring. Keep it symmetrical and avoid the broken-looking
     # segmented gaps that appeared around the previous version.
@@ -14418,6 +14432,8 @@ async def generate_hourly_stats_card(payload):
     d = ImageDraw.Draw(img)
     d.ellipse((logo_center[0] - sc(60), logo_center[1] - sc(60), logo_center[0] + sc(60), logo_center[1] + sc(60)), outline=(255, 255, 255, 28), width=sc(1))
     d.ellipse((logo_center[0] - sc(47), logo_center[1] - sc(47), logo_center[0] + sc(47), logo_center[1] + sc(47)), fill=(11, 12, 29, 238), outline=(190, 195, 255, 88), width=sc(1))
+
+    await asyncio.sleep(0)
 
     asset_id = extract_asset_id(payload.get("icon"))
     icon_bytes = await fetch_image_bytes(f"{PS99_API}/image/{asset_id}") if asset_id else None
@@ -14539,6 +14555,10 @@ async def generate_hourly_stats_card(payload):
             score = str(pph) if pph_ready else "—"
             right_text(dd, px + panel_w - sc(18), y, score, fonts["row_small"], (*score_fill, 255))
 
+        # Yield after each column so heartbeats are acked during the heaviest
+        # per-row gradient work (3 columns x 25 rows).
+        await asyncio.sleep(0)
+
     # Tiny timestamp in the bottom-right.
     d = ImageDraw.Draw(img)
     try:
@@ -14547,6 +14567,8 @@ async def generate_hourly_stats_card(payload):
         stamp_dt = datetime.now(timezone.utc)
     updated = stamp_dt.astimezone(timezone.utc).strftime("Slot %H:%M UTC")
     right_text(d, sc(1300), sc(754), updated, fonts["tiny"], (120, 129, 155, 190))
+
+    await asyncio.sleep(0)
 
     out = BytesIO()
     img = img.resize((1355, 804), Image.Resampling.LANCZOS)
@@ -15162,6 +15184,8 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     overlay = overlay.filter(ImageFilter.GaussianBlur(sc(1)))
     card.alpha_composite(overlay)
 
+    await asyncio.sleep(0)
+
     # Rounded card mask + outer glow.
     mask = rounded_mask((cw, ch), sc(54))
     shaped = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
@@ -15292,6 +15316,8 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     d.rounded_rectangle(bar, radius=sc(34), outline=(165, 181, 255, 132), width=sc(2))
     d.rounded_rectangle((bar[0]+sc(3), bar[1]+sc(3), bar[2]-sc(3), bar[3]-sc(3)), radius=sc(31), outline=(255, 255, 255, 30), width=sc(1))
 
+    await asyncio.sleep(0)
+
     # Solid colour chevrons with a crisp shadow and a tiny highlight edge.
     # Slightly left of the previous version so the full double-chevron sits more centrally
     # between the old and new rank blocks instead of leaning into the new-rank side.
@@ -15337,6 +15363,8 @@ async def generate_placement_card(old_rank, new_rank, points, icon_value=None):
     pts_box = (group_x + label_w + sc(28), footer[1] + sc(2), group_x + group_w, footer[3] - sc(6))
     draw_aligned(label, fonts["label"], label_box, (233, 236, 250, 240), align="left", shadow=(0, 0, 0, 105), offset=(sc(2), sc(3)))
     draw_aligned(pts, fonts["points"], pts_box, (255, 220, 94, 255), align="left", shadow=(0, 0, 0, 138), offset=(sc(3), sc(3)))
+
+    await asyncio.sleep(0)
 
     img = img.resize((1080, 560), Image.Resampling.LANCZOS)
     out = BytesIO()
