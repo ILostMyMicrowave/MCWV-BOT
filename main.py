@@ -7402,13 +7402,40 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
     embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
     embed.add_field(name="Roblox", value=f"**{roblox_name}**\n`{roblox_id}`", inline=True)
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
-    embed.add_field(
-        name="Next step",
-        value="Review screenshots, open **Staff Info** for answers/gamepasses, check Roblox history/requirements, then **Accept** if they meet MCWV requirements.",
-        inline=False,
-    )
     embed.set_footer(text=f"Claimed by {claimed_by}" if claimed_by else "Pending staff review")
     return embed
+
+
+async def send_application_review_card(guild, channel, ticket_id, applicant, app_row):
+    """Post the 'Application Ready for Review' staff card into the ticket channel.
+
+    The card lives inside the applicant's ticket only — there is no review-channel
+    fallback. Returns True when the card was posted successfully, False otherwise
+    (e.g. missing application data or a Discord send failure); the caller is
+    expected to warn the applicant on False.
+    """
+    if app_row is None:
+        return False
+    try:
+        roblox_username = app_row[0]
+        roblox_id = app_row[1]
+        avatar_url = await get_roblox_headshot_url(roblox_id)
+        embed = build_application_review_embed(
+            ticket_id,
+            applicant,
+            roblox_username or "Unknown",
+            roblox_id or "0",
+            app_row[2],
+            app_row[3],
+            app_row[4],
+            app_row[5],
+            avatar_url=avatar_url,
+        )
+        await channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
+        return True
+    except Exception as exc:
+        print(f"[ticket] in-ticket review card send failed for {ticket_id}: {exc}")
+        return False
 
 
 async def _fetch_ps99_store_gamepasses():
@@ -8105,16 +8132,6 @@ async def restore_application_review_messages(guild):
         if guild is None or not db_enabled():
             return 0
 
-        review_channel = guild.get_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
-        if review_channel is None:
-            try:
-                review_channel = await guild.fetch_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
-            except Exception:
-                review_channel = None
-        if not isinstance(review_channel, discord.TextChannel):
-            # Optional fallback only now — cards live in the ticket channels.
-            review_channel = None
-
         db_ensure_mcwv_ticket_tables()
         with conn.cursor() as cur:
             cur.execute(
@@ -8124,6 +8141,11 @@ async def restore_application_review_messages(guild):
                 FROM mcwv_tickets t
                 JOIN mcwv_ticket_applications a ON a.ticket_id = t.ticket_id
                 WHERE t.status = 'pending'
+                  AND EXISTS (
+                    SELECT 1 FROM mcwv_ticket_actions act
+                    WHERE act.ticket_id = t.ticket_id
+                      AND act.action = 'screenshots/uploaded'
+                  )
                 ORDER BY t.updated_at DESC
                 LIMIT 25
                 """
@@ -8157,31 +8179,28 @@ async def restore_application_review_messages(guild):
                     avatar_url=avatar_url,
                 )
                 ticket_channel = guild.get_channel(int(row[1])) if row[1] else None
-                # Skip when the card is already posted inside the ticket (never double-post).
-                if isinstance(ticket_channel, discord.TextChannel):
-                    already_posted = False
-                    try:
-                        async for message in ticket_channel.history(limit=50):
-                            for existing_embed in message.embeds or []:
-                                if (existing_embed.title or "") != "MCWV Application Ready for Review":
-                                    continue
-                                for field in existing_embed.fields:
-                                    if str(field.name).lower() == "ticket" and str(field.value).replace("`", "").strip() == ticket_id:
-                                        already_posted = True
-                                        break
-                            if already_posted:
-                                break
-                    except Exception:
-                        already_posted = True  # cannot verify -> safer to skip than duplicate
-                    if already_posted:
-                        continue
-                    await ticket_channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
-                elif isinstance(review_channel, discord.TextChannel):
-                    # Emergency fallback only (ticket channel itself is gone).
-                    embed.add_field(name="Ticket Channel", value="(channel missing)", inline=False)
-                    await review_channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
-                else:
+                # Review cards live inside the ticket channel only. If the ticket
+                # channel is gone, there is nowhere to restore the card.
+                if not isinstance(ticket_channel, discord.TextChannel):
                     continue
+                # Skip when the card is already posted inside the ticket (never double-post).
+                already_posted = False
+                try:
+                    async for message in ticket_channel.history(limit=50):
+                        for existing_embed in message.embeds or []:
+                            if (existing_embed.title or "") != "MCWV Application Ready for Review":
+                                continue
+                            for field in existing_embed.fields:
+                                if str(field.name).lower() == "ticket" and str(field.value).replace("`", "").strip() == ticket_id:
+                                    already_posted = True
+                                    break
+                        if already_posted:
+                            break
+                except Exception:
+                    already_posted = True  # cannot verify -> safer to skip than duplicate
+                if already_posted:
+                    continue
+                await ticket_channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
                 restored += 1
                 await asyncio.sleep(1.0)
             except Exception as exc:
@@ -8490,6 +8509,28 @@ class ScreenshotUploadedView(discord.ui.View):
             allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
         )
 
+        # Screenshots are confirmed, so the application is now ready for staff
+        # review — post the staff review card (Accept / Staff Info / Close) into
+        # the ticket channel. It lives here only (no review-channel fallback).
+        try:
+            app_row = await asyncio.to_thread(db_get_ticket_application, row[0])
+            applicant = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+            if applicant is None:
+                applicant = interaction.user
+            posted = await send_application_review_card(
+                interaction.guild,
+                interaction.channel,
+                row[0],
+                applicant,
+                app_row,
+            )
+            if not posted:
+                await interaction.channel.send(
+                    "⚠️ Could not post the staff review card here. Staff can still review this application via the Hub dashboard."
+                )
+        except Exception as review_error:
+            print(f"[ticket] review card post after screenshots failed for {row[0]}: {review_error}")
+
 
 class ApplicationModal(discord.ui.Modal):
     def __init__(self, opener):
@@ -8656,43 +8697,10 @@ class ApplicationModal(discord.ui.Modal):
             print(f"[ticket] screenshot confirmation button failed in {channel.id}: {button_error}")
             await channel.send("When your screenshots are uploaded, please tell staff: `Screenshots uploaded`.")
 
-        roblox_avatar_url = await get_roblox_headshot_url(resolved["id"])
-        review_embed = build_application_review_embed(
-            ticket_id,
-            interaction.user,
-            resolved["name"],
-            resolved["id"],
-            afk_247,
-            activity,
-            liquid_gems,
-            why_accept,
-            avatar_url=roblox_avatar_url,
-        )
-        # The staff control card lives INSIDE the applicant's ticket so staff can
-        # work the application in-channel. Review channel is an emergency fallback only.
-        review_channel = guild.get_channel(MCWV_TICKET_REVIEW_CHANNEL_ID)
-        try:
-            await channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
-        except Exception as review_error:
-            print(f"[ticket] in-ticket review embed send failed for {ticket_id}: {review_error}")
-            fallback_ok = False
-            if isinstance(review_channel, discord.TextChannel):
-                try:
-                    review_embed.add_field(name="Ticket Channel", value=channel.mention, inline=False)
-                    await review_channel.send(embed=review_embed, view=ApplicationReviewView(ticket_id))
-                    fallback_ok = True
-                except Exception as fallback_error:
-                    print(f"[ticket] review-channel fallback send failed for {ticket_id}: {fallback_error}")
-            if not fallback_ok:
-                await interaction.followup.send(
-                    f"⚠️ Ticket was created ({channel.mention}) but the staff review embed could not be sent. Check my channel permissions.",
-                    ephemeral=True,
-                )
-                return
-            try:
-                await channel.send("⚠️ Staff controls are temporarily in the review channel because the card could not be posted here.")
-            except Exception:
-                pass
+        # The staff review card ("Application Ready for Review") is NOT posted at
+        # ticket open. It is posted once the applicant confirms their screenshots
+        # are uploaded (ScreenshotUploadedView), because that is when the
+        # application is actually ready for staff review.
 
         await interaction.followup.send(f"✅ Application ticket created: {channel.mention}", ephemeral=True)
 
