@@ -8272,6 +8272,17 @@ async def build_ticket_transcript(channel, limit=250):
 
 
 async def accept_application_ticket(interaction, ticket_row):
+    # Defer FIRST. This function does several seconds of DB/Discord API work
+    # (link Roblox, add role, rename + move channel, send embeds, DM). Without
+    # deferring, the final interaction.response.send_message blows past Discord's
+    # interaction window and raises 404 Unknown interaction (10062). Guarded so a
+    # caller that already deferred (or responded) does not double-acknowledge.
+    if not interaction.response.is_done():
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
     guild = interaction.guild
     channel = None
     if guild and ticket_row and ticket_row[1]:
@@ -8289,12 +8300,18 @@ async def accept_application_ticket(interaction, ticket_row):
         except Exception:
             applicant = None
     if applicant is None:
-        await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Applicant is no longer in the server.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
         return False
 
     app = db_get_ticket_application(ticket_row[0])
     if not app:
-        await interaction.response.send_message("❌ No submitted application found yet.", ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ No submitted application found yet.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ No submitted application found yet.", ephemeral=True)
         return False
     roblox_name, roblox_id = str(app[0]), str(app[1])
 
