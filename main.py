@@ -2929,6 +2929,7 @@ CLAN_MEMBER_CATEGORY_IDS = [
     1503109089931034785,  # main
     1520511998633185280   # backup
 ]
+MCWV_LOA_CATEGORY_ID = int(os.environ.get("MCWV_LOA_CATEGORY_ID", "1509315307204771900") or "1509315307204771900")
 MEMBERS_CHANNEL_ID        = 1509276380674789617  # membership record posted here
 LOG_CHANNEL_ID            = 1502001938705682622  # accept/action log
 PS99_API                  = "https://ps99.biggamesapi.io"
@@ -12879,6 +12880,15 @@ async def clan_leave_loop():
             if "UserID" in m
         }
 
+        # The in-game Owner is not always listed in Members. Include them so
+        # the owner never triggers a false "Clan Leave Detected" alert.
+        owner_id = get_clan_owner_id_from_data(data)
+        if owner_id:
+            try:
+                clan_member_ids.add(int(owner_id))
+            except Exception:
+                pass
+
         if not clan_member_ids:
             return
 
@@ -12912,7 +12922,7 @@ async def clan_leave_loop():
 
                 embed.add_field(name="Discord User", value=f"<@{discord_id}>", inline=True)
                 embed.add_field(name="Roblox", value=roblox_name, inline=True)
-                embed.add_field(name="Action Required", value="Approve or ignore this removal.", inline=False)
+                embed.add_field(name="Action Required", value="Approve removal, grant LOA, or ignore.", inline=False)
 
                 await staff_channel.send(
                     embed=embed,
@@ -12969,6 +12979,95 @@ class ClanReviewView(discord.ui.View):
             try:
                 await interaction.response.send_message(
                     "❌ Something went wrong while processing this.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(label="LOA", style=discord.ButtonStyle.secondary, emoji="🏝️")
+    async def loa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if self.roblox_id not in pending_clan_removals:
+                return await interaction.response.send_message("Already handled.", ephemeral=True)
+
+            await interaction.response.defer(ephemeral=True)
+            data = pending_clan_removals.pop(self.roblox_id)
+            guild = interaction.guild
+            discord_id = int(data["discord_id"])
+            roblox_name = str(data["roblox_name"] or "unknown")
+            notes = []
+
+            # 1) Find the member's ticket channel (by topic or DB-stored channel ID).
+            ticket_channel = None
+            if guild:
+                ticket_channel = discord.utils.get(
+                    guild.text_channels,
+                    topic=f"mcwv-ticket-owner:{discord_id}"
+                )
+                if ticket_channel is None:
+                    # Fall back to the DB-stored ticket_channel_id.
+                    try:
+                        saved_id = db_get_setting(f"ticket_channel:{discord_id}", None)
+                        if saved_id:
+                            ticket_channel = guild.get_channel(int(saved_id))
+                    except Exception:
+                        pass
+
+            # 2) Move + rename the ticket channel.
+            if isinstance(ticket_channel, discord.TextChannel):
+                safe_name = normalize_ticket_key(roblox_name)[:24] or str(discord_id)
+                loa_category = guild.get_channel(MCWV_LOA_CATEGORY_ID) if guild else None
+                if isinstance(loa_category, discord.CategoryChannel):
+                    try:
+                        await ticket_channel.edit(
+                            category=loa_category,
+                            name=f"\U0001f3dd\ufe0f-ticket-{safe_name}",
+                            reason=f"MCWV LOA - moved by {interaction.user}",
+                        )
+                        notes.append(f"Ticket moved to LOA category and renamed")
+                    except Exception as exc:
+                        print(f"[LOA] ticket move/rename failed: {exc}")
+                        notes.append(f"Could not move ticket: {exc}")
+                else:
+                    notes.append("LOA category not found - ticket not moved")
+            else:
+                notes.append("No ticket channel found for this member - skipped move")
+
+            # 3) Remove the clan member role.
+            member = guild.get_member(discord_id) if guild else None
+            if member is None and guild:
+                try:
+                    member = await guild.fetch_member(discord_id)
+                except Exception:
+                    member = None
+            role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
+            if member and role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason=f"MCWV LOA - by {interaction.user}")
+                    notes.append("Clan member role removed")
+                except Exception as exc:
+                    notes.append(f"Could not remove role: {exc}")
+
+            # 4) Unlink their Roblox account (keeps the Hub login).
+            try:
+                ok, unlink_msg = db_remove_all_links_for_discord(discord_id)
+                notes.append("Roblox links removed" if ok else f"Unlink failed: {unlink_msg}")
+            except Exception as exc:
+                notes.append(f"Unlink error: {exc}")
+
+            # 5) Edit the original embed to show LOA was applied.
+            await interaction.edit_original_response(
+                content=f"\U0001f3dd\ufe0f **LOA applied by {interaction.user.mention}**\n" + "\n".join(notes),
+                embed=interaction.message.embeds[0] if interaction.message.embeds else None,
+                view=None
+            )
+            self.stop()
+
+        except Exception as e:
+            print("LOA button error:", e)
+            try:
+                await interaction.followup.send(
+                    "Something went wrong while applying LOA.",
                     ephemeral=True
                 )
             except Exception:
