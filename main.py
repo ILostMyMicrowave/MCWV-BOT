@@ -5015,6 +5015,12 @@ MCWV_HOURLY_STATS_BG_PATH = os.environ.get(
     "MCWV_HOURLY_STATS_BG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hourly_stats_bg.webp"),
 )
+
+# ---------------- SLACKER ALERT ----------------
+MCWV_SLACKER_ALERT_CHANNEL_ID = int(os.environ.get("MCWV_SLACKER_ALERT_CHANNEL_ID", "0") or "0")
+MCWV_SLACKER_ALERT_ENABLED_DEFAULT = os.environ.get("MCWV_SLACKER_ALERT_ENABLED", "0") == "1"
+MCWV_SLACKER_ALERT_INTERVAL_HOURS = max(1, int(os.environ.get("MCWV_SLACKER_ALERT_INTERVAL_HOURS", "24") or "24"))
+MCWV_SLACKER_ALERT_TOP_N = max(1, min(int(os.environ.get("MCWV_SLACKER_ALERT_TOP_N", "10") or "10"), 50))
 # Automatically pause hourly stats when no clan war is active and resume them
 # when the next war starts. Set MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE=0 to keep them
 # fully manual (only the /toggle_automation command and Dashboard button control them).
@@ -9106,6 +9112,7 @@ class MCWVTicketPanelView(discord.ui.View):
     app_commands.Choice(name="Placement alerts", value="placement_alerts"),
     app_commands.Choice(name="Clan logs", value="clan_logs"),
     app_commands.Choice(name="Hourly stats", value="hourly_stats"),
+    app_commands.Choice(name="Slacker alerts", value="slacker_alerts"),
 ])
 async def setup(interaction: discord.Interaction, system: app_commands.Choice[str], channel: discord.TextChannel):
     if not has_mcwv_ticket_staff_permission(interaction.user):
@@ -9154,6 +9161,25 @@ async def setup(interaction: discord.Interaction, system: app_commands.Choice[st
                 f"MCWV hourly stats cards will be posted in {channel.mention} every "
                 f"**{MCWV_HOURLY_STATS_INTERVAL_MINUTES} minutes**.\n\n"
                 "Use `/hourly_stats` anytime to send one manually."
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if system.value == "slacker_alerts":
+        set_slacker_alert_channel_id(channel.id)
+        db_set_setting("mcwv_slacker_alert_enabled", "1")
+        if not slacker_alert_loop.is_running():
+            slacker_alert_loop.start()
+        embed = discord.Embed(
+            title="Slacker alerts configured",
+            description=(
+                f"MCWV slacker alerts will be posted in {channel.mention} every "
+                f"**{get_slacker_alert_interval_hours()}h**, pinging the worst "
+                f"**{get_slacker_alert_top_n()}** performers by points gained.\n\n"
+                "Use `/slacker_alert_config` to change the interval and count."
             ),
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
@@ -9249,6 +9275,7 @@ async def hourly_stats(interaction: discord.Interaction, channel: discord.TextCh
     app_commands.Choice(name="Hourly PPH pings", value="hourly_pings"),
     app_commands.Choice(name="Placement alerts", value="placement_alerts"),
     app_commands.Choice(name="Clan logs", value="clan_logs"),
+    app_commands.Choice(name="Slacker alerts", value="slacker_alerts"),
 ])
 async def toggle_automation(interaction: discord.Interaction, system: app_commands.Choice[str], enabled: bool):
     if not has_mcwv_ticket_staff_permission(interaction.user):
@@ -9286,6 +9313,16 @@ async def toggle_automation(interaction: discord.Interaction, system: app_comman
         label = "Clan logs"
         if enabled and not get_clan_log_channel_id():
             notes.append("No clan log channel set yet — run `/setup Clan logs #channel`.")
+    elif value == "slacker_alerts":
+        set_slacker_alert_enabled(bool(enabled))
+        label = "Slacker alerts"
+        if enabled:
+            if not get_slacker_alert_channel_id():
+                notes.append("No slacker channel set yet — run `/setup Slacker alerts #channel`.")
+            if not slacker_alert_loop.is_running():
+                slacker_alert_loop.start()
+        elif MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE:
+            notes.append("Auto pause/resume on clan war start/end is still on, but this manual toggle wins.")
     else:
         return await interaction.followup.send("❌ Unknown automation.", ephemeral=True)
 
@@ -9301,6 +9338,53 @@ async def toggle_automation(interaction: discord.Interaction, system: app_comman
     )
     embed.set_footer(text=f"Changed by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="slacker_alert_config", description="Configure slacker alert interval and how many to ping", guild=guild_obj)
+@app_commands.describe(
+    interval_hours="Hours between slacker alerts (1-168, default 24)",
+    top_n="How many worst performers to ping (1-50, default 10)"
+)
+async def slacker_alert_config(interaction: discord.Interaction, interval_hours: int = None, top_n: int = None):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    notes = []
+    if interval_hours is not None:
+        interval_hours = max(1, min(int(interval_hours), 168))
+        set_slacker_alert_interval_hours(interval_hours)
+        notes.append(f"Interval set to **{interval_hours}h**.")
+    if top_n is not None:
+        top_n = max(1, min(int(top_n), 50))
+        set_slacker_alert_top_n(top_n)
+        notes.append(f"Will ping the worst **{top_n}** performers.")
+
+    if not notes:
+        notes.append("No changes — provide `interval_hours` and/or `top_n`.")
+
+    embed = discord.Embed(
+        title="⚙️ Slacker alert config",
+        description="\n".join(notes) + f"\n\nCurrent: every **{get_slacker_alert_interval_hours()}h**, top **{get_slacker_alert_top_n()}** slackers.",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Changed by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="slacker_alert_test", description="Send a slacker alert right now (ignores cooldown)", guild=guild_obj)
+async def slacker_alert_test(interaction: discord.Interaction):
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not get_slacker_alert_channel_id():
+        return await interaction.followup.send("❌ No slacker alert channel set. Run `/setup Slacker alerts #channel` first.", ephemeral=True)
+    try:
+        await send_slacker_alert()
+        await interaction.followup.send("✅ Slacker alert sent.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Failed: `{exc}`", ephemeral=True)
 
 
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
@@ -15479,6 +15563,215 @@ async def before_hub_war_collect_loop():
     await bot.wait_until_ready()
 
 
+# ---------------- SLACKER ALERT ----------------
+# Pings the worst N performers by points gained since the last alert.
+# Baseline snapshot is stored in DB settings so gains survive restarts.
+
+def slacker_alert_enabled():
+    raw = db_get_setting("mcwv_slacker_alert_enabled", "1" if MCWV_SLACKER_ALERT_ENABLED_DEFAULT else "0")
+    return str(raw).lower() not in ("0", "false", "off", "no")
+
+
+def set_slacker_alert_enabled(enabled):
+    db_set_setting("mcwv_slacker_alert_enabled", "1" if enabled else "0")
+
+
+def get_slacker_alert_channel_id():
+    saved = db_get_setting("mcwv_slacker_alert_channel_id", None)
+    try:
+        return int(saved or MCWV_SLACKER_ALERT_CHANNEL_ID or 0)
+    except Exception:
+        return int(MCWV_SLACKER_ALERT_CHANNEL_ID or 0)
+
+
+def set_slacker_alert_channel_id(channel_id):
+    db_set_setting("mcwv_slacker_alert_channel_id", int(channel_id))
+
+
+def get_slacker_alert_interval_hours():
+    try:
+        return max(1, int(db_get_setting("mcwv_slacker_alert_interval_hours", MCWV_SLACKER_ALERT_INTERVAL_HOURS)))
+    except Exception:
+        return int(MCWV_SLACKER_ALERT_INTERVAL_HOURS)
+
+
+def set_slacker_alert_interval_hours(hours):
+    db_set_setting("mcwv_slacker_alert_interval_hours", max(1, int(hours)))
+
+
+def get_slacker_alert_top_n():
+    try:
+        return max(1, min(int(db_get_setting("mcwv_slacker_alert_top_n", MCWV_SLACKER_ALERT_TOP_N)), 50))
+    except Exception:
+        return int(MCWV_SLACKER_ALERT_TOP_N)
+
+
+def set_slacker_alert_top_n(count):
+    db_set_setting("mcwv_slacker_alert_top_n", max(1, min(int(count), 50)))
+
+
+def slacker_alert_last_sent_iso():
+    return db_get_setting("mcwv_slacker_alert_last_sent_at", None)
+
+
+def slacker_alert_due_now():
+    last = slacker_alert_last_sent_iso()
+    if not last:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    interval_seconds = get_slacker_alert_interval_hours() * 3600
+    return (datetime.now(timezone.utc) - last_dt).total_seconds() >= interval_seconds
+
+
+async def send_slacker_alert():
+    """Fetch current clan battle contributions, compare to the stored baseline,
+    ping the bottom N by gain, then save current points as the new baseline.
+
+    On the first run (no baseline), save current points and send a heads-up
+    instead — the real report comes next cycle.
+    """
+    channel_id = get_slacker_alert_channel_id()
+    if not channel_id:
+        print("[slacker] no channel configured")
+        return
+    channel = await _maybe_get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"[slacker] channel not found/not text: {channel_id}")
+        return
+
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        print("[slacker] no active war — skipping")
+        return
+
+    clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
+    data = clan_payload.get("data", {}) if isinstance(clan_payload, dict) else {}
+    if not isinstance(data, dict) or not data:
+        print("[slacker] could not load clan data")
+        return
+
+    battles = data.get("Battles") or {}
+    battle = battles.get(battle_id) or battles.get(str(battle_id)) if isinstance(battles, dict) else None
+    if not battle and isinstance(battles, dict):
+        norm = normalize_hourly_battle_key(battle_id)
+        battle = next((value for key, value in battles.items() if normalize_hourly_battle_key(key) == norm), None)
+    if not isinstance(battle, dict):
+        print("[slacker] battle not found in clan data")
+        return
+
+    contributions = battle.get("PointContributions") or battle.get("pointContributions") or []
+    current_points = {}
+    for entry in contributions if isinstance(contributions, list) else []:
+        try:
+            rid = str(int(entry.get("UserID") or entry.get("userId") or 0))
+            current_points[rid] = int(entry.get("Points") or entry.get("points") or 0)
+        except Exception:
+            continue
+
+    if not current_points:
+        print("[slacker] no contributions found")
+        return
+
+    # Load baseline (last alert's point snapshot).
+    baseline_raw = db_get_setting("mcwv_slacker_alert_baseline", "")
+    baseline = {}
+    if baseline_raw:
+        try:
+            baseline = json.loads(baseline_raw)
+        except Exception:
+            baseline = {}
+
+    # First run — no baseline. Save current and send a heads-up.
+    if not baseline:
+        db_set_setting("mcwv_slacker_alert_baseline", json.dumps(current_points))
+        db_set_setting("mcwv_slacker_alert_last_sent_at", _now_iso())
+        await channel.send(
+            "📊 **Slacker Alert baseline set.** "
+            f"I've recorded everyone's current points. The first slacker report will come in **{get_slacker_alert_interval_hours()}h**."
+        )
+        print("[slacker] baseline saved — first report next cycle")
+        return
+
+    # Compute gains and sort worst-first (lowest gain = worst).
+    tracked = db_get_all_tracked()
+    discord_by_roblox = {}
+    name_by_roblox = {}
+    for row in tracked or []:
+        try:
+            rid = str(row[0]).strip()
+            did = str(row[1]).strip() if row[1] else None
+            uname = str(row[2]).strip() if len(row) > 2 and row[2] else rid
+            if rid:
+                name_by_roblox[rid] = uname
+                if did:
+                    discord_by_roblox[rid] = did
+        except Exception:
+            continue
+
+    gains = []
+    for rid, pts in current_points.items():
+        prev = int(baseline.get(rid, pts) or 0)
+        gain = pts - prev
+        gains.append({
+            "robloxId": rid,
+            "name": name_by_roblox.get(rid, rid),
+            "discordId": discord_by_roblox.get(rid),
+            "gain": gain,
+            "current": pts,
+        })
+
+    # Sort worst-first: lowest gain at the top. Include zero-gain players.
+    gains.sort(key=lambda x: x["gain"])
+    top_n = get_slacker_alert_top_n()
+    worst = gains[:top_n]
+
+    interval_h = get_slacker_alert_interval_hours()
+    period_label = "today" if interval_h >= 20 else f"in the last {interval_h}h"
+
+    lines = [f"# Today's slackers are:\n"]
+    for i, member in enumerate(worst, 1):
+        mention = f"<@{member['discordId']}>" if member["discordId"] else f"**{member['name']}**"
+        gain_str = f"+{member['gain']:,}" if member["gain"] >= 0 else f"{member['gain']:,}"
+        lines.append(f"{i}. {mention} — gained **{gain_str}** points {period_label}")
+
+    content = "\n".join(lines)
+
+    # Discord message limit safety.
+    if len(content) > 1900:
+        content = content[:1890] + "\n…"
+
+    await channel.send(
+        content=content,
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+
+    # Save the new baseline + timestamp.
+    db_set_setting("mcwv_slacker_alert_baseline", json.dumps(current_points))
+    db_set_setting("mcwv_slacker_alert_last_sent_at", _now_iso())
+    print(f"[slacker] alert sent to {channel_id} — {len(worst)} members pinged")
+
+
+@tasks.loop(minutes=1)
+async def slacker_alert_loop():
+    await bot.wait_until_ready()
+    if not slacker_alert_enabled():
+        return
+    if not slacker_alert_due_now():
+        return
+    try:
+        await send_slacker_alert()
+    except Exception as exc:
+        print(f"[slacker] loop error: {exc}")
+
+
+@slacker_alert_loop.before_loop
+async def before_slacker_alert_loop():
+    await bot.wait_until_ready()
+
+
 # ---------------- LOOP STARTER ----------------
 def start_bot_loops():
     if not check_loop.is_running():
@@ -15523,6 +15816,10 @@ def start_bot_loops():
     # ---------------- GIVEAWAY LOOP ----------------
     if not check_giveaway_event.is_running():
         check_giveaway_event.start()
+
+    # ---------------- SLACKER ALERT LOOP ----------------
+    if not slacker_alert_loop.is_running():
+        slacker_alert_loop.start()
 
 
 # ---------------- READY ----------------
