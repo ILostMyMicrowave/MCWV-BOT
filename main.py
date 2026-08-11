@@ -5021,6 +5021,7 @@ MCWV_SLACKER_ALERT_CHANNEL_ID = int(os.environ.get("MCWV_SLACKER_ALERT_CHANNEL_I
 MCWV_SLACKER_ALERT_ENABLED_DEFAULT = os.environ.get("MCWV_SLACKER_ALERT_ENABLED", "0") == "1"
 MCWV_SLACKER_ALERT_INTERVAL_HOURS = max(1, int(os.environ.get("MCWV_SLACKER_ALERT_INTERVAL_HOURS", "24") or "24"))
 MCWV_SLACKER_ALERT_TOP_N = max(1, min(int(os.environ.get("MCWV_SLACKER_ALERT_TOP_N", "10") or "10"), 50))
+MCWV_SLACKER_ALERT_ROLE_ID = int(os.environ.get("MCWV_SLACKER_ALERT_ROLE_ID", "1530151749082681494") or "1530151749082681494")
 # Automatically pause hourly stats when no clan war is active and resume them
 # when the next war starts. Set MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE=0 to keep them
 # fully manual (only the /toggle_automation command and Dashboard button control them).
@@ -9340,12 +9341,13 @@ async def toggle_automation(interaction: discord.Interaction, system: app_comman
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="slacker_alert_config", description="Configure slacker alert interval and how many to ping", guild=guild_obj)
+@bot.tree.command(name="slacker_alert_config", description="Configure slacker alert interval, count, and role", guild=guild_obj)
 @app_commands.describe(
     interval_hours="Hours between slacker alerts (1-168, default 24)",
-    top_n="How many worst performers to ping (1-50, default 10)"
+    top_n="How many worst performers to ping (1-50, default 10)",
+    role="The Discord role to give slackers (leave empty to keep current)"
 )
-async def slacker_alert_config(interaction: discord.Interaction, interval_hours: int = None, top_n: int = None):
+async def slacker_alert_config(interaction: discord.Interaction, interval_hours: int = None, top_n: int = None, role: discord.Role = None):
     if not has_mcwv_ticket_staff_permission(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
@@ -9359,6 +9361,9 @@ async def slacker_alert_config(interaction: discord.Interaction, interval_hours:
         top_n = max(1, min(int(top_n), 50))
         set_slacker_alert_top_n(top_n)
         notes.append(f"Will ping the worst **{top_n}** performers.")
+    if role is not None:
+        set_slacker_role_id(role.id)
+        notes.append(f"Slacker role set to **{role.name}**.")
 
     if not notes:
         notes.append("No changes — provide `interval_hours` and/or `top_n`.")
@@ -15610,6 +15615,111 @@ def set_slacker_alert_top_n(count):
     db_set_setting("mcwv_slacker_alert_top_n", max(1, min(int(count), 50)))
 
 
+def get_slacker_role_id():
+    try:
+        return int(db_get_setting("mcwv_slacker_alert_role_id", MCWV_SLACKER_ALERT_ROLE_ID) or MCWV_SLACKER_ALERT_ROLE_ID)
+    except Exception:
+        return int(MCWV_SLACKER_ALERT_ROLE_ID)
+
+
+def set_slacker_role_id(role_id):
+    db_set_setting("mcwv_slacker_alert_role_id", int(role_id))
+
+
+# Discord IDs that currently hold the slacker role from the last alert.
+# Stored as a JSON list so we know who to remove the role from next cycle.
+def get_current_slacker_discord_ids():
+    raw = db_get_setting("mcwv_slacker_alert_current_ids", "")
+    try:
+        ids = json.loads(raw) if raw else []
+        return [str(x) for x in ids if x]
+    except Exception:
+        return []
+
+
+def set_current_slacker_discord_ids(ids):
+    db_set_setting("mcwv_slacker_alert_current_ids", json.dumps([str(x) for x in ids if x]))
+
+
+async def sync_slacker_role(guild, new_slacker_discord_ids):
+    """Add the slacker role to new slackers and remove it from ex-slackers.
+
+    Returns (added_count, removed_count). Silently skips members who left the
+    server or whose role the bot can't manage.
+    """
+    role_id = get_slacker_role_id()
+    role = guild.get_role(role_id) if role_id else None
+    if not role or not isinstance(role, discord.Role):
+        print(f"[slacker] role {role_id} not found in guild — skipping role sync")
+        return 0, 0
+
+    me = guild.me
+    if me and role >= me.top_role:
+        print(f"[slacker] role {role.name} is above the bot's top role — cannot manage it")
+        return 0, 0
+
+    previous_ids = set(get_current_slacker_discord_ids())
+    new_ids = set(str(x) for x in new_slacker_discord_ids if x)
+
+    to_add = new_ids - previous_ids
+    to_remove = previous_ids - new_ids
+
+    added = 0
+    for did in to_add:
+        try:
+            member = guild.get_member(int(did))
+            if member is None:
+                member = await guild.fetch_member(int(did))
+            if member and role not in member.roles:
+                await member.add_roles(role, reason="MCWV slacker alert — poor performance")
+                added += 1
+        except Exception as exc:
+            print(f"[slacker] could not add role to {did}: {exc}")
+
+    removed = 0
+    for did in to_remove:
+        try:
+            member = guild.get_member(int(did))
+            if member is None:
+                member = await guild.fetch_member(int(did))
+            if member and role in member.roles:
+                await member.remove_roles(role, reason="MCWV slacker alert — no longer on slacker list")
+                removed += 1
+        except Exception as exc:
+            print(f"[slacker] could not remove role from {did}: {exc}")
+
+    set_current_slacker_discord_ids(list(new_ids))
+    return added, removed
+
+
+async def clear_all_slacker_roles(guild):
+    """Remove the slacker role from everyone who had it (used when a war ends)."""
+    role_id = get_slacker_role_id()
+    role = guild.get_role(role_id) if role_id else None
+    if not role or not isinstance(role, discord.Role):
+        return 0
+
+    me = guild.me
+    if me and role >= me.top_role:
+        return 0
+
+    current_ids = get_current_slacker_discord_ids()
+    removed = 0
+    for did in current_ids:
+        try:
+            member = guild.get_member(int(did))
+            if member is None:
+                member = await guild.fetch_member(int(did))
+            if member and role in member.roles:
+                await member.remove_roles(role, reason="MCWV slacker alert — war ended, roles cleared")
+                removed += 1
+        except Exception:
+            pass
+
+    set_current_slacker_discord_ids([])
+    return removed
+
+
 def slacker_alert_last_sent_iso():
     return db_get_setting("mcwv_slacker_alert_last_sent_at", None)
 
@@ -15645,6 +15755,12 @@ async def send_slacker_alert():
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         print("[slacker] no active war — skipping")
+        # War ended: clear the slacker role from everyone who had it.
+        guild = bot.get_guild(GUILD_ID) or (bot.guilds[0] if bot.guilds else None)
+        if guild:
+            cleared = await clear_all_slacker_roles(guild)
+            if cleared:
+                print(f"[slacker] war ended — cleared slacker role from {cleared} member(s)")
         return
 
     clan_payload = await fetch_json_for_placement(CLAN_API) if CLAN_API else None
@@ -15752,6 +15868,16 @@ async def send_slacker_alert():
     db_set_setting("mcwv_slacker_alert_baseline", json.dumps(current_points))
     db_set_setting("mcwv_slacker_alert_last_sent_at", _now_iso())
     print(f"[slacker] alert sent to {channel_id} — {len(worst)} members pinged")
+
+    # Give the slacker role to the worst performers, remove it from ex-slackers.
+    guild = channel.guild
+    new_slacker_ids = [m["discordId"] for m in worst if m["discordId"]]
+    try:
+        added, removed = await sync_slacker_role(guild, new_slacker_ids)
+        if added or removed:
+            print(f"[slacker] role sync: +{added} added, -{removed} removed")
+    except Exception as exc:
+        print(f"[slacker] role sync failed: {exc}")
 
 
 @tasks.loop(minutes=1)
