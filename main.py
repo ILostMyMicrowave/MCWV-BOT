@@ -12864,11 +12864,28 @@ async def war_poll_loop():
                 await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
                 print("War started (state synced)")
                 await run_initial_presence_check()
+                # Fire instant push to all Hub subscribers.
+                await trigger_hub_push(
+                    "war_start",
+                    title="⚔️ WAR DECLARED",
+                    body=f"{PS99_CURRENT_WAR_NAME or 'New battle'} is live — MCWV, to arms!",
+                    url="/war-info",
+                    tag=f"war-start-{PS99_CURRENT_WAR_NAME or 'battle'}".lower()[:48],
+                )
             else:
                 offline_since.clear()
                 status_cache.clear()
                 await channel.send("🛑 CLAN WAR OVER. GG EVERYONE!!")
                 print("War ended (state synced)")
+                # Fire instant push + sweep any pending broadcasts.
+                await trigger_hub_push(
+                    "war_end",
+                    title="🛑 WAR OVER",
+                    body="GG MCWV — war's done. Check the recap on the Hub.",
+                    url="/war-info",
+                    tag="war-end",
+                )
+                await trigger_hub_push("sweep")
 
     except Exception as e:
         print("War poll error:", e)
@@ -15597,6 +15614,43 @@ def build_placement_embed(old_rank, new_rank, points):
     return embed
 
 
+async def trigger_hub_push(event, title=None, body=None, url=None, tag=None, image=None):
+    """Fire a push notification to all Hub subscribers instantly via the
+    bot-to-hub server endpoint. Best-effort: failures are logged but never
+    block the calling flow (war detection, placement alerts, etc.).
+    """
+    if not HUB_BASE_URL:
+        return
+    api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+    if not api_key:
+        return
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        payload = {"event": event}
+        if title: payload["title"] = str(title)[:200]
+        if body: payload["body"] = str(body)[:2000]
+        if url: payload["url"] = url
+        if tag: payload["tag"] = str(tag)[:48]
+        if image: payload["image"] = image
+        endpoint = f"{HUB_BASE_URL}/api/push/trigger"
+        async with session.post(
+            endpoint,
+            json=payload,
+            headers={"X-Admin-API-Key": api_key, "Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as res:
+            if res.status == 200:
+                data = await res.json(content_type=None)
+                print(f"[hub push] {event} sent: {data.get('sent', '?')} delivered")
+            else:
+                text = await res.text()
+                print(f"[hub push] {event} HTTP {res.status}: {text[:200]}")
+    except Exception as exc:
+        print(f"[hub push] {event} failed: {exc}")
+
+
 async def send_placement_alert(snapshot, old_rank):
     channel_id = get_placement_channel_id()
     if not channel_id:
@@ -15640,6 +15694,15 @@ async def placement_alert_loop():
         if await send_placement_alert(snapshot, old_rank):
             save_placement_state(battle_id, rank, points, announced=True)
             print(f"[placement] alert sent {battle_id}: {old_rank}->{rank} points={points}")
+            # Fire instant push for placement changes.
+            improved = rank < old_rank
+            await trigger_hub_push(
+                "placement",
+                title=f"{'📈' if improved else '📉'} MCWV #{rank}",
+                body=f"Clan placement {'up' if improved else 'down'} from #{old_rank} to #{rank} - {format_compact_points(points)} pts",
+                url="/war-info",
+                tag=f"placement-{battle_id}".lower()[:48],
+            )
         else:
             save_placement_state(battle_id, rank, points, announced=False)
     except Exception as exc:
