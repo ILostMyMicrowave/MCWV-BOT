@@ -2385,7 +2385,7 @@ def db_remove_all_links_for_discord(discord_id):
     except Exception as e:
         conn.rollback()
         print("db_remove_all_links_for_discord error:", e)
-        return False, "Failed to remove player links."
+        return False, f"Failed to remove player links: {type(e).__name__}: {e}"
 
 status_cache = {}
 status_cache_time = {}
