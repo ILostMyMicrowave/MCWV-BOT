@@ -2375,24 +2375,11 @@ def db_remove_all_links_for_discord(discord_id):
             if db_is_owner_discord(did):
                 return False, "Owner accounts cannot be removed from Roblox Links. Restore or edit the owner manually in Neon."
 
-            # One-time migration: roblox_id was originally PRIMARY KEY (NOT NULL),
-            # but we need to NULL it to unlink while keeping the Hub auth row.
-            # Convert it to a UNIQUE constraint (allows NULLs) so ON CONFLICT
-            # (roblox_id) in db_add still works. Idempotent.
-            try:
-                cur.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_pkey")
-                cur.execute("ALTER TABLE users ALTER COLUMN roblox_id DROP NOT NULL")
-                cur.execute("ALTER TABLE users ADD CONSTRAINT users_roblox_id_unique UNIQUE (roblox_id)")
-            except Exception:
-                conn.rollback()
-
-            # Important: do not DELETE from users. The Hub auth account lives in
-            # this table too. Only remove Roblox tracking/link data.
             cur.execute("DELETE FROM user_alts WHERE discord_id = %s", (did,))
-            cur.execute("UPDATE users SET roblox_id = NULL WHERE discord_id = %s", (did,))
+            cur.execute("DELETE FROM users WHERE discord_id = %s", (did,))
 
         conn.commit()
-        return True, "Player Roblox links removed. The Hub account was kept."
+        return True, "Player fully removed (Roblox links + Hub login)."
     except Exception as e:
         conn.rollback()
         print("db_remove_all_links_for_discord error:", e)
