@@ -2930,6 +2930,7 @@ CLAN_MEMBER_CATEGORY_IDS = [
     1520511998633185280   # backup
 ]
 MCWV_LOA_CATEGORY_ID = int(os.environ.get("MCWV_LOA_CATEGORY_ID", "1509315307204771900") or "1509315307204771900")
+MCWV_LOA_ROLE_ID = int(os.environ.get("MCWV_LOA_ROLE_ID", "1512865451900801085") or "1512865451900801085")
 MEMBERS_CHANNEL_ID        = 1509276380674789617  # membership record posted here
 LOG_CHANNEL_ID            = 1502001938705682622  # accept/action log
 PS99_API                  = "https://ps99.biggamesapi.io"
@@ -3832,6 +3833,24 @@ def db_set_ticket_channel(discord_id, channel_id):
         except Exception:
             pass
         return False
+
+
+def db_get_ticket_channel_id(discord_id):
+    """Read a member's stored ticket channel ID from the users table."""
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticket_channel_id FROM users WHERE discord_id = %s LIMIT 1",
+                (int(discord_id),)
+            )
+            row = cur.fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception as e:
+        print("db_get_ticket_channel_id error:", e)
+    return None
 
 
 def db_log_admin_action(level, event, message, action=None, actor_username=None, metadata=None):
@@ -13005,11 +13024,11 @@ class ClanReviewView(discord.ui.View):
                     topic=f"mcwv-ticket-owner:{discord_id}"
                 )
                 if ticket_channel is None:
-                    # Fall back to the DB-stored ticket_channel_id.
+                    # Fall back to the DB-stored ticket_channel_id column.
                     try:
-                        saved_id = db_get_setting(f"ticket_channel:{discord_id}", None)
+                        saved_id = db_get_ticket_channel_id(discord_id)
                         if saved_id:
-                            ticket_channel = guild.get_channel(int(saved_id))
+                            ticket_channel = guild.get_channel(saved_id)
                     except Exception:
                         pass
 
@@ -13033,27 +13052,39 @@ class ClanReviewView(discord.ui.View):
             else:
                 notes.append("No ticket channel found for this member - skipped move")
 
-            # 3) Remove the clan member role.
+            # 3) Remove the clan member role and add the LOA role.
             member = guild.get_member(discord_id) if guild else None
             if member is None and guild:
                 try:
                     member = await guild.fetch_member(discord_id)
                 except Exception:
                     member = None
-            role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
-            if member and role and role in member.roles:
+
+            clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
+            if member and clan_role and clan_role in member.roles:
                 try:
-                    await member.remove_roles(role, reason=f"MCWV LOA - by {interaction.user}")
+                    await member.remove_roles(clan_role, reason=f"MCWV LOA - by {interaction.user}")
                     notes.append("Clan member role removed")
                 except Exception as exc:
-                    notes.append(f"Could not remove role: {exc}")
+                    notes.append(f"Could not remove clan role: {exc}")
+
+            loa_role = guild.get_role(MCWV_LOA_ROLE_ID) if guild else None
+            if member and loa_role:
+                try:
+                    if loa_role not in member.roles:
+                        await member.add_roles(loa_role, reason=f"MCWV LOA - by {interaction.user}")
+                    notes.append(f"LOA role added ({loa_role.name})")
+                except Exception as exc:
+                    notes.append(f"Could not add LOA role: {exc}")
+            elif not loa_role:
+                notes.append("LOA role not found in server")
 
             # 4) Unlink their Roblox account (keeps the Hub login).
             try:
                 ok, unlink_msg = db_remove_all_links_for_discord(discord_id)
                 notes.append("Roblox links removed" if ok else f"Unlink failed: {unlink_msg}")
             except Exception as exc:
-                notes.append(f"Unlink error: {exc}")
+                notes.append(f"Unlink error: {type(exc).__name__}: {exc}")
 
             # 5) Edit the original embed to show LOA was applied.
             await interaction.edit_original_response(
