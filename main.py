@@ -9357,15 +9357,20 @@ async def _get_clan_pph_from_history(clan_name, battle_id):
         return None
     try:
         battle_key = normalize_hourly_battle_key(battle_id)
+        # The hub war-collector stores battle_id as the raw configName (e.g.
+        # "ClanBattle987"), but the bot might use a different variant (Title,
+        # _id, etc). Match both the raw and normalized forms so we always find
+        # the right rows regardless of which source produced the battle_id.
+        battle_variants = list(dict.fromkeys([str(battle_id), battle_key]))
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT points, captured_at
                    FROM clan_history
-                   WHERE battle_id = %s
+                   WHERE battle_id = ANY(%s)
                      AND LOWER(clan_name) = LOWER(%s)
                      AND captured_at >= NOW() - INTERVAL '3 hours'
                    ORDER BY captured_at ASC""",
-                (battle_key, clan_name),
+                (battle_variants, clan_name),
             )
             rows = cur.fetchall()
         if not rows or len(rows) < 2:
