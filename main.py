@@ -9357,10 +9357,6 @@ async def _get_clan_pph_from_history(clan_name, battle_id):
         return None
     try:
         battle_key = normalize_hourly_battle_key(battle_id)
-        # The hub war-collector stores battle_id as the raw configName (e.g.
-        # "ClanBattle987"), but the bot might use a different variant (Title,
-        # _id, etc). Match both the raw and normalized forms so we always find
-        # the right rows regardless of which source produced the battle_id.
         battle_variants = list(dict.fromkeys([str(battle_id), battle_key]))
         with conn.cursor() as cur:
             cur.execute(
@@ -9434,47 +9430,44 @@ def _threat_level(mcwv_pph, rival_pph, gap, above):
     Returns (label, emoji, color_hint)."""
     if not mcwv_pph or not rival_pph:
         if above and gap is not None and gap < 5_000_000:
-            return ("LOW THREAT", "🟡", "close but no pace data")
-        return ("UNKNOWN", "⚪", "insufficient pace data")
+            return ("LOW THREAT", "\U0001f7e1", "close but no pace data")
+        return ("UNKNOWN", "\u26aa", "insufficient pace data")
     if above:
-        # They're ahead of us
         net = mcwv_pph - rival_pph
         if net <= 0:
-            return ("EXTREME", "🔴", "they're out-pacing us - gap grows")
+            return ("EXTREME", "\U0001f534", "they're out-pacing us - gap grows")
         if gap is not None and net > 0:
             eta = gap / net
             if eta < 6:
-                return ("HIGH", "🟠", f"we overtake in ~{math.ceil(eta)}h")
+                return ("HIGH", "\U0001f7e0", f"we overtake in ~{math.ceil(eta)}h")
             if eta < 24:
-                return ("MEDIUM", "🟡", f"we overtake in ~{math.ceil(eta)}h")
-            return ("LOW", "🟢", f"~{math.ceil(eta)}h to catch - safe for now")
+                return ("MEDIUM", "\U0001f7e1", f"we overtake in ~{math.ceil(eta)}h")
+            return ("LOW", "\U0001f7e2", f"~{math.ceil(eta)}h to catch - safe for now")
     else:
-        # They're behind us
         net = rival_pph - mcwv_pph
         if net <= 0:
-            return ("SAFE", "🟢", "we're pulling away")
+            return ("SAFE", "\U0001f7e2", "we're pulling away")
         if gap is not None and net > 0:
             eta = abs(gap) / net
             if eta < 6:
-                return ("CRITICAL", "🔴", f"they overtake us in ~{math.ceil(eta)}h!")
+                return ("CRITICAL", "\U0001f534", f"they overtake us in ~{math.ceil(eta)}h!")
             if eta < 24:
-                return ("HIGH", "🟠", f"they overtake us in ~{math.ceil(eta)}h")
-            return ("MEDIUM", "🟡", f"~{math.ceil(eta)}h until they catch us")
-    return ("UNKNOWN", "⚪", "insufficient data")
+                return ("HIGH", "\U0001f7e0", f"they overtake us in ~{math.ceil(eta)}h")
+            return ("MEDIUM", "\U0001f7e1", f"~{math.ceil(eta)}h until they catch us")
+    return ("UNKNOWN", "\u26aa", "insufficient data")
 
 
-def _pace_bar(mcwv_pph, rival_pph):
-    """Visual bar comparing pace. Returns a string."""
+def _pace_bar(mcwv_pph, rival_pph, bar_len=20):
+    """Visual bar comparing pace share. Returns a string."""
     if not mcwv_pph or not rival_pph:
-        return "No pace data"
+        return ""
     if mcwv_pph == 0 and rival_pph == 0:
-        return "Both idle"
+        return ""
     total = mcwv_pph + rival_pph
     mcwv_share = mcwv_pph / total if total else 0.5
-    bar_len = 20
     mcwv_filled = max(1, int(round(mcwv_share * bar_len)))
     rival_filled = bar_len - mcwv_filled
-    return f"MCWV `{'█' * mcwv_filled}{'░' * rival_filled}` {rival_pph and 'RIVAL' or ''} ({mcwv_pph/1e6:.1f}M vs {rival_pph/1e6:.1f}M/h)"
+    return f"`{'\u2588' * mcwv_filled}{'\u2591' * rival_filled}`"
 
 
 @bot.tree.command(name="spy", description="Spy on a rival clan - full intel with projections and threat assessment", guild=guild_obj)
@@ -9492,7 +9485,6 @@ async def spy(interaction: discord.Interaction, clan_name: str):
         return await interaction.followup.send(f"Invalid clan tag `{clan_name}`. Use 1-8 letters/numbers.")
 
     try:
-        # Fetch everything in parallel where possible
         data = await _fetch_clan_data(clan_name)
         if not data:
             return await interaction.followup.send(f"Could not find clan `{clan_name}` on PS99.")
@@ -9508,7 +9500,6 @@ async def spy(interaction: discord.Interaction, clan_name: str):
         gem_candidates = [data.get("Diamonds"), data.get("Bank"), data.get("ClanBank"), data.get("TotalDiamonds")]
         gems = next((int(g) for g in gem_candidates if isinstance(g, (int, float)) and int(g) > 0), None)
 
-        # Battle + timing data
         battle_id = await get_active_battle_id_for_placement()
         battles = data.get("Battles", {})
         if not isinstance(battles, dict):
@@ -9531,7 +9522,6 @@ async def spy(interaction: discord.Interaction, clan_name: str):
                 reverse=True,
             )
 
-        # Parallel: MCWV snapshot + rival rank + rival PPH + war timing
         mcwv_snapshot, (rival_rank, rival_standings_pts), rival_pph, war_timing = await asyncio.gather(
             get_mcwv_placement_snapshot(),
             _get_clan_rank_from_standings(clan_name),
@@ -9547,15 +9537,13 @@ async def spy(interaction: discord.Interaction, clan_name: str):
         mcwv_pph = await _get_clan_pph_from_history(CLAN_NAME, battle_id) if battle_id else None
         hours_left = war_timing[2] if war_timing else None
 
-        # Projections
         rival_projected = None
         mcwv_projected = None
-        if hours_left and rival_pph:
-            rival_projected = rival_points + (rival_pph * hours_left) if rival_points else None
+        if hours_left and rival_pph and rival_points:
+            rival_projected = rival_points + (rival_pph * hours_left)
         if hours_left and mcwv_pph and mcwv_points:
             mcwv_projected = mcwv_points + (mcwv_pph * hours_left)
 
-        # Threat assessment
         gap = (rival_points - mcwv_points) if (rival_points and mcwv_points) else None
         above = gap is not None and gap > 0
         threat_label, threat_emoji, threat_detail = _threat_level(mcwv_pph, rival_pph, gap, above)
@@ -9564,89 +9552,109 @@ async def spy(interaction: discord.Interaction, clan_name: str):
         icon_id = extract_asset_id(icon) if icon else None
 
         # ===== BUILD EMBED =====
+        embed_color = discord.Color.red() if battle_id else discord.Color(MCWV_BRAND_COLOR)
+
         embed = discord.Embed(
-            title=f"Spy Report: {name}",
-            description=(
-                f"**{threat_emoji} {threat_label}** - {threat_detail}\n"
-            ),
-            color=discord.Color.red() if battle_id else discord.Color(MCWV_BRAND_COLOR),
+            title=f"\U0001f50d Spy Report: {name}",
+            color=embed_color,
             timestamp=datetime.now(timezone.utc),
         )
         if icon_id:
             embed.set_thumbnail(url=f"{PS99_API}/image/{icon_id}")
 
+        # Description block: threat + war status
+        desc_lines = [f"**{threat_emoji} {threat_label}** \u2014 {threat_detail}"]
         if battle_id:
             friendly = _friendly_battle_name(battle_id)
-            war_line = f"War: **{friendly}**"
+            war_line = f"\u2694\ufe0f **{friendly}**"
             if hours_left:
-                war_line += f" | **{hours_left:.1f}h** left"
-            embed.description += war_line + "\n"
+                war_line += f" \u00b7 {hours_left:.1f}h remaining"
+            desc_lines.append(war_line)
+        else:
+            desc_lines.append("\U0001f634 No active war")
+        embed.description = "\n".join(desc_lines)
 
-        # Core stats
-        embed.add_field(name="Members", value=f"**{member_count}**/{member_capacity or '?'}", inline=True)
+        # Row 1: Core stats
+        stats = []
+        stats.append(f"\U0001f465 **{member_count}**/{member_capacity or '?'} members")
         if level:
-            embed.add_field(name="Level", value=f"**{level}**", inline=True)
+            stats.append(f"\U0001f3c6 Level **{level}**")
         if rival_rank:
-            embed.add_field(name="Rank", value=f"**#{rival_rank}**", inline=True)
+            stats.append(f"\U0001f3c6 Rank **#{rival_rank}**")
         if rival_points is not None:
-            embed.add_field(name="War Points", value=f"**{format_points(rival_points)}**", inline=True)
+            stats.append(f"\u2694\ufe0f **{format_points(rival_points)}** pts")
         if gems:
-            embed.add_field(name="Gems", value=f"**{format_points(gems)}**", inline=True)
+            stats.append(f"\U0001f48e **{format_points(gems)}** gems")
         if rival_points and member_count:
-            embed.add_field(name="Avg/Member", value=f"**{format_points(int(rival_points / member_count))}**", inline=True)
+            stats.append(f"\U0001f4ca **{format_points(int(rival_points / member_count))}** avg/member")
+        embed.add_field(name="\U0001f4cb Overview", value="\n".join(stats), inline=True)
 
-        # PPH comparison
-        if rival_pph is not None or mcwv_pph is not None:
-            rival_pph_txt = format_points(rival_pph) + "/h" if rival_pph else "no data"
-            mcwv_pph_txt = format_points(mcwv_pph) + "/h" if mcwv_pph else "no data"
-            embed.add_field(
-                name="PPH Pace",
-                value=f"Rival: **{rival_pph_txt}**\nMCWV: **{mcwv_pph_txt}**",
-                inline=True,
-            )
+        # Row 2: Pace
+        pace_lines = []
+        pace_lines.append(f"**{name}**: {format_points(rival_pph) + '/h' if rival_pph else 'no data'}")
+        pace_lines.append(f"**MCWV**: {format_points(mcwv_pph) + '/h' if mcwv_pph else 'no data'}")
+        if mcwv_pph and rival_pph:
+            pace_lines.append("")
+            pace_lines.append(_pace_bar(mcwv_pph, rival_pph))
+            net = mcwv_pph - rival_pph
+            if net > 0:
+                pace_lines.append(f"\U0001f539 We're **{format_points(net)}/h** faster")
+            elif net < 0:
+                pace_lines.append(f"\U0001f53b They're **{format_points(-net)}/h** faster")
+            else:
+                pace_lines.append("\u2696 Same pace")
+        embed.add_field(name="\U0001f4c8 Pace (PPH)", value="\n".join(pace_lines), inline=True)
 
-        # Gap + projection
+        # Gap analysis (full width)
         if gap is not None:
             if above:
-                gap_txt = f"**{format_points(gap)}** pts ahead of MCWV"
+                gap_txt = f"\U0001f53b **{format_points(gap)} pts** behind {name}"
             elif gap < 0:
-                gap_txt = f"**{format_points(-gap)}** pts behind MCWV"
+                gap_txt = f"\U0001f539 **{format_points(-gap)} pts** ahead of {name}"
             else:
-                gap_txt = "**Level** - same points!"
+                gap_txt = "\u2696 **Level** \u2014 same points!"
 
             if mcwv_pph and rival_pph:
                 net = mcwv_pph - rival_pph if above else rival_pph - mcwv_pph
-                if above and net > 0:
-                    eta = gap / net
-                    gap_txt += f"\nMCWV closing at **{format_points(net)}/h** net"
-                    gap_txt += f" -> overtake in **~{math.ceil(eta)}h**" if eta < hours_left else f" -> not enough time ({math.ceil(eta)}h needed, {hours_left:.0f}h left)"
-                elif above and net <= 0:
-                    gap_txt += f"\nThey're pulling away at **{format_points(-net)}/h**"
-                elif not above and net > 0:
-                    eta = (-gap) / net
-                    gap_txt += f"\nThey're closing at **{format_points(net)}/h** net"
-                    gap_txt += f" -> overtake in **~{math.ceil(eta)}h**" if eta < hours_left else f" -> not enough time ({math.ceil(eta)}h needed, {hours_left:.0f}h left)"
-                elif not above and net <= 0:
-                    gap_txt += f"\nMCWV pulling away at **{format_points(-net)}/h**"
+                if above:
+                    if net > 0:
+                        eta = gap / net
+                        gap_txt += f"\n\U0001f539 Closing at **{format_points(net)}/h** net"
+                        if hours_left and eta < hours_left:
+                            gap_txt += f"\n\u27a1 Overtake in **~{math.ceil(eta)}h** \u2014 **WE CAN CATCH THEM**"
+                        elif hours_left:
+                            gap_txt += f"\n\u26a0\ufe0f Need {math.ceil(eta)}h, only {hours_left:.0f}h left \u2014 **not enough time**"
+                    else:
+                        gap_txt += f"\n\U0001f53b They're pulling away at **{format_points(-net)}/h**"
+                else:
+                    if net > 0:
+                        eta = (-gap) / net
+                        gap_txt += f"\n\U0001f53b They're closing at **{format_points(net)}/h** net"
+                        if hours_left and eta < hours_left:
+                            gap_txt += f"\n\u26a0\ufe0f They overtake us in **~{math.ceil(eta)}h** \u2014 **DANGER**"
+                        elif hours_left:
+                            gap_txt += f"\n\u2705 Need {math.ceil(eta)}h, only {hours_left:.0f}h left \u2014 **safe for now**"
+                    else:
+                        gap_txt += f"\n\U0001f539 MCWV pulling away at **{format_points(-net)}/h**"
 
-            embed.add_field(name="Gap vs MCWV", value=gap_txt, inline=False)
+            embed.add_field(name="\U0001f4ca Gap vs MCWV", value=gap_txt, inline=False)
 
-        # Projections
+        # Projected finish
         if hours_left and (rival_projected or mcwv_projected):
             proj_lines = []
             if rival_projected:
-                proj_lines.append(f"{name}: **{format_points(int(rival_projected))}** pts")
+                proj_lines.append(f"**{name}**: {format_points(int(rival_projected))} pts")
             if mcwv_projected:
-                proj_lines.append(f"MCWV: **{format_points(int(mcwv_projected))}** pts")
+                proj_lines.append(f"**MCWV**: {format_points(int(mcwv_projected))} pts")
             if rival_projected and mcwv_projected:
                 final_gap = rival_projected - mcwv_projected
                 if final_gap > 0:
-                    proj_lines.append(f"-> {name} finishes **{format_points(int(final_gap))}** ahead")
+                    proj_lines.append(f"\u27a1 {name} finishes **{format_points(int(final_gap))}** ahead")
                 elif final_gap < 0:
-                    proj_lines.append(f"-> MCWV finishes **{format_points(int(-final_gap))}** ahead!")
+                    proj_lines.append(f"\u27a1 MCWV finishes **{format_points(int(-final_gap))}** ahead!")
                 else:
-                    proj_lines.append("-> Dead heat!")
-            embed.add_field(name="Projected Finish", value="\n".join(proj_lines), inline=False)
+                    proj_lines.append("\u27a1 Dead heat!")
+            embed.add_field(name="\U0001f52e Projected Finish", value="\n".join(proj_lines), inline=False)
 
         # Top 3 contributors
         if contributions:
@@ -9658,31 +9666,17 @@ async def spy(interaction: discord.Interaction, clan_name: str):
                 pass
 
             top_lines = []
-            medals = ["1st", "2nd", "3rd"]
+            medals = ["\U0001f947", "\U0001f948", "\U0001f949"]
             for i, entry in enumerate(contributions[:3]):
                 rid = int(entry.get("UserID", 0) or 0)
                 pts = int(entry.get("Points", 0) or 0)
                 linked_name = linked_by_roblox.get(rid)
                 display_name = linked_name or str(rid)
                 pct = (pts / rival_points * 100) if rival_points else 0
-                top_lines.append(f"**{medals[i]}** {display_name} - {format_points(pts)} pts ({pct:.1f}%)")
-            embed.add_field(name="Top Contributors", value="\n".join(top_lines), inline=False)
+                top_lines.append(f"{medals[i]} **{display_name}** \u2014 {format_points(pts)} pts ({pct:.1f}%)")
+            embed.add_field(name="\U0001f3c6 Top Contributors", value="\n".join(top_lines), inline=False)
 
-        # Efficiency rating
-        if rival_points and member_count and mcwv_points:
-            rival_eff = rival_points / member_count
-            mcwv_eff = mcwv_points / (mcwv_snapshot and mcwv_snapshot.get("member_count") or member_count)
-            if mcwv_eff > 0:
-                ratio = rival_eff / mcwv_eff
-                if ratio > 1.2:
-                    eff_txt = f"**{ratio:.2f}x** MCWV - highly efficient"
-                elif ratio > 0.8:
-                    eff_txt = f"**{ratio:.2f}x** MCWV - comparable"
-                else:
-                    eff_txt = f"**{ratio:.2f}x** MCWV - less efficient"
-                embed.add_field(name="Efficiency", value=eff_txt, inline=True)
-
-        embed.set_footer(text=f"PS99 live | Spied by {interaction.user}")
+        embed.set_footer(text=f"PS99 live \u00b7 Spied by {interaction.user}")
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
@@ -9708,7 +9702,6 @@ async def spycompare(interaction: discord.Interaction, clan_name: str):
     try:
         battle_id = await get_active_battle_id_for_placement()
 
-        # Fetch both clans + timing + MCWV PPH in parallel
         mcwv_data, rival_data, war_timing = await asyncio.gather(
             _fetch_clan_data(CLAN_NAME),
             _fetch_clan_data(clan_name),
@@ -9721,7 +9714,6 @@ async def spycompare(interaction: discord.Interaction, clan_name: str):
         rival_name = rival_data.get("Name", clan_name)
         hours_left = war_timing[2] if war_timing else None
 
-        # MCWV stats
         mcwv_members = len(mcwv_data.get("Members", []) or []) if mcwv_data else 0
         mcwv_battles = (mcwv_data or {}).get("Battles", {})
         mcwv_battle = None
@@ -9729,7 +9721,6 @@ async def spycompare(interaction: discord.Interaction, clan_name: str):
             mcwv_battle = mcwv_battles.get(battle_id) or mcwv_battles.get(str(battle_id))
         mcwv_points = pick_first_int(mcwv_battle, ("Points", "points")) if isinstance(mcwv_battle, dict) else None
 
-        # Rival stats
         rival_members = len(rival_data.get("Members", []) or [])
         rival_battles = rival_data.get("Battles", {})
         rival_battle = None
@@ -9737,7 +9728,6 @@ async def spycompare(interaction: discord.Interaction, clan_name: str):
             rival_battle = rival_battles.get(battle_id) or rival_battles.get(str(battle_id))
         rival_points = pick_first_int(rival_battle, ("Points", "points")) if isinstance(rival_battle, dict) else None
 
-        # Ranks + PPH in parallel
         (mcwv_rank, mcwv_sp), (rival_rank, rival_sp), mcwv_pph, rival_pph = await asyncio.gather(
             _get_clan_rank_from_standings(CLAN_NAME),
             _get_clan_rank_from_standings(clan_name),
@@ -9753,124 +9743,99 @@ async def spycompare(interaction: discord.Interaction, clan_name: str):
         above = gap is not None and gap > 0
         threat_label, threat_emoji, threat_detail = _threat_level(mcwv_pph, rival_pph, gap, above)
 
-        # Projections
         mcwv_proj = (mcwv_points + mcwv_pph * hours_left) if (hours_left and mcwv_pph and mcwv_points) else None
         rival_proj = (rival_points + rival_pph * hours_left) if (hours_left and rival_pph and rival_points) else None
 
+        embed_color = discord.Color.red() if battle_id else discord.Color(MCWV_BRAND_COLOR)
+
         embed = discord.Embed(
-            title=f"MCWV vs {rival_name}",
-            description=f"**{threat_emoji} {threat_label}** - {threat_detail}",
-            color=discord.Color.red() if battle_id else discord.Color(MCWV_BRAND_COLOR),
+            title=f"\u2694\ufe0f MCWV vs {rival_name}",
+            description=f"**{threat_emoji} {threat_label}** \u2014 {threat_detail}",
+            color=embed_color,
             timestamp=datetime.now(timezone.utc),
         )
-
         if hours_left:
-            embed.description += f"\n**{hours_left:.1f}h** remaining in war"
+            embed.description += f"\n\u23f1\ufe0f **{hours_left:.1f}h** remaining"
 
-        # Head-to-head stats
-        embed.add_field(
-            name="Rank",
-            value=f"MCWV: **#{mcwv_rank or '?'}**\n{rival_name}: **#{rival_rank or '?'}**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Points",
-            value=f"MCWV: **{format_points(mcwv_points or 0)}**\n{rival_name}: **{format_points(rival_points or 0)}**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Members",
-            value=f"MCWV: **{mcwv_members}**\n{rival_name}: **{rival_members}**",
-            inline=True,
-        )
-
-        # PPH comparison
-        mcwv_pph_txt = format_points(mcwv_pph) + "/h" if mcwv_pph else "no data"
-        rival_pph_txt = format_points(rival_pph) + "/h" if rival_pph else "no data"
-        embed.add_field(
-            name="PPH Pace",
-            value=f"MCWV: **{mcwv_pph_txt}**\n{rival_name}: **{rival_pph_txt}**",
-            inline=True,
-        )
-
-        # Avg per member
+        # Comparison table
+        comp = []
+        comp.append(f"**Rank**     MCWV #{mcwv_rank or '?'}  vs  {rival_name} #{rival_rank or '?'}")
+        comp.append(f"**Points**   MCWV {format_points(mcwv_points or 0)}  vs  {rival_name} {format_points(rival_points or 0)}")
+        comp.append(f"**Members**  MCWV {mcwv_members}  vs  {rival_name} {rival_members}")
+        pph_m = format_points(mcwv_pph) + "/h" if mcwv_pph else "no data"
+        pph_r = format_points(rival_pph) + "/h" if rival_pph else "no data"
+        comp.append(f"**PPH**      MCWV {pph_m}  vs  {rival_name} {pph_r}")
         if mcwv_points and mcwv_members and rival_points and rival_members:
             mcwv_avg = int(mcwv_points / mcwv_members)
             rival_avg = int(rival_points / rival_members)
             efficiency = (rival_avg / mcwv_avg) if mcwv_avg else 0
             eff_label = "highly efficient" if efficiency > 1.2 else "comparable" if efficiency > 0.8 else "less efficient"
+            comp.append(f"**Avg/Member** MCWV {format_points(mcwv_avg)}  vs  {rival_name} {format_points(rival_avg)} ({efficiency:.2f}x - {eff_label})")
+        embed.add_field(name="\U0001f4ca Head to Head", value=f"```\n{chr(10).join(comp)}\n```", inline=False)
+
+        # Pace bar
+        if mcwv_pph and rival_pph:
+            bar = _pace_bar(mcwv_pph, rival_pph)
+            total_pace = mcwv_pph + rival_pph
+            mcwv_pct = (mcwv_pph / total_pace * 100) if total_pace else 50
             embed.add_field(
-                name="Avg/Member",
-                value=f"MCWV: **{format_points(mcwv_avg)}**\n{rival_name}: **{format_points(rival_avg)}** ({efficiency:.2f}x - {eff_label})",
-                inline=True,
+                name="\U0001f4c8 Pace Share",
+                value=f"```\nMCWV {bar} {rival_name}\n     {mcwv_pct:.0f}% vs {100 - mcwv_pct:.0f}%\n```",
+                inline=False,
             )
 
-        # Gap analysis with full detail
+        # Gap analysis
         if gap is not None:
             if above:
-                gap_txt = f"**{format_points(gap)}** pts behind {rival_name}"
+                gap_txt = f"\U0001f53b **{format_points(gap)} pts** behind {rival_name}"
             elif gap < 0:
-                gap_txt = f"**{format_points(-gap)}** pts ahead of {rival_name}"
+                gap_txt = f"\U0001f539 **{format_points(-gap)} pts** ahead of {rival_name}"
             else:
-                gap_txt = "**Level** - same points!"
+                gap_txt = "\u2696 **Level** \u2014 same points!"
 
             if mcwv_pph and rival_pph:
                 net = mcwv_pph - rival_pph if above else rival_pph - mcwv_pph
                 if above:
                     if net > 0:
                         eta = gap / net
-                        gap_txt += f"\n**Closing at {format_points(net)}/h net**"
-                        if eta < hours_left:
-                            gap_txt += f"\n-> Overtake in **~{math.ceil(eta)}h** - WE CAN CATCH THEM"
-                        else:
-                            gap_txt += f"\n-> Need {math.ceil(eta)}h, only {hours_left:.0f}h left - **not enough time**"
+                        gap_txt += f"\n\U0001f539 Closing at **{format_points(net)}/h** net"
+                        if hours_left and eta < hours_left:
+                            gap_txt += f"\n\u27a1 Overtake in **~{math.ceil(eta)}h** \u2014 **WE CAN CATCH THEM**"
+                        elif hours_left:
+                            gap_txt += f"\n\u26a0\ufe0f Need {math.ceil(eta)}h, only {hours_left:.0f}h left \u2014 **not enough time**"
                     else:
-                        gap_txt += f"\n**They're pulling away at {format_points(-net)}/h** - gap is growing"
+                        gap_txt += f"\n\U0001f53b They're pulling away at **{format_points(-net)}/h**"
                 else:
                     if net > 0:
                         eta = (-gap) / net
-                        gap_txt += f"\n**They're closing at {format_points(net)}/h net**"
-                        if eta < hours_left:
-                            gap_txt += f"\n-> They overtake us in **~{math.ceil(eta)}h** - DANGER"
-                        else:
-                            gap_txt += f"\n-> Need {math.ceil(eta)}h, only {hours_left:.0f}h left - **safe for now**"
+                        gap_txt += f"\n\U0001f53b They're closing at **{format_points(net)}/h** net"
+                        if hours_left and eta < hours_left:
+                            gap_txt += f"\n\u26a0\ufe0f They overtake us in **~{math.ceil(eta)}h** \u2014 **DANGER**"
+                        elif hours_left:
+                            gap_txt += f"\n\u2705 Need {math.ceil(eta)}h, only {hours_left:.0f}h left \u2014 **safe for now**"
                     else:
-                        gap_txt += f"\n**MCWV pulling away at {format_points(-net)}/h** - gap is growing"
+                        gap_txt += f"\n\U0001f539 MCWV pulling away at **{format_points(-net)}/h**"
 
-            embed.add_field(name="Gap Analysis", value=gap_txt, inline=False)
-
-        # Pace bar visual
-        if mcwv_pph and rival_pph:
-            total_pace = mcwv_pph + rival_pph
-            mcwv_share = mcwv_pph / total_pace if total_pace else 0.5
-            bar_len = 20
-            mcwv_filled = max(1, int(round(mcwv_share * bar_len)))
-            rival_filled = bar_len - mcwv_filled
-            bar = f"MCWV `{'█' * mcwv_filled}{'░' * rival_filled}` RIVAL"
-            embed.add_field(
-                name="Pace Share",
-                value=f"{bar}\n{mcwv_pph/1e6:.1f}M/h vs {rival_pph/1e6:.1f}M/h",
-                inline=False,
-            )
+            embed.add_field(name="\U0001f4ca Gap Analysis", value=gap_txt, inline=False)
 
         # Projected finish
         if hours_left and (mcwv_proj or rival_proj):
             proj_lines = []
             if mcwv_proj:
-                proj_lines.append(f"MCWV: **{format_points(int(mcwv_proj))}** pts")
+                proj_lines.append(f"**MCWV**: {format_points(int(mcwv_proj))} pts")
             if rival_proj:
-                proj_lines.append(f"{rival_name}: **{format_points(int(rival_proj))}** pts")
+                proj_lines.append(f"**{rival_name}**: {format_points(int(rival_proj))} pts")
             if mcwv_proj and rival_proj:
                 final_gap = rival_proj - mcwv_proj
                 if final_gap > 0:
-                    proj_lines.append(f"-> {rival_name} finishes **{format_points(int(final_gap))}** ahead")
+                    proj_lines.append(f"\u27a1 {rival_name} finishes **{format_points(int(final_gap))}** ahead")
                 elif final_gap < 0:
-                    proj_lines.append(f"-> MCWV finishes **{format_points(int(-final_gap))}** ahead!")
+                    proj_lines.append(f"\u27a1 MCWV finishes **{format_points(int(-final_gap))}** ahead!")
                 else:
-                    proj_lines.append("-> Dead heat!")
-            embed.add_field(name="Projected Final", value="\n".join(proj_lines), inline=False)
+                    proj_lines.append("\u27a1 Dead heat!")
+            embed.add_field(name="\U0001f52e Projected Final", value="\n".join(proj_lines), inline=False)
 
-        embed.set_footer(text=f"PS99 live + clan_history | {interaction.user}")
+        embed.set_footer(text=f"PS99 live + clan_history \u00b7 {interaction.user}")
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
@@ -9879,7 +9844,7 @@ async def spycompare(interaction: discord.Interaction, clan_name: str):
         await interaction.followup.send(f"Comparison failed: `{type(e).__name__}`")
 
 
-@bot.tree.command(name="threatboard", description="Show the 5 clans closest to MCWV with full pace analysis and threat ratings", guild=guild_obj)
+@bot.tree.command(name="threatboard", description="Show clans ranked around MCWV with pace analysis and threat ratings", guild=guild_obj)
 @require_role()
 async def threatboard(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -9891,9 +9856,8 @@ async def threatboard(interaction: discord.Interaction):
     try:
         battle_id = await get_active_battle_id_for_placement()
         if not battle_id:
-            return await interaction.followup.send("No active war - threat board is only useful during a war.")
+            return await interaction.followup.send("No active war \u2014 threat board is only useful during a war.")
 
-        # Get MCWV data + timing in parallel
         mcwv_snapshot, war_timing = await asyncio.gather(
             get_mcwv_placement_snapshot(),
             _get_war_timing(),
@@ -9905,7 +9869,6 @@ async def threatboard(interaction: discord.Interaction):
         mcwv_points = mcwv_snapshot["points"]
         hours_left = war_timing[2] if war_timing else None
 
-        # Get MCWV PPH
         mcwv_pph = await _get_clan_pph_from_history(CLAN_NAME, battle_id)
 
         # Get top-100 standings
@@ -9916,86 +9879,122 @@ async def threatboard(interaction: discord.Interaction):
         if not isinstance(rows, list) or not rows:
             return await interaction.followup.send("Can't load the clan standings right now.")
 
-        # Find clans closest to MCWV (by points distance)
-        rivals = []
+        # Build the ordered list: 3 clans above MCWV, MCWV, 3 clans below
+        # (like a leaderboard window: #20, #21, #22, [MCWV #23], #24, #25, #26)
+        window_above = 3
+        window_below = 3
+
+        # Find MCWV in the standings
+        mcwv_idx = -1
+        all_clans = []
         for i, row in enumerate(rows):
-            name = str(row.get("Name") or row.get("name") or "")
+            clan_name = str(row.get("Name") or row.get("name") or "")
             pts = int(row.get("Points") or row.get("points") or 0)
-            if _normalize_clan_name(name) == _normalize_clan_name(CLAN_NAME):
-                continue
-            gap = pts - mcwv_points
-            rivals.append({
-                "name": name,
-                "rank": i + 1,
-                "points": pts,
-                "gap": gap,
-                "above": gap > 0,
-            })
+            is_us = _normalize_clan_name(clan_name) == _normalize_clan_name(CLAN_NAME)
+            all_clans.append({"name": clan_name, "rank": i + 1, "points": pts, "is_us": is_us})
+            if is_us:
+                mcwv_idx = i
 
-        rivals.sort(key=lambda x: abs(x["gap"]))
-        top5 = rivals[:5]
+        if mcwv_idx < 0:
+            return await interaction.followup.send("MCWV not found in the top-100 standings.")
 
-        if not top5:
-            return await interaction.followup.send("No rival clans found near MCWV in the standings.")
+        # Window: 3 above + MCWV + 3 below
+        start_idx = max(0, mcwv_idx - window_above)
+        end_idx = min(len(all_clans), mcwv_idx + window_below + 1)
+        window = all_clans[start_idx:end_idx]
 
-        # Get PPH for each in parallel
+        # Fetch PPH for all window clans in parallel
+        rival_clans = [c for c in window if not c["is_us"]]
         pph_results = await asyncio.gather(
-            *[_get_clan_pph_from_history(r["name"], battle_id) for r in top5],
+            *[_get_clan_pph_from_history(c["name"], battle_id) for c in rival_clans],
             return_exceptions=True,
         )
-        for i, pph_result in enumerate(pph_results):
-            top5[i]["pph"] = pph_result if not isinstance(pph_result, Exception) else None
+        pph_map = {}
+        for i, c in enumerate(rival_clans):
+            pph_map[c["name"]] = pph_results[i] if not isinstance(pph_results[i], Exception) else None
 
         # Build embed
         embed = discord.Embed(
-            title="Threat Board",
+            title="\U0001f3af Threat Board",
             description=(
-                f"MCWV: **#{mcwv_rank}** | {format_points(mcwv_points)} pts"
-                + (f" | {format_points(mcwv_pph)}/h" if mcwv_pph else "")
-                + (f" | **{hours_left:.1f}h** left" if hours_left else "")
+                f"Clans ranked around MCWV \u2014 **#{mcwv_rank}** \u00b7 {format_points(mcwv_points)} pts"
+                + (f" \u00b7 {format_points(mcwv_pph)}/h" if mcwv_pph else "")
+                + (f" \u00b7 {hours_left:.1f}h left" if hours_left else "")
             ),
             color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc),
         )
 
         lines = []
-        for r in top5:
-            threat_label, threat_emoji, threat_detail = _threat_level(
-                mcwv_pph, r["pph"], r["gap"], r["above"]
-            )
+        for c in window:
+            rank = c["rank"]
+            clan_name = c["name"]
+            pts = c["points"]
 
-            direction = "ABOVE" if r["above"] else "BELOW"
-            gap_txt = f"{format_points(abs(r['gap']))} pts {'ahead' if r['above'] else 'behind'}"
+            if c["is_us"]:
+                # Highlight MCWV
+                lines.append(f"\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+                lines.append(f"\U0001f451 **#{rank} {clan_name}** (US) \u2014 {format_points(pts)} pts")
+                if mcwv_pph:
+                    lines.append(f"   \U0001f4c8 {format_points(mcwv_pph)}/h")
+                lines.append(f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+                continue
 
-            line = f"**{threat_emoji} {r['name']}** (#{r['rank']}) - {direction}, {gap_txt}"
-            line += f"\n  {threat_label}: {threat_detail}"
+            rival_pph = pph_map.get(clan_name)
+            gap = pts - mcwv_points
+            above = gap > 0
 
-            if r["pph"] and r["pph"] > 0:
-                line += f" | {format_points(r['pph'])}/h"
+            threat_label, threat_emoji, threat_detail = _threat_level(mcwv_pph, rival_pph, gap, above)
 
-                # Projection for this rival
-                if hours_left:
-                    proj = r["points"] + r["pph"] * hours_left
-                    mcwv_proj = mcwv_points + (mcwv_pph or 0) * hours_left
-                    final_gap = proj - mcwv_proj
-                    if r["above"] and final_gap < 0:
-                        line += f"\n  -> MCWV overtakes them by **{format_points(int(-final_gap))}** at war end!"
-                    elif not r["above"] and final_gap > 0:
-                        line += f"\n  -> They overtake MCWV by **{format_points(int(final_gap))}** at war end!"
-                    elif abs(final_gap) < 1_000_000:
-                        line += f"\n  -> Dead heat at war end!"
+            # Rank + name + threat emoji
+            line = f"**#{rank}** {threat_emoji} **{clan_name}**"
 
-            lines.append(line)
+            # Points + gap
+            gap_dir = "\u2b06\ufe0f" if above else "\u2b07\ufe0f"
+            gap_txt = f"{format_points(abs(gap))} pts {'above' if above else 'below'}"
+            line += f" \u2014 {format_points(pts)} pts ({gap_dir} {gap_txt})"
 
-        embed.add_field(name="5 Nearest Rivals", value="\n\n".join(lines), inline=False)
+            # PPH
+            if rival_pph and rival_pph > 0:
+                line += f" \u00b7 \U0001f4c8 {format_points(rival_pph)}/h"
 
-        # Summary line
-        safe = sum(1 for r in top5 if _threat_level(mcwv_pph, r["pph"], r["gap"], r["above"])[0] in ("SAFE", "LOW"))
-        danger = sum(1 for r in top5 if _threat_level(mcwv_pph, r["pph"], r["gap"], r["above"])[0] in ("CRITICAL", "EXTREME", "HIGH"))
-        summary = f"**{safe}** safe | **{len(top5) - safe - danger}** medium | **{danger}** dangerous"
-        embed.add_field(name="Summary", value=summary, inline=True)
+            # Threat detail
+            line += f"\n   {threat_emoji} {threat_detail}"
 
-        embed.set_footer(text=f"PS99 live + clan_history | {interaction.user}")
+            # Projection
+            if hours_left and rival_pph and mcwv_pph:
+                rival_proj = pts + rival_pph * hours_left
+                mcwv_proj = mcwv_points + mcwv_pph * hours_left
+                final_gap = rival_proj - mcwv_proj
+                if above and final_gap < 0:
+                    line += f"\n   \u27a1 \U0001f539 MCWV overtakes by **{format_points(int(-final_gap))}** at war end!"
+                elif not above and final_gap > 0:
+                    line += f"\n   \u27a1 \U0001f53b They overtake by **{format_points(int(final_gap))}** at war end!"
+                elif abs(final_gap) < 2_000_000:
+                    line += f"\n   \u27a1 \u2696 Dead heat at war end!"
+
+            lines.append(line + "\n")
+
+        embed.add_field(name=f"\U0001f4cb Standings Window (#{window[0]['rank']}\u2013#{window[-1]['rank']})", value="\n".join(lines), inline=False)
+
+        # Summary
+        safe = 0
+        danger = 0
+        medium = 0
+        for c in rival_clans:
+            r_pph = pph_map.get(c["name"])
+            gap = c["points"] - mcwv_points
+            label, _, _ = _threat_level(mcwv_pph, r_pph, gap, gap > 0)
+            if label in ("SAFE", "LOW"):
+                safe += 1
+            elif label in ("CRITICAL", "EXTREME", "HIGH"):
+                danger += 1
+            else:
+                medium += 1
+
+        embed.add_field(name="\U0001f4ca Summary", value=f"\U0001f7e2 **{safe}** safe \u00b7 \U0001f7e1 **{medium}** unknown/medium \u00b7 \U0001f534 **{danger}** dangerous", inline=True)
+
+        embed.set_footer(text=f"PS99 live + clan_history \u00b7 {interaction.user}")
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
