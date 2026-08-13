@@ -11077,15 +11077,22 @@ async def scrape_members_cmd(interaction: discord.Interaction):
                         pass
 
                 if ids:
-                    with local_conn.cursor() as cur:
-                        for uid in ids:
-                            cur.execute("""
+                    # Batch insert to avoid blocking the event loop
+                    # (24k+ individual INSERTs would freeze the bot heartbeat)
+                    id_list = list(ids)
+                    batch_size = 500
+                    for batch_start in range(0, len(id_list), batch_size):
+                        batch = id_list[batch_start:batch_start + batch_size]
+                        values = ",".join(f"('{uid}','{clan_name}',NOW(),NOW())" for uid in batch)
+                        with local_conn.cursor() as cur:
+                            cur.execute(f"""
                                 INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen, last_checked)
-                                VALUES (%s, %s, NOW(), NOW())
+                                VALUES {values}
                                 ON CONFLICT (roblox_id, clan_name)
                                 DO UPDATE SET last_checked = NOW()
-                            """, (uid, clan_name))
-                    local_conn.commit()
+                            """)
+                        local_conn.commit()
+                        await asyncio.sleep(0)  # Yield to event loop
                     total_members += len(ids)
                     clans_done += 1
                     print(f"[scrape_members] {clan_name}: {len(ids)} members")
