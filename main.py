@@ -10350,7 +10350,16 @@ async def cache_battle_contributors(battle_id):
             session = aiohttp.ClientSession()
 
         # Source 1: v1/clans/battles/{battle_id} — top 200 players globally
-        v1_payload = await _ps99_json(f"{PS99_API}/v1/clans/battles/{battle_id}")
+        # Retry up to 3 times with a delay (PS99 API can rate-limit)
+        v1_payload = None
+        for attempt in range(3):
+            v1_payload = await _ps99_json(f"{PS99_API}/v1/clans/battles/{battle_id}")
+            if v1_payload is not None:
+                break
+            print(f"[cross-clan cache] {battle_id}: v1 fetch attempt {attempt+1} failed, retrying...")
+            await asyncio.sleep(2)
+        if v1_payload is None:
+            print(f"[cross-clan cache] {battle_id}: v1 API returned no data after 3 tries — using clan scan only")
         v1_data = v1_payload.get("data", {}) if isinstance(v1_payload, dict) else {}
         v1_meta = v1_data.get("meta", {}) if isinstance(v1_data, dict) else {}
         v1_start = _safe_int(v1_meta.get("startTime"))
