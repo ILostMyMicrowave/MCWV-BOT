@@ -10946,14 +10946,137 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
 
 
 async def auto_cache_war_end(battle_id):
-    """Auto-cache a war's data when it ends. Called from war_poll_loop."""
+    """Auto-cache a war's data when it ends. Called from war_poll_loop.
+    
+    Triggers a full 50k clan scan via the sitemap so we capture ALL
+    contributor data while it's still available (the API only returns
+    full PointContributions for active/recently-ended battles).
+    Runs in the background so the war-end announcement isn't delayed."""
     if not battle_id:
         return
+    if not DATABASE_URL:
+        return
+    if GLOBAL_BACKFILL_RUNNING:
+        print(f"[cross-clan cache] auto-cache skipped for {battle_id}: global backfill already running")
+        return
+    # Run the full scan in the background
+    asyncio.create_task(_auto_cache_full_scan(battle_id))
+    print(f"[cross-clan cache] auto-cache full scan queued for {battle_id}")
+
+
+async def _auto_cache_full_scan(battle_id):
+    """Background task: scan all 50k clans for one specific battle."""
+    global GLOBAL_BACKFILL_RUNNING
+
+    battle_id = str(battle_id)
+    GLOBAL_BACKFILL_RUNNING = True
+    scan_session = aiohttp.ClientSession()
+    local_conn = None
+    started = time.time()
+
     try:
-        count = await cache_battle_contributors(battle_id)
-        print(f"[cross-clan cache] auto-cached war {battle_id}: {count} rows")
+        clan_names = await fetch_all_clan_names_from_sitemap(scan_session)
+        if not clan_names:
+            print(f"[auto-cache] no clans from sitemap for {battle_id}")
+            return
+
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        local_conn.autocommit = False
+
+        # Ensure table exists
+        def _ensure():
+            try:
+                with local_conn.cursor() as cur:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS cross_clan_player_history (
+                        id BIGSERIAL PRIMARY KEY, roblox_id TEXT NOT NULL, battle_id TEXT NOT NULL,
+                        battle_name TEXT, clan_name TEXT NOT NULL, points BIGINT NOT NULL DEFAULT 0,
+                        rank INTEGER, total_contributors INTEGER, clan_place INTEGER,
+                        earned_medal BOOLEAN DEFAULT FALSE, start_time BIGINT,
+                        cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (roblox_id, battle_id, clan_name))""")
+                    cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
+                local_conn.commit()
+            except Exception:
+                local_conn.rollback()
+        await asyncio.to_thread(_ensure)
+
+        CONCURRENCY = 8
+        clans_with_data = 0
+        total_contribs = 0
+        pending_rows = []
+
+        print(f"[auto-cache] scanning {len(clan_names)} clans for {battle_id}")
+
+        for batch_start in range(0, len(clan_names), CONCURRENCY):
+            batch = clan_names[batch_start:batch_start + CONCURRENCY]
+            results = await asyncio.gather(
+                *(_fetch_clan_contributions(scan_session, name) for name in batch),
+                return_exceptions=True,
+            )
+
+            for rows in results:
+                if isinstance(rows, Exception) or not rows:
+                    continue
+                # Filter to only this battle's contributions
+                battle_rows = [r for r in rows if r[1] == battle_id]
+                if battle_rows:
+                    clans_with_data += 1
+                    total_contribs += len(battle_rows)
+                    pending_rows.extend(battle_rows)
+
+            if len(pending_rows) >= 5000:
+                await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
+                pending_rows.clear()
+
+            if (batch_start // CONCURRENCY + 1) % 100 == 0:
+                elapsed = time.time() - started
+                print(f"[auto-cache] {batch_start+CONCURRENCY}/{len(clan_names)} clans, {total_contribs:,} contribs, {elapsed:.0f}s")
+                await asyncio.sleep(0)
+
+        if pending_rows:
+            await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
+            pending_rows.clear()
+
+        # Recompute ranks for this battle only
+        def _rank_battle():
+            try:
+                with local_conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM cross_clan_player_history WHERE battle_id = %s", (battle_id,))
+                    actual_total = int(cur.fetchone()[0] or 0)
+                    if actual_total == 0:
+                        return 0
+                    cur.execute("""
+                        WITH ranked AS (
+                            SELECT id, ROW_NUMBER() OVER (ORDER BY points DESC, roblox_id ASC) AS gr, %s AS gt
+                            FROM cross_clan_player_history WHERE battle_id = %s
+                        )
+                        UPDATE cross_clan_player_history h SET rank = r.gr, total_contributors = r.gt
+                        FROM ranked r WHERE h.id = r.id
+                    """, (actual_total, battle_id))
+                    updated = cur.rowcount
+                local_conn.commit()
+                return updated
+            except Exception as exc:
+                local_conn.rollback()
+                print(f"[auto-cache] rank failed: {exc}")
+                return 0
+
+        ranked = await asyncio.to_thread(_rank_battle)
+        elapsed = time.time() - started
+        print(f"[auto-cache] {battle_id}: {clans_with_data} clans, {total_contribs:,} contribs, {ranked:,} ranked, {elapsed:.0f}s")
+
     except Exception as e:
-        print(f"[cross-clan cache] auto-cache failed for {battle_id}: {e}")
+        print(f"[auto-cache] FATAL: {e}")
+        traceback.print_exc()
+    finally:
+        GLOBAL_BACKFILL_RUNNING = False
+        await scan_session.close()
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 def get_cached_player_history(roblox_id):
