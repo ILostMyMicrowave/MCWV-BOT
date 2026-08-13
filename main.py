@@ -10052,8 +10052,13 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             if not isinstance(row, dict):
                 continue
             key = (str(row.get("battleId") or "").lower(), str(row.get("clan") or "").lower())
-            if key not in merged or _safe_int(row.get("points")) > _safe_int(merged[key].get("points")):
+            if key not in merged:
+                # Battle not in cache — add it
                 merged[key] = row
+            elif _safe_int(row.get("points")) > _safe_int(merged[key].get("points")):
+                # Active battle with higher live points — update points but
+                # KEEP the cached global rank/total (live has scan-pool ranks)
+                merged[key]["points"] = _safe_int(row.get("points"))
 
         rows = list(merged.values())
 
@@ -11361,6 +11366,15 @@ def _compute_global_ranks_sql(local_conn):
     """Pass 2: compute true global rank + total per battle via SQL window function."""
     try:
         with local_conn.cursor() as cur:
+            # First count how many rows have NULL ranks (need computing)
+            cur.execute("SELECT COUNT(*) FROM cross_clan_player_history WHERE rank IS NULL")
+            null_count = int(cur.fetchone()[0] or 0)
+            print(f"[global backfill] computing ranks for {null_count:,} NULL rows + recompute all...")
+
+            # For each battle, rank all contributors by points descending.
+            # Also compute the true total per battle. This updates ALL rows
+            # (not just NULL ones) so existing scan-pool ranks get overwritten
+            # with true global ranks.
             cur.execute("""
                 WITH ranked AS (
                     SELECT id,
@@ -11379,13 +11393,15 @@ def _compute_global_ranks_sql(local_conn):
             """)
             updated = cur.rowcount
         local_conn.commit()
+        print(f"[global backfill] rank computation complete: {updated:,} rows updated")
         return updated
     except Exception as exc:
         try:
             local_conn.rollback()
         except Exception:
             pass
-        print(f"[global backfill] rank computation failed: {exc}")
+        print(f"[global backfill] rank computation FAILED: {exc}")
+        traceback.print_exc()
         return 0
 
 
@@ -11448,6 +11464,55 @@ async def backfill_status_cmd(interaction: discord.Interaction):
     except Exception as e:
         close_db_connection()
         await interaction.followup.send(f"Backfill running: **{'yes' if running else 'no'}**\nStats error: `{e}`", ephemeral=True)
+
+
+@bot.tree.command(name="recompute_ranks", description="Recompute global ranks from cached data (no re-scan needed)", guild=guild_obj)
+@require_role()
+async def recompute_ranks_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not DATABASE_URL:
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    await interaction.followup.send("Recomputing global ranks... This takes a few seconds.", ephemeral=True)
+
+    def _do_recompute():
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        local_conn.autocommit = False
+        try:
+            ranked = _compute_global_ranks_sql(local_conn)
+            with local_conn.cursor() as cur:
+                cur.execute("SELECT COUNT(DISTINCT battle_id) FROM cross_clan_player_history WHERE rank IS NOT NULL")
+                battles_with_ranks = int(cur.fetchone()[0] or 0)
+                cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC NULLS LAST LIMIT 5")
+                top = cur.fetchall()
+            local_conn.commit()
+            return ranked, battles_with_ranks, top
+        finally:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
+
+    try:
+        ranked, battles_with_ranks, top = await asyncio.to_thread(_do_recompute)
+        lines = [f"Rank computation complete! **{ranked:,}** rows updated."]
+        lines.append(f"Battles with rank data: **{battles_with_ranks}**")
+        if top:
+            lines.append("\n**Top battles by contributor count:**")
+            for bid, total in top:
+                lines.append(f"  {bid}: {total:,} contributors" if total else f"  {bid}: (no rank data)")
+        lines.append("\n`/checkplayer` should now show correct global ranks.")
+        try:
+            ch = bot.get_channel(interaction.channel_id)
+            if ch is None:
+                ch = await bot.fetch_channel(interaction.channel_id)
+            if ch:
+                await ch.send("\n".join(lines))
+        except Exception:
+            pass
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Rank computation failed: `{type(e).__name__}: {e}`", ephemeral=True)
 
 
 async def _fetch_clan_contributions(scan_session, clan_name):
