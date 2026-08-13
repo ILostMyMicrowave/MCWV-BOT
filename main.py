@@ -11294,13 +11294,16 @@ async def scrape_members_cmd(interaction: discord.Interaction):
 GLOBAL_BACKFILL_RUNNING = False
 
 
-async def fetch_all_clan_names_from_sitemap():
-    """Fetch every clan name from the db.biggames.io sitemap."""
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
+async def fetch_all_clan_names_from_sitemap(scan_session=None):
+    """Fetch every clan name from the db.biggames.io sitemap.
+    Uses the provided scan_session (dedicated to the backfill) to avoid
+    race conditions with the global session that other loops close."""
+    own_session = False
+    if scan_session is None or getattr(scan_session, "closed", True):
+        scan_session = aiohttp.ClientSession()
+        own_session = True
     try:
-        async with session.get(
+        async with scan_session.get(
             "https://db.biggames.io/sitemap.xml?sub=clans",
             headers={"User-Agent": "MCWV-Bot/1.0"},
             timeout=aiohttp.ClientTimeout(total=30),
@@ -11321,7 +11324,11 @@ async def fetch_all_clan_names_from_sitemap():
         return cleaned
     except Exception as exc:
         print(f"[global backfill] sitemap fetch failed: {exc}")
+        traceback.print_exc()
         return []
+    finally:
+        if own_session:
+            await scan_session.close()
 
 
 def _insert_raw_contributions(local_conn, rows):
@@ -11405,7 +11412,15 @@ async def backfill_global_cmd(interaction: discord.Interaction):
         "When done, `/checkplayer` will show true global ranks.",
         ephemeral=True,
     )
-    asyncio.create_task(_run_global_backfill(interaction.channel_id))
+    task = asyncio.create_task(_run_global_backfill(interaction.channel_id))
+    def _log_backfill_exception(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            print(f"[global backfill] TASK CRASHED: {exc}")
+            traceback.print_exc()
+    task.add_done_callback(_log_backfill_exception)
 
 
 @bot.tree.command(name="backfill_status", description="Check if the global backfill is running and see cache stats", guild=guild_obj)
@@ -11499,13 +11514,14 @@ async def _run_global_backfill(progress_channel_id):
     """Background task: scan all clans, rebuild global battle leaderboards."""
     global GLOBAL_BACKFILL_RUNNING
 
+    print(f"[global backfill] TASK STARTED — channel_id={progress_channel_id}")
     scan_session = aiohttp.ClientSession()
     local_conn = None
     started = time.time()
 
     try:
-        # 1. Fetch sitemap
-        clan_names = await fetch_all_clan_names_from_sitemap()
+        # 1. Fetch sitemap (use the dedicated scan_session, not the global one)
+        clan_names = await fetch_all_clan_names_from_sitemap(scan_session)
         if not clan_names:
             print("[global backfill] no clans from sitemap, aborting")
             return
