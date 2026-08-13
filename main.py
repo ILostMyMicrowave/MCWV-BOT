@@ -10075,7 +10075,7 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         # ===== BUILD EMBED =====
         embed = discord.Embed(
             title=f"\U0001f50d Cross-Clan History: {roblox_name}",
-            description=f"Roblox ID: `{roblox_id}`\n{len(rows)} battles found across clans",
+            description=f"Roblox ID: `{roblox_id}`\n{len(rows)} battles found across top-100 clans",
             color=discord.Color(MCWV_BRAND_COLOR),
             timestamp=datetime.now(timezone.utc),
         )
@@ -10090,27 +10090,64 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         total_battles = max(_safe_int(summary.get("TotalBattles")), len(rows))
         earned_medals = max(_safe_int(summary.get("EarnedMedals")), sum(1 for r in rows if r.get("earnedMedal")))
 
-        # Verify: is this player actually in MCWV right now?
+        # Verify the player's ACTUAL current clan by checking the real member
+        # lists. PS99's /v1/clans/players/ summary is often stale, so we check
+        # MCWV first (most important), then all top 100 clans to find where
+        # this player actually is right now — regardless of clan placement.
+        actual_current_clan = None
+
+        # Check MCWV first
         mcwv_clan_data = await _fetch_clan_data(CLAN_NAME)
         in_mcwv_now = False
         if mcwv_clan_data:
             mcwv_members = mcwv_clan_data.get("Members", [])
             if isinstance(mcwv_members, list):
                 in_mcwv_now = any(str(m.get("UserID")) == str(roblox_id) for m in mcwv_members if isinstance(m, dict))
+                if in_mcwv_now:
+                    actual_current_clan = CLAN_NAME
 
-        # If PS99 says they're in a rival clan but they're actually in MCWV,
-        # trust the member list over the stale summary.
-        if in_mcwv_now:
-            current_clan_name = CLAN_NAME
+        # If not in MCWV, check all top 100 clans to find where they actually are
+        if not actual_current_clan:
+            try:
+                top_100_list = await fetch_top_clan_names_for_history()
+                for check_clan in top_100_list:
+                    if check_clan.upper() == CLAN_NAME.upper():
+                        continue  # Already checked
+                    try:
+                        check_data = await _fetch_clan_data(check_clan)
+                        if not check_data:
+                            continue
+                        check_members = check_data.get("Members", [])
+                        if isinstance(check_members, list):
+                            if any(str(m.get("UserID")) == str(roblox_id) for m in check_members if isinstance(m, dict)):
+                                actual_current_clan = check_clan
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
-        # Also check clans that might not have been in the top-100 scan
-        # (e.g. a former clan like V1LN). Fetch their battle data directly
-        # and extract this player's contributions for any missing battles.
+        # Override the stale PS99 summary with the verified clan
+        if actual_current_clan:
+            current_clan_name = actual_current_clan
+
+        # Only check clans in the TOP 100 for additional battle data.
+        # This ensures /checkplayer only shows history from top-100 clans.
         existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows if isinstance(r, dict)}
+        top_100_clans = set()
+        try:
+            top_100_list = await fetch_top_clan_names_for_history()
+            top_100_clans = {c.upper() for c in top_100_list}
+        except Exception:
+            pass
+
+        # Only check clans that ARE in the top 100
         extra_clans_to_check = set()
         if current_clan_name and current_clan_name != "Unknown":
-            extra_clans_to_check.add(current_clan_name)
-        extra_clans_to_check.add(CLAN_NAME)
+            if current_clan_name.upper() in top_100_clans:
+                extra_clans_to_check.add(current_clan_name)
+        if CLAN_NAME.upper() in top_100_clans:
+            extra_clans_to_check.add(CLAN_NAME)
 
         for clan_to_check in extra_clans_to_check:
             try:
@@ -10145,10 +10182,41 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
 
         # Also check the scraped all-time clan memberships (from db.biggames.io)
         # This catches clans the player was in even if we don't have per-battle data
+        # FILTER: only show clans that are/were in the TOP 100
         scraped_clans = get_cached_clan_memberships(roblox_id)
+        clans_from_scrape_only = []
+        # Build the top 100 set for filtering (from the cached battle data)
+        top_100_set = set()
+        try:
+            if db_enabled():
+                with conn.cursor() as cur:
+                    cur.execute("SELECT DISTINCT clan_name FROM cross_clan_player_history")
+                    for row in cur.fetchall():
+                        top_100_set.add(str(row[0]).upper())
+                close_db_connection()
+        except Exception:
+            pass
+        # Also add clans from the battle rows we already have
+        for row in rows:
+            if isinstance(row, dict):
+                top_100_set.add(str(row.get("clan") or "").upper())
+
         for clan_name in scraped_clans:
-            if clan_name not in clans_seen:
+            # Only include if this clan appears in our top-100 data
+            if clan_name.upper() in top_100_set and clan_name not in clans_seen:
                 clans_seen.append(clan_name)
+                clans_from_scrape_only.append(clan_name)
+
+        # Show clans found only from the website scrape (no per-battle data)
+        if clans_from_scrape_only:
+            scrape_line = ", ".join(f"**{c}**" for c in clans_from_scrape_only[:8])
+            if len(clans_from_scrape_only) > 8:
+                scrape_line += f" + {len(clans_from_scrape_only) - 8} more"
+            embed.add_field(
+                name="\U0001f50d Also Known To Have Been In",
+                value=f"{scrape_line}\n_(from db.biggames.io — no per-battle data available)_",
+                inline=False,
+            )
 
         if clans_seen:
             # Check if they've been in MCWV
@@ -10916,6 +10984,141 @@ def get_cached_battle_stats(battle_id):
     except Exception:
         pass
     return None
+
+
+@bot.tree.command(name="scrape_members", description="Scrape db.biggames.io for ALL member lists across top 100 clans (complete clan history)", guild=guild_obj)
+@require_role()
+async def scrape_members_cmd(interaction: discord.Interaction):
+    """Scrape all top-100 clan pages from db.biggames.io to get FULL member lists.
+    This gives us every player who has ever been in each clan — not just top scorers.
+    Run this once (or periodically to update). Takes ~5-10 minutes for 100 clans."""
+    await interaction.response.defer(ephemeral=True)
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    if not DATABASE_URL:
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    # Open a dedicated connection (immune to other loops closing the global conn)
+    local_conn = None
+    try:
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        local_conn.autocommit = True
+
+        # Ensure the table exists
+        with local_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_members (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    clan_name TEXT NOT NULL,
+                    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (roblox_id, clan_name)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_roblox_idx ON cross_clan_members (roblox_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_clan_idx ON cross_clan_members (clan_name)")
+
+        # Get the list of top 100 clans to scrape
+        clan_names = await fetch_top_clan_names_for_history()
+        if not clan_names:
+            return await interaction.followup.send("Could not fetch the top 100 clan list.", ephemeral=True)
+
+        await interaction.followup.send(
+            f"Scraping **{len(clan_names)}** clan pages from db.biggames.io...\n"
+            f"This gets EVERY member who has ever been in each clan.\n"
+            f"Each clan takes ~2-3 seconds. I will update you every 10 clans.",
+            ephemeral=True,
+        )
+
+        total_members = 0
+        clans_done = 0
+        clans_failed = 0
+
+        for i, clan_name in enumerate(clan_names, 1):
+            try:
+                # Fetch the clan page
+                url = f"https://db.biggames.io/clans/{clan_name}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers={"User-Agent": "Mozilla/5.0"}) as res:
+                    if res.status != 200:
+                        clans_failed += 1
+                        continue
+                    html = await res.text()
+
+                # Extract user IDs from the RSC data
+                # The page contains escaped quoted IDs: \"12345678\"
+                import re as _re
+                ids = set()
+                for match in _re.findall(r'\\"(\d{7,12})\\"', html):
+                    uid = int(match)
+                    if uid > 1000000:
+                        ids.add(str(match))
+                # Also try unescaped quotes
+                for match in _re.findall(r'"(\d{7,12})"', html):
+                    uid = int(match)
+                    if uid > 1000000:
+                        ids.add(str(match))
+
+                if ids:
+                    # Store in DB
+                    added = 0
+                    with local_conn.cursor() as cur:
+                        for uid in ids:
+                            cur.execute("""
+                                INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen, last_checked)
+                                VALUES (%s, %s, NOW(), NOW())
+                                ON CONFLICT (roblox_id, clan_name)
+                                DO UPDATE SET last_checked = NOW()
+                            """, (uid, clan_name))
+                            added += cur.rowcount
+                    local_conn.commit()
+                    total_members += len(ids)
+                    clans_done += 1
+                else:
+                    clans_failed += 1
+
+                # Progress update every 10 clans
+                if i % 10 == 0 or i == len(clan_names):
+                    try:
+                        await interaction.followup.send(
+                            f"[{i}/{len(clan_names)}] Scraped {clans_done} clans ({clans_failed} failed) "
+                            f"— {total_members:,} total member IDs found so far.",
+                            ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+
+                # Yield to event loop
+                await asyncio.sleep(0.5)
+
+            except Exception as exc:
+                clans_failed += 1
+                print(f"[scrape_members] failed for {clan_name}: {exc}")
+
+        # Final summary
+        summary = (
+            f"\nScrape complete!\n"
+            f"Clans scraped: **{clans_done}/{len(clan_names)}** ({clans_failed} failed)\n"
+            f"Total member IDs stored: **{total_members:,}**\n"
+            f"Use `/checkplayer <username>` to see full cross-clan history."
+        )
+        await interaction.followup.send(summary, ephemeral=True)
+        print(f"[scrape_members] done: {clans_done} clans, {total_members} members")
+
+    except Exception as e:
+        print(f"[scrape_members] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Scrape failed: `{type(e).__name__}`", ephemeral=True)
+    finally:
+        if local_conn is not None:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
+
 
 
 @bot.tree.command(name="backfill_history", description="Backfill all historical war data into the permanent cross-clan cache", guild=guild_obj)
