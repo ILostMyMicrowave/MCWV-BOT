@@ -11010,131 +11010,169 @@ async def scrape_members_cmd(interaction: discord.Interaction):
     if not DATABASE_URL:
         return await interaction.followup.send("Database is not available.", ephemeral=True)
 
-    # Use a FRESH session for this command (don't rely on the global one)
-    scrape_session = aiohttp.ClientSession()
+    # Everything runs in a background task so the bot NEVER blocks.
+    # Progress is sent via followup at safe intervals.
+    progress_msg = await interaction.followup.send(
+        "Scraping **77** clan pages from db.biggames.io...\n"
+        "This runs in the background - the bot stays fully responsive.\n"
+        "I will update you with progress.",
+        ephemeral=True,
+        wait=True,
+    )
 
-    # Use a FRESH DB connection (immune to other loops)
-    local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-    local_conn.autocommit = True
-
-    try:
-        # Ensure table exists
-        with local_conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS cross_clan_members (
-                    id BIGSERIAL PRIMARY KEY,
-                    roblox_id TEXT NOT NULL,
-                    clan_name TEXT NOT NULL,
-                    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (roblox_id, clan_name)
-                )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_roblox_idx ON cross_clan_members (roblox_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_clan_idx ON cross_clan_members (clan_name)")
-            # Add last_checked column if it doesn't exist (table may have been
-            # created by an earlier version without it)
-            cur.execute("ALTER TABLE cross_clan_members ADD COLUMN IF NOT EXISTS last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW()")
-
-        # Use hardcoded list (reliable, no API dependency)
-        clan_names = list(HARDCODED_TOP_100_CLANS)
-        print(f"[scrape_members] Starting scrape of {len(clan_names)} clans")
-
-        await interaction.followup.send(
-            f"Scraping **{len(clan_names)}** clan pages... Updates every 10 clans.",
-            ephemeral=True,
-        )
-
+    async def _run_scrape():
+        """Background scrape task — fully isolated from the bot's event loop."""
+        # Fresh aiohttp session (don't touch the global one)
+        scrape_session = aiohttp.ClientSession()
+        local_conn = None
         total_members = 0
         clans_done = 0
         clans_failed = 0
+        failed_clans = []
 
-        for i, clan_name in enumerate(clan_names, 1):
-            try:
-                url = f"https://db.biggames.io/clans/{clan_name}"
-                async with scrape_session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}) as res:
-                    if res.status != 200:
-                        print(f"[scrape_members] {clan_name}: HTTP {res.status}")
+        try:
+            local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+            local_conn.autocommit = True
+
+            # Ensure table exists + migrate
+            with local_conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS cross_clan_members (
+                        id BIGSERIAL PRIMARY KEY,
+                        roblox_id TEXT NOT NULL,
+                        clan_name TEXT NOT NULL,
+                        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (roblox_id, clan_name)
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_roblox_idx ON cross_clan_members (roblox_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_clan_idx ON cross_clan_members (clan_name)")
+                cur.execute("ALTER TABLE cross_clan_members ADD COLUMN IF NOT EXISTS last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+
+            clan_names = list(HARDCODED_TOP_100_CLANS)
+            print(f"[scrape_members] Starting scrape of {len(clan_names)} clans")
+
+            for i, clan_name in enumerate(clan_names, 1):
+                try:
+                    # Fetch the clan page
+                    url = f"https://db.biggames.io/clans/{clan_name}"
+                    async with scrape_session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
+                    ) as res:
+                        if res.status != 200:
+                            clans_failed += 1
+                            failed_clans.append(clan_name)
+                            print(f"[scrape_members] {clan_name}: HTTP {res.status}")
+                            continue
+                        html = await res.text()
+
+                    # Extract user IDs from the RSC data
+                    ids = set()
+                    for match in re.findall(r'\\"(\d{7,12})\"', html):
+                        try:
+                            uid = int(match)
+                            if uid > 1000000:
+                                ids.add(str(match))
+                        except Exception:
+                            pass
+                    for match in re.findall(r'"(\d{7,12})"', html):
+                        try:
+                            uid = int(match)
+                            if uid > 1000000:
+                                ids.add(str(match))
+                        except Exception:
+                            pass
+
+                    if ids:
+                        # Batch insert (500 at a time) with event loop yields
+                        id_list = list(ids)
+                        for batch_start in range(0, len(id_list), 500):
+                            batch = id_list[batch_start:batch_start + 500]
+                            # Use parameterized values to avoid SQL injection
+                            args = [(uid, clan_name) for uid in batch]
+                            # Build VALUES clause safely
+                            values_clause = ",".join(f"(%s,%s,NOW(),NOW())" for _ in batch)
+                            flat_args = []
+                            for uid, cn in args:
+                                flat_args.extend([uid, cn])
+                            with local_conn.cursor() as cur:
+                                cur.execute(
+                                    f"""INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen, last_checked)
+                                    VALUES {values_clause}
+                                    ON CONFLICT (roblox_id, clan_name)
+                                    DO UPDATE SET last_checked = NOW()""",
+                                    flat_args,
+                                )
+                            local_conn.commit()
+                            await asyncio.sleep(0)  # CRITICAL: yield to event loop
+
+                        total_members += len(ids)
+                        clans_done += 1
+                        print(f"[scrape_members] {clan_name}: {len(ids)} members")
+                    else:
                         clans_failed += 1
-                        continue
-                    html = await res.text()
+                        failed_clans.append(clan_name)
+                        print(f"[scrape_members] {clan_name}: no IDs found")
 
-                # Extract user IDs
-                ids = set()
-                for match in re.findall(r'\\"(\d{7,12})\\"', html):
-                    try:
-                        uid = int(match)
-                        if uid > 1000000:
-                            ids.add(str(match))
-                    except Exception:
-                        pass
-                for match in re.findall(r'"(\d{7,12})"', html):
-                    try:
-                        uid = int(match)
-                        if uid > 1000000:
-                            ids.add(str(match))
-                    except Exception:
-                        pass
+                    # Progress update every 10 clans
+                    if i % 10 == 0 or i == len(clan_names):
+                        try:
+                            await progress_msg.edit(
+                                content=f"Scraping clan pages... **[{i}/{len(clan_names)}]**\n"
+                                f"Done: **{clans_done}** | Failed: **{clans_failed}** | IDs: **{total_members:,}**"
+                            )
+                        except Exception:
+                            pass
 
-                if ids:
-                    # Batch insert to avoid blocking the event loop
-                    # (24k+ individual INSERTs would freeze the bot heartbeat)
-                    id_list = list(ids)
-                    batch_size = 500
-                    for batch_start in range(0, len(id_list), batch_size):
-                        batch = id_list[batch_start:batch_start + batch_size]
-                        values = ",".join(f"('{uid}','{clan_name}',NOW(),NOW())" for uid in batch)
-                        with local_conn.cursor() as cur:
-                            cur.execute(f"""
-                                INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen, last_checked)
-                                VALUES {values}
-                                ON CONFLICT (roblox_id, clan_name)
-                                DO UPDATE SET last_checked = NOW()
-                            """)
-                        local_conn.commit()
-                        await asyncio.sleep(0)  # Yield to event loop
-                    total_members += len(ids)
-                    clans_done += 1
-                    print(f"[scrape_members] {clan_name}: {len(ids)} members")
-                else:
+                    # Delay between clans (avoid rate limiting)
+                    await asyncio.sleep(0.5)
+
+                except asyncio.TimeoutError:
                     clans_failed += 1
-                    print(f"[scrape_members] {clan_name}: no IDs found")
+                    failed_clans.append(clan_name)
+                    print(f"[scrape_members] {clan_name}: timeout")
+                except Exception as exc:
+                    clans_failed += 1
+                    failed_clans.append(clan_name)
+                    print(f"[scrape_members] {clan_name}: {type(exc).__name__}: {exc}")
 
-                if i % 10 == 0 or i == len(clan_names):
-                    try:
-                        await interaction.followup.send(
-                            f"[{i}/{len(clan_names)}] {clans_done} done, {clans_failed} failed, {total_members:,} IDs",
-                            ephemeral=True,
-                        )
-                    except Exception:
-                        pass
+            # Final update
+            summary = (
+                f"Scrape complete!\n"
+                f"Clans: **{clans_done}/{len(clan_names)}** ({clans_failed} failed)\n"
+                f"Total member IDs: **{total_members:,}**\n"
+            )
+            if failed_clans:
+                summary += f"Failed: {', '.join(failed_clans[:10])}"
+            summary += f"\nUse `/checkplayer <username>` to see full cross-clan history."
 
-                await asyncio.sleep(0.5)
+            try:
+                await progress_msg.edit(content=summary)
+            except Exception:
+                pass
 
-            except Exception as exc:
-                clans_failed += 1
-                print(f"[scrape_members] {clan_name}: {type(exc).__name__}: {exc}")
-                continue
+            print(f"[scrape_members] DONE: {clans_done} clans, {total_members} members, {clans_failed} failed")
 
-        await interaction.followup.send(
-            f"Scrape complete! **{clans_done}/{len(clan_names)}** clans, **{total_members:,}** member IDs.",
-            ephemeral=True,
-        )
-        print(f"[scrape_members] DONE: {clans_done} clans, {total_members} members")
+        except Exception as e:
+            print(f"[scrape_members] FATAL: {e}")
+            traceback.print_exc()
+            try:
+                await progress_msg.edit(content=f"Scrape failed: `{type(e).__name__}`")
+            except Exception:
+                pass
+        finally:
+            await scrape_session.close()
+            if local_conn is not None:
+                try:
+                    local_conn.close()
+                except Exception:
+                    pass
 
-    except Exception as e:
-        print(f"[scrape_members] FATAL: {e}")
-        traceback.print_exc()
-        try:
-            await interaction.followup.send(f"Scrape failed: `{type(e).__name__}`", ephemeral=True)
-        except Exception:
-            pass
-    finally:
-        await scrape_session.close()
-        try:
-            local_conn.close()
-        except Exception:
-            pass
+    # Run as a background task so the bot stays fully responsive
+    asyncio.create_task(_run_scrape())
 
 
 
