@@ -10386,43 +10386,44 @@ async def cache_battle_contributors(battle_id):
                 "start_time": v1_start if v1_start > 0 else None,
             })
 
-        # Source 2: each top-100 clan's legacy PointContributions for this battle
-        # This catches contributors not in the global top 200 but in a clan's top performers
+        # Source 2: each top-100 clan's legacy PointContributions for this battle.
+        # Done SEQUENTIALLY (one clan at a time) to avoid timeouts and rate limits.
         clan_names = await fetch_top_clan_names_for_history()
-        semaphore = asyncio.Semaphore(10)
+        clans_scanned = 0
+        clans_failed = 0
 
-        async def fetch_clan_contribs(clan_name):
-            async with semaphore:
+        for clan_name in clan_names:
+            try:
                 payload = await fetch_legacy_clan_payload(clan_name)
                 if not payload:
-                    return []
+                    clans_failed += 1
+                    continue
                 battles = _legacy_clan_battles(payload)
                 battle = battles.get(battle_id) or battles.get(str(battle_id))
                 if not isinstance(battle, dict):
-                    # Try normalized match
                     norm = normalize_hourly_battle_key(battle_id)
                     for bid, b in battles.items():
                         if normalize_hourly_battle_key(bid) == norm:
                             battle = b
                             break
                 if not isinstance(battle, dict):
-                    return []
+                    clans_scanned += 1
+                    continue
                 contribs = battle.get("PointContributions") or battle.get("pointContributions") or []
                 if not isinstance(contribs, list):
-                    return []
+                    clans_scanned += 1
+                    continue
                 clan_place = battle.get("Place") or battle.get("place")
                 clan_place_int = int(clan_place) if isinstance(clan_place, (int, float)) and clan_place else None
                 earned_medal = bool(battle.get("EarnedMedal") or battle.get("earnedMedal"))
                 start_time = _safe_int(battle.get("StartTime") or battle.get("startTime"))
-                # Rank the contributions within this clan
                 ranked = sorted(contribs, key=lambda c: _safe_int(c.get("Points")), reverse=True)
                 total = len(ranked)
-                rows = []
                 for idx, c in enumerate(ranked, start=1):
                     uid = str(c.get("UserID") or c.get("userId") or c.get("UserId") or "").strip()
                     if not uid:
                         continue
-                    rows.append({
+                    rows_to_cache.append({
                         "roblox_id": uid,
                         "battle_id": str(battle_id),
                         "battle_name": str(battle_name),
@@ -10434,16 +10435,14 @@ async def cache_battle_contributors(battle_id):
                         "earned_medal": earned_medal,
                         "start_time": start_time if start_time > 0 else None,
                     })
-                return rows
+                clans_scanned += 1
+            except Exception as exc:
+                clans_failed += 1
 
-        clan_results = await asyncio.gather(
-            *(fetch_clan_contribs(cn) for cn in clan_names),
-            return_exceptions=True,
-        )
+        print(f"[cross-clan cache] {battle_id}: scanned {clans_scanned} clans ({clans_failed} failed)")
 
-        for result in clan_results:
-            if isinstance(result, list):
-                rows_to_cache.extend(result)
+        # Yield to event loop between battles
+        await asyncio.sleep(0)
 
         # Deduplicate: keep the row with the highest points per (roblox_id, battle_id, clan_name)
         best_rows = {}
@@ -10492,38 +10491,69 @@ async def cache_battle_contributors(battle_id):
 
 async def get_all_battle_ids():
     """Collect all unique battle IDs from the top 100 clans' legacy data.
+    Falls back to MCWV's own battles if the scan fails.
     Returns a list of battle IDs sorted by start time (oldest first)."""
-    clan_names = await fetch_top_clan_names_for_history()
-    semaphore = asyncio.Semaphore(10)
     battle_ids = {}
 
-    async def fetch_battles(clan_name):
-        async with semaphore:
-            payload = await fetch_legacy_clan_payload(clan_name)
-            if not payload:
-                return {}
-            battles = _legacy_clan_battles(payload)
-            result = {}
-            for bid, b in battles.items():
+    # Always start with MCWV's own battles (reliable fallback)
+    try:
+        mcwv_payload = await fetch_legacy_clan_payload(CLAN_NAME)
+        if mcwv_payload:
+            mcwv_battles = _legacy_clan_battles(mcwv_payload)
+            for bid, b in mcwv_battles.items():
                 if not isinstance(b, dict):
                     continue
                 battle_id = str(b.get("BattleID") or b.get("battleId") or bid or "").strip()
-                if not battle_id:
-                    continue
-                start = _safe_int(b.get("StartTime") or b.get("startTime"))
-                result[battle_id] = start
-            return result
+                if battle_id:
+                    start = _safe_int(b.get("StartTime") or b.get("startTime"))
+                    battle_ids[battle_id] = start
+            print(f"[cross-clan cache] MCWV fallback: found {len(battle_ids)} battles")
+    except Exception as e:
+        print(f"[cross-clan cache] MCWV fallback failed: {e}")
 
-    results = await asyncio.gather(
-        *(fetch_battles(cn) for cn in clan_names),
-        return_exceptions=True,
-    )
+    # Then try the full top-100 scan for more battles
+    try:
+        clan_names = await fetch_top_clan_names_for_history()
+        print(f"[cross-clan cache] scanning {len(clan_names)} clans for battle IDs")
 
-    for result in results:
-        if isinstance(result, dict):
-            for bid, start in result.items():
-                if bid not in battle_ids or start > battle_ids[bid]:
-                    battle_ids[bid] = start
+        semaphore = asyncio.Semaphore(10)
+        scanned_count = 0
+        failed_count = 0
+
+        async def fetch_battles(clan_name):
+            nonlocal scanned_count, failed_count
+            async with semaphore:
+                payload = await fetch_legacy_clan_payload(clan_name)
+                if not payload:
+                    failed_count += 1
+                    return {}
+                scanned_count += 1
+                battles = _legacy_clan_battles(payload)
+                result = {}
+                for bid, b in battles.items():
+                    if not isinstance(b, dict):
+                        continue
+                    battle_id = str(b.get("BattleID") or b.get("battleId") or bid or "").strip()
+                    if not battle_id:
+                        continue
+                    start = _safe_int(b.get("StartTime") or b.get("startTime"))
+                    result[battle_id] = start
+                return result
+
+        results = await asyncio.gather(
+            *(fetch_battles(cn) for cn in clan_names),
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, dict):
+                for bid, start in result.items():
+                    if bid not in battle_ids or start > battle_ids[bid]:
+                        battle_ids[bid] = start
+
+        print(f"[cross-clan cache] scan done: {scanned_count} clans scanned, {failed_count} failed, {len(battle_ids)} unique battles")
+    except Exception as e:
+        print(f"[cross-clan cache] top-100 scan failed (using MCWV fallback only): {e}")
 
     # Sort by start time (oldest first for backfill)
     sorted_ids = sorted(battle_ids.keys(), key=lambda bid: battle_ids.get(bid, 0))
