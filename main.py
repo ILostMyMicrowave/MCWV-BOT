@@ -11342,7 +11342,7 @@ def _insert_raw_contributions(local_conn, rows):
             execute_values(cur, """
                 INSERT INTO cross_clan_player_history
                     (roblox_id, battle_id, battle_name, clan_name, points,
-                     clan_place, earned_medal, start_time, cached_at)
+                     clan_place, earned_medal, start_time)
                 VALUES %s
                 ON CONFLICT (roblox_id, battle_id, clan_name)
                 DO UPDATE SET
