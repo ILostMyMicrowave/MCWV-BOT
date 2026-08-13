@@ -10031,18 +10031,36 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         roblox_id = resolved["id"]
         roblox_name = resolved["name"]
 
-        # Fetch their cross-clan war history (uses top-100 scan + PS99 API)
+        # First: check the permanent cross-clan cache (instant, no API calls)
+        cached_rows = get_cached_player_history(roblox_id)
+
+        # Also fetch from the live PS99 API (for battles not yet cached)
         history = await fetch_ps99_player_war_history(roblox_id)
 
-        if not history or not isinstance(history, dict):
-            return await interaction.followup.send(f"No war history found for `{roblox_name}`.")
+        # Merge: combine cached rows with live rows, dedup by (battle_id, clan_name)
+        live_rows = []
+        if history and isinstance(history, dict):
+            live_rows = history.get("battles", []) or []
 
-        rows = history.get("battles", [])
-        if not isinstance(rows, list) or not rows:
+        # Build a merged set keyed by (battle_id_lower, clan_name_lower)
+        merged = {}
+        for row in cached_rows:
+            key = (str(row.get("battleId") or "").lower(), str(row.get("clan") or "").lower())
+            merged[key] = row
+        for row in live_rows:
+            if not isinstance(row, dict):
+                continue
+            key = (str(row.get("battleId") or "").lower(), str(row.get("clan") or "").lower())
+            if key not in merged or _safe_int(row.get("points")) > _safe_int(merged[key].get("points")):
+                merged[key] = row
+
+        rows = list(merged.values())
+
+        if not rows:
             return await interaction.followup.send(f"No war battle data found for `{roblox_name}`. They may not have participated in any tracked wars.")
 
-        summary = history.get("summary") if isinstance(history.get("summary"), dict) else {}
-        scan = history.get("scan", {}) if isinstance(history.get("scan"), dict) else {}
+        summary = history.get("summary") if isinstance(history, dict) and isinstance(history.get("summary"), dict) else {}
+        scan = history.get("scan", {}) if isinstance(history, dict) and isinstance(history.get("scan"), dict) else {}
 
         # Sort battles by start time (most recent first)
         rows.sort(key=_battle_sort_key, reverse=True)
@@ -10263,6 +10281,481 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         print(f"[checkplayer] error: {e}")
         traceback.print_exc()
         await interaction.followup.send(f"Lookup failed: `{type(e).__name__}`")
+
+
+
+# ---------------- CROSS-CLAN HISTORY CACHE ----------------
+# Permanently store every player's war contributions across all clans.
+# Backfilled from PS99 public API + auto-cached at the end of each war.
+
+CROSS_CLAN_CACHE_VERSION = 1
+
+
+def ensure_cross_clan_history_table():
+    """Create the permanent cache table if it doesn't exist."""
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_player_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    battle_id TEXT NOT NULL,
+                    battle_name TEXT,
+                    clan_name TEXT NOT NULL,
+                    points BIGINT NOT NULL DEFAULT 0,
+                    rank INTEGER,
+                    total_contributors INTEGER,
+                    clan_place INTEGER,
+                    earned_medal BOOLEAN DEFAULT FALSE,
+                    start_time BIGINT,
+                    cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (roblox_id, battle_id, clan_name)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx
+                ON cross_clan_player_history (roblox_id)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx
+                ON cross_clan_player_history (battle_id)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS cross_clan_history_clan_idx
+                ON cross_clan_player_history (clan_name, battle_id)
+            """)
+        conn.commit()
+    except Exception as e:
+        print("[cross-clan cache] table creation failed:", e)
+        conn.rollback()
+
+
+async def cache_battle_contributors(battle_id):
+    """Fetch and cache ALL contributor data for a single battle.
+    Combines the v1/clans/battles endpoint (top 200 globally) with
+    each top-100 clan's legacy PointContributions to get maximum coverage.
+    Returns the number of rows cached."""
+    if not battle_id or not db_enabled():
+        return 0
+
+    ensure_cross_clan_history_table()
+    battle_name = _friendly_battle_name(battle_id)
+    cached_count = 0
+
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        # Source 1: v1/clans/battles/{battle_id} — top 200 players globally
+        v1_payload = await _ps99_json(f"{PS99_API}/v1/clans/battles/{battle_id}")
+        v1_data = v1_payload.get("data", {}) if isinstance(v1_payload, dict) else {}
+        v1_meta = v1_data.get("meta", {}) if isinstance(v1_data, dict) else {}
+        v1_start = _safe_int(v1_meta.get("startTime"))
+        v1_players = v1_data.get("topPlayers", []) if isinstance(v1_data, dict) else []
+        v1_stats = v1_data.get("stats", {}) if isinstance(v1_data, dict) else {}
+        total_contributors = _safe_int(v1_stats.get("totalContributors"))
+
+        rows_to_cache = []
+
+        for player in v1_players if isinstance(v1_players, list) else []:
+            if not isinstance(player, dict):
+                continue
+            uid = str(player.get("userId") or player.get("UserID") or "").strip()
+            if not uid:
+                continue
+            clan = player.get("clan", {}) if isinstance(player.get("clan"), dict) else {}
+            clan_name = str(clan.get("name") or "Unknown").strip()
+            pts = _safe_int(player.get("points"))
+            rank = _safe_int(player.get("rank"))
+            place = clan.get("place")
+            place_int = int(place) if isinstance(place, (int, float)) and place else None
+            medal = bool(player.get("earnedMedal") or player.get("medal"))
+            rows_to_cache.append({
+                "roblox_id": uid,
+                "battle_id": str(battle_id),
+                "battle_name": str(v1_meta.get("title") or battle_name),
+                "clan_name": clan_name,
+                "points": pts,
+                "rank": rank if rank > 0 else None,
+                "total_contributors": total_contributors if total_contributors > 0 else None,
+                "clan_place": place_int,
+                "earned_medal": medal,
+                "start_time": v1_start if v1_start > 0 else None,
+            })
+
+        # Source 2: each top-100 clan's legacy PointContributions for this battle
+        # This catches contributors not in the global top 200 but in a clan's top performers
+        clan_names = await fetch_top_clan_names_for_history()
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_clan_contribs(clan_name):
+            async with semaphore:
+                payload = await fetch_legacy_clan_payload(clan_name)
+                if not payload:
+                    return []
+                battles = _legacy_clan_battles(payload)
+                battle = battles.get(battle_id) or battles.get(str(battle_id))
+                if not isinstance(battle, dict):
+                    # Try normalized match
+                    norm = normalize_hourly_battle_key(battle_id)
+                    for bid, b in battles.items():
+                        if normalize_hourly_battle_key(bid) == norm:
+                            battle = b
+                            break
+                if not isinstance(battle, dict):
+                    return []
+                contribs = battle.get("PointContributions") or battle.get("pointContributions") or []
+                if not isinstance(contribs, list):
+                    return []
+                clan_place = battle.get("Place") or battle.get("place")
+                clan_place_int = int(clan_place) if isinstance(clan_place, (int, float)) and clan_place else None
+                earned_medal = bool(battle.get("EarnedMedal") or battle.get("earnedMedal"))
+                start_time = _safe_int(battle.get("StartTime") or battle.get("startTime"))
+                # Rank the contributions within this clan
+                ranked = sorted(contribs, key=lambda c: _safe_int(c.get("Points")), reverse=True)
+                total = len(ranked)
+                rows = []
+                for idx, c in enumerate(ranked, start=1):
+                    uid = str(c.get("UserID") or c.get("userId") or c.get("UserId") or "").strip()
+                    if not uid:
+                        continue
+                    rows.append({
+                        "roblox_id": uid,
+                        "battle_id": str(battle_id),
+                        "battle_name": str(battle_name),
+                        "clan_name": str(clan_name),
+                        "points": _safe_int(c.get("Points")),
+                        "rank": idx,
+                        "total_contributors": total,
+                        "clan_place": clan_place_int,
+                        "earned_medal": earned_medal,
+                        "start_time": start_time if start_time > 0 else None,
+                    })
+                return rows
+
+        clan_results = await asyncio.gather(
+            *(fetch_clan_contribs(cn) for cn in clan_names),
+            return_exceptions=True,
+        )
+
+        for result in clan_results:
+            if isinstance(result, list):
+                rows_to_cache.extend(result)
+
+        # Deduplicate: keep the row with the highest points per (roblox_id, battle_id, clan_name)
+        best_rows = {}
+        for row in rows_to_cache:
+            key = (row["roblox_id"], row["battle_id"], row["clan_name"])
+            if key not in best_rows or row["points"] > best_rows[key]["points"]:
+                best_rows[key] = row
+
+        # Insert into DB (upsert — update if exists with higher points)
+        if best_rows:
+            with conn.cursor() as cur:
+                for row in best_rows.values():
+                    cur.execute("""
+                        INSERT INTO cross_clan_player_history
+                            (roblox_id, battle_id, battle_name, clan_name, points,
+                             rank, total_contributors, clan_place, earned_medal, start_time)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (roblox_id, battle_id, clan_name)
+                        DO UPDATE SET
+                            points = GREATEST(cross_clan_player_history.points, EXCLUDED.points),
+                            rank = CASE WHEN EXCLUDED.rank IS NOT NULL AND EXCLUDED.points >= cross_clan_player_history.points
+                                        THEN EXCLUDED.rank ELSE cross_clan_player_history.rank END,
+                            total_contributors = COALESCE(EXCLUDED.total_contributors, cross_clan_player_history.total_contributors),
+                            clan_place = COALESCE(EXCLUDED.clan_place, cross_clan_player_history.clan_place),
+                            earned_medal = cross_clan_player_history.earned_medal OR EXCLUDED.earned_medal,
+                            battle_name = COALESCE(EXCLUDED.battle_name, cross_clan_player_history.battle_name),
+                            start_time = COALESCE(EXCLUDED.start_time, cross_clan_player_history.start_time),
+                            cached_at = NOW()
+                    """, (
+                        row["roblox_id"], row["battle_id"], row["battle_name"],
+                        row["clan_name"], row["points"], row["rank"],
+                        row["total_contributors"], row["clan_place"],
+                        row["earned_medal"], row["start_time"],
+                    ))
+            conn.commit()
+            cached_count = len(best_rows)
+
+        print(f"[cross-clan cache] {battle_id}: cached {cached_count} contributor rows")
+        return cached_count
+
+    except Exception as e:
+        print(f"[cross-clan cache] failed for {battle_id}: {e}")
+        conn.rollback()
+        return 0
+
+
+async def get_all_battle_ids():
+    """Collect all unique battle IDs from the top 100 clans' legacy data.
+    Returns a list of battle IDs sorted by start time (oldest first)."""
+    clan_names = await fetch_top_clan_names_for_history()
+    semaphore = asyncio.Semaphore(10)
+    battle_ids = {}
+
+    async def fetch_battles(clan_name):
+        async with semaphore:
+            payload = await fetch_legacy_clan_payload(clan_name)
+            if not payload:
+                return {}
+            battles = _legacy_clan_battles(payload)
+            result = {}
+            for bid, b in battles.items():
+                if not isinstance(b, dict):
+                    continue
+                battle_id = str(b.get("BattleID") or b.get("battleId") or bid or "").strip()
+                if not battle_id:
+                    continue
+                start = _safe_int(b.get("StartTime") or b.get("startTime"))
+                result[battle_id] = start
+            return result
+
+    results = await asyncio.gather(
+        *(fetch_battles(cn) for cn in clan_names),
+        return_exceptions=True,
+    )
+
+    for result in results:
+        if isinstance(result, dict):
+            for bid, start in result.items():
+                if bid not in battle_ids or start > battle_ids[bid]:
+                    battle_ids[bid] = start
+
+    # Sort by start time (oldest first for backfill)
+    sorted_ids = sorted(battle_ids.keys(), key=lambda bid: battle_ids.get(bid, 0))
+    return sorted_ids
+
+
+async def backfill_cross_clan_history(interaction=None, battle_filter=None):
+    """Backfill all historical battle data into the permanent cache.
+    If interaction is provided, sends progress updates.
+    If battle_filter is provided, only caches that battle.
+    Returns (battles_cached, total_rows)."""
+    if not db_enabled():
+        return 0, 0
+
+    ensure_cross_clan_history_table()
+
+    if battle_filter:
+        count = await cache_battle_contributors(battle_filter)
+        return 1, count
+
+    battle_ids = await get_all_battle_ids()
+    if not battle_ids:
+        if interaction:
+            await interaction.followup.send("No battles found to backfill.")
+        return 0, 0
+
+    # Check which battles are already cached
+    already_cached = set()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT battle_id FROM cross_clan_player_history")
+            for row in cur.fetchall():
+                already_cached.add(str(row[0]))
+    except Exception:
+        pass
+
+    to_cache = [bid for bid in battle_ids if bid not in already_cached]
+    if not to_cache:
+        if interaction:
+            await interaction.followup.send(f"All {len(battle_ids)} battles are already cached!")
+        return 0, 0
+
+    total_rows = 0
+    battles_cached = 0
+
+    for i, bid in enumerate(to_cache, 1):
+        rows = await cache_battle_contributors(bid)
+        total_rows += rows
+        battles_cached += 1
+
+        if interaction and (i % 5 == 0 or i == len(to_cache)):
+            try:
+                await interaction.followup.send(
+                    f"Backfilling... **{i}/{len(to_cache)}** battles done ({total_rows:,} rows cached so far).",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+        # Yield to event loop
+        await asyncio.sleep(0)
+
+    if interaction:
+        await interaction.followup.send(
+            f"Backfill complete! **{battles_cached}** battles cached, **{total_rows:,}** total contributor rows.",
+        )
+
+    print(f"[cross-clan cache] backfill done: {battles_cached} battles, {total_rows} rows")
+    return battles_cached, total_rows
+
+
+async def auto_cache_war_end(battle_id):
+    """Auto-cache a war's data when it ends. Called from war_poll_loop."""
+    if not battle_id:
+        return
+    try:
+        count = await cache_battle_contributors(battle_id)
+        print(f"[cross-clan cache] auto-cached war {battle_id}: {count} rows")
+    except Exception as e:
+        print(f"[cross-clan cache] auto-cache failed for {battle_id}: {e}")
+
+
+def get_cached_player_history(roblox_id):
+    """Read a player's full cross-clan history from the permanent cache.
+    Returns a list of dicts sorted by start time (most recent first)."""
+    if not db_enabled():
+        return []
+    ensure_cross_clan_history_table()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT battle_id, battle_name, clan_name, points, rank,
+                       total_contributors, clan_place, earned_medal, start_time
+                FROM cross_clan_player_history
+                WHERE roblox_id = %s
+                ORDER BY start_time DESC NULLS LAST, battle_id DESC
+            """, (str(roblox_id),))
+            rows = cur.fetchall()
+        return [
+            {
+                "battleId": r[0],
+                "title": r[1] or _friendly_battle_name(r[0]),
+                "clan": r[2],
+                "points": int(r[3] or 0),
+                "rank": int(r[4]) if r[4] else None,
+                "total": int(r[5]) if r[5] else None,
+                "clanPlace": r[6],
+                "earnedMedal": bool(r[7]),
+                "startTime": int(r[8]) if r[8] else 0,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[cross-clan cache] player history read failed: {e}")
+        return []
+
+
+def get_cached_battle_stats(battle_id):
+    """Get stats for a cached battle — how many clans and players we have."""
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(DISTINCT clan_name) as clans,
+                       COUNT(*) as players,
+                       COUNT(DISTINCT roblox_id) as unique_players
+                FROM cross_clan_player_history
+                WHERE battle_id = %s
+            """, (str(battle_id),))
+            row = cur.fetchone()
+        if row:
+            return {"clans": int(row[0] or 0), "rows": int(row[1] or 0), "uniquePlayers": int(row[2] or 0)}
+    except Exception:
+        pass
+    return None
+
+
+@bot.tree.command(name="backfill_history", description="Backfill all historical war data into the permanent cross-clan cache", guild=guild_obj)
+@app_commands.describe(battle_name="Optional: only backfill a specific battle (e.g. NinjaBattle2026)")
+@require_role()
+async def backfill_history(interaction: discord.Interaction, battle_name: str = None):
+    await interaction.response.defer(ephemeral=True)
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    if not db_enabled():
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    battle_filter = battle_name.strip() if battle_name else None
+    await interaction.followup.send(
+        f"Starting backfill{' for ' + battle_filter if battle_filter else ' of all historical battles'}... This may take a few minutes.",
+        ephemeral=True,
+    )
+
+    battles, rows = await backfill_cross_clan_history(interaction=interaction, battle_filter=battle_filter)
+    close_db_connection()
+
+
+@bot.tree.command(name="cachewar", description="Cache a specific war's data into the permanent cross-clan cache", guild=guild_obj)
+@app_commands.describe(battle_id="Battle ID to cache (e.g. NinjaBattle2026)")
+@require_role()
+async def cachewar(interaction: discord.Interaction, battle_id: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not db_enabled():
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    battle_id = battle_id.strip()
+    count = await cache_battle_contributors(battle_id)
+    close_db_connection()
+
+    if count > 0:
+        stats = get_cached_battle_stats(battle_id)
+        stats_txt = ""
+        if stats:
+            stats_txt = f"\n{stats['clans']} clans | {stats['uniquePlayers']} unique players | {stats['rows']} total rows"
+        await interaction.followup.send(f"Cached **{battle_id}** — {count:,} contributor rows.{stats_txt}", ephemeral=True)
+    else:
+        await interaction.followup.send(f"No data found for `{battle_id}`. Check the battle ID.", ephemeral=True)
+
+
+@bot.tree.command(name="cachedbstats", description="Show stats for the cross-clan history cache", guild=guild_obj)
+@require_role()
+async def cachedbstats(interaction: discord.Interaction):
+    if not db_enabled():
+        return await interaction.response.send_message("Database is not available.", ephemeral=True)
+
+    ensure_cross_clan_history_table()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM cross_clan_player_history")
+            total_rows = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(DISTINCT roblox_id) FROM cross_clan_player_history")
+            unique_players = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(DISTINCT battle_id) FROM cross_clan_player_history")
+            unique_battles = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(DISTINCT clan_name) FROM cross_clan_player_history")
+            unique_clans = int(cur.fetchone()[0] or 0)
+            cur.execute("""
+                SELECT battle_id, battle_name, COUNT(*) as rows, COUNT(DISTINCT clan_name) as clans
+                FROM cross_clan_player_history
+                GROUP BY battle_id, battle_name
+                ORDER BY MAX(start_time) DESC NULLS LAST
+                LIMIT 10
+            """)
+            recent = cur.fetchall()
+
+        embed = discord.Embed(
+            title="Cross-Clan Cache Stats",
+            color=discord.Color(MCWV_BRAND_COLOR),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Total Rows", value=f"**{total_rows:,}**", inline=True)
+        embed.add_field(name="Unique Players", value=f"**{unique_players:,}**", inline=True)
+        embed.add_field(name="Battles", value=f"**{unique_battles}**", inline=True)
+        embed.add_field(name="Clans", value=f"**{unique_clans}**", inline=True)
+
+        if recent:
+            lines = []
+            for r in recent:
+                lines.append(f"**{r[1] or r[0]}** — {r[2]} rows, {r[3]} clans")
+            embed.add_field(name="Recent Cached Battles", value="\n".join(lines), inline=False)
+
+        embed.set_footer(text="Use /backfill_history to cache more battles")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        close_db_connection()
+
+    except Exception as e:
+        await interaction.response.send_message(f"Error: `{e}`", ephemeral=True)
 
 
 
@@ -13754,6 +14247,10 @@ async def war_poll_loop():
                     tag="war-end",
                 )
                 await trigger_hub_push("sweep")
+                # Auto-cache the just-ended war's cross-clan contributor data.
+                if PS99_CURRENT_WAR_NAME:
+                    asyncio.create_task(auto_cache_war_end(PS99_CURRENT_WAR_NAME))
+                    print(f"[cross-clan cache] auto-cache queued for {PS99_CURRENT_WAR_NAME}")
 
     except Exception as e:
         print("War poll error:", e)
