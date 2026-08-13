@@ -10560,25 +10560,57 @@ async def get_all_battle_ids():
     return sorted_ids
 
 
+# Known battle IDs that exist in PS99 (hardcoded fallback so backfill
+# doesn't depend on the top-100 scan working). Updated 2026-08-13.
+KNOWN_BATTLE_IDS = [
+    "NinjaBattle2026", "GummyBattle2026", "LunarBattle2026", "SoccerBattle2026",
+    "Backrooms2026", "AngelBattle2026", "StarryBattle", "Spring2026",
+    "LuckyChestBattle", "Christmas2025", "Turkey2025", "TrickOrTreat",
+    "BlockPartyBattle", "StrengthBattle", "TowerBattle", "BasketballBattle",
+    "BalloonCorgiBattle", "PoisonTurtleBattle", "PixelChickBattle", "AthenaBattle",
+    "TieDyeBattle", "LuckyBattle", "CardBattle", "ValBattle", "CannonBattle",
+    "SquidBattle", "NewYear2024", "YearEnd2024", "Christmas2024", "SantaBattle",
+    "LineBattle", "HalloweenBattle", "CatchingBattle", "CrabBattle", "RngBattle",
+    "MillionaireRunBattle", "GoodEvilBattle", "HackerBattle", "PrisonBattle",
+    "GlitchBattle", "GoalBattleTwo", "GoalBattleOne", "AchBattle",
+    "IndexBattle", "RaidBattle", "Christmas2023", "DecemberActiveHugePets",
+]
+
+
 async def backfill_cross_clan_history(interaction=None, battle_filter=None):
     """Backfill all historical battle data into the permanent cache.
-    If interaction is provided, sends progress updates.
-    If battle_filter is provided, only caches that battle.
-    Returns (battles_cached, total_rows)."""
+    Uses a hardcoded list of known battle IDs + MCWV's own battles as the
+    source (no dependency on the top-100 scan). Caches each battle one at a
+    time with progress updates. Returns (battles_cached, total_rows)."""
     if not db_enabled():
+        if interaction:
+            await interaction.followup.send("Database is not available.", ephemeral=True)
         return 0, 0
 
     ensure_cross_clan_history_table()
 
     if battle_filter:
         count = await cache_battle_contributors(battle_filter)
+        close_db_connection()
+        if interaction:
+            await interaction.followup.send(f"Done! Cached **{count:,}** rows for {battle_filter}.", ephemeral=True)
         return 1, count
 
-    battle_ids = await get_all_battle_ids()
-    if not battle_ids:
-        if interaction:
-            await interaction.followup.send("No battles found to backfill.")
-        return 0, 0
+    # Use the hardcoded known battle IDs (reliable, no API dependency)
+    battle_ids = list(KNOWN_BATTLE_IDS)
+
+    # Also try to add any battles from MCWV's own data
+    try:
+        mcwv_payload = await fetch_legacy_clan_payload(CLAN_NAME)
+        if mcwv_payload:
+            mcwv_battles = _legacy_clan_battles(mcwv_payload)
+            for bid, b in mcwv_battles.items():
+                if isinstance(b, dict):
+                    battle_id = str(b.get("BattleID") or b.get("battleId") or bid or "").strip()
+                    if battle_id and battle_id not in battle_ids:
+                        battle_ids.append(battle_id)
+    except Exception:
+        pass
 
     # Check which battles are already cached
     already_cached = set()
@@ -10593,35 +10625,58 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
     to_cache = [bid for bid in battle_ids if bid not in already_cached]
     if not to_cache:
         if interaction:
-            await interaction.followup.send(f"All {len(battle_ids)} battles are already cached!")
+            await interaction.followup.send(f"All {len(battle_ids)} battles are already cached!", ephemeral=True)
+        close_db_connection()
         return 0, 0
-
-    total_rows = 0
-    battles_cached = 0
-
-    for i, bid in enumerate(to_cache, 1):
-        rows = await cache_battle_contributors(bid)
-        total_rows += rows
-        battles_cached += 1
-
-        if interaction and (i % 5 == 0 or i == len(to_cache)):
-            try:
-                await interaction.followup.send(
-                    f"Backfilling... **{i}/{len(to_cache)}** battles done ({total_rows:,} rows cached so far).",
-                    ephemeral=True,
-                )
-            except Exception:
-                pass
-
-        # Yield to event loop
-        await asyncio.sleep(0)
 
     if interaction:
         await interaction.followup.send(
-            f"Backfill complete! **{battles_cached}** battles cached, **{total_rows:,}** total contributor rows.",
+            f"Backfilling **{len(to_cache)}** battles (skipping {len(already_cached)} already cached)...\n"
+            f"Each battle takes ~30-60s. I will update you after each one.",
+            ephemeral=True,
         )
 
-    print(f"[cross-clan cache] backfill done: {battles_cached} battles, {total_rows} rows")
+    total_rows = 0
+    battles_cached = 0
+    failed = []
+
+    for i, bid in enumerate(to_cache, 1):
+        try:
+            rows = await cache_battle_contributors(bid)
+            total_rows += rows
+            battles_cached += 1
+
+            if interaction:
+                try:
+                    await interaction.followup.send(
+                        f"[{i}/{len(to_cache)}] **{bid}** — {rows:,} rows cached",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            failed.append(bid)
+            if interaction:
+                try:
+                    await interaction.followup.send(
+                        f"[{i}/{len(to_cache)}] **{bid}** — failed: {exc}",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+        # Close and reopen DB between battles (Neon scale-to-zero friendly)
+        close_db_connection()
+        await asyncio.sleep(1)  # Small delay to avoid hammering the API
+
+    if interaction:
+        summary = f"\nBackfill complete! **{battles_cached}/{len(to_cache)}** battles cached, **{total_rows:,}** total rows."
+        if failed:
+            summary += f"\nFailed: {', '.join(failed)}"
+        await interaction.followup.send(summary, ephemeral=True)
+
+    print(f"[cross-clan cache] backfill done: {battles_cached} battles, {total_rows} rows, {len(failed)} failed")
+    close_db_connection()
     return battles_cached, total_rows
 
 
