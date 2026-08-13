@@ -10044,33 +10044,6 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         summary = history.get("summary") if isinstance(history.get("summary"), dict) else {}
         scan = history.get("scan", {}) if isinstance(history.get("scan"), dict) else {}
 
-        # Also check clans from the player summary that might not have been
-        # in the top-100 scan (e.g. a former clan like V1LN). Fetch their
-        # battle data directly and extract this player's contributions.
-        existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows if isinstance(r, dict)}
-        extra_clans_to_check = set()
-
-        # Add the current clan from summary (if not MCWV and not already checked)
-        if current_clan_name and current_clan_name != "Unknown":
-            extra_clans_to_check.add(current_clan_name)
-
-        # Add MCWV (always check it directly for completeness)
-        extra_clans_to_check.add(CLAN_NAME)
-
-        for clan_to_check in extra_clans_to_check:
-            try:
-                clan_data = await _fetch_clan_data(clan_to_check)
-                if not clan_data:
-                    continue
-                for row in _mcwv_history_from_clan_payload(roblox_id, {"data": clan_data}):
-                    bid_lower = str(row.get("battleId") or "").lower()
-                    if bid_lower not in existing_battle_ids:
-                        row["clan"] = clan_to_check
-                        rows.append(row)
-                        existing_battle_ids.add(bid_lower)
-            except Exception as exc:
-                print(f"[checkplayer] extra clan fetch failed for {clan_to_check}: {exc}")
-
         # Sort battles by start time (most recent first)
         rows.sort(key=_battle_sort_key, reverse=True)
 
@@ -10111,6 +10084,32 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         # trust the member list over the stale summary.
         if in_mcwv_now:
             current_clan_name = CLAN_NAME
+
+        # Also check clans that might not have been in the top-100 scan
+        # (e.g. a former clan like V1LN). Fetch their battle data directly
+        # and extract this player's contributions for any missing battles.
+        existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows if isinstance(r, dict)}
+        extra_clans_to_check = set()
+        if current_clan_name and current_clan_name != "Unknown":
+            extra_clans_to_check.add(current_clan_name)
+        extra_clans_to_check.add(CLAN_NAME)
+
+        for clan_to_check in extra_clans_to_check:
+            try:
+                extra_clan_data = await _fetch_clan_data(clan_to_check)
+                if not extra_clan_data:
+                    continue
+                for row in _mcwv_history_from_clan_payload(roblox_id, {"data": extra_clan_data}):
+                    bid_lower = str(row.get("battleId") or "").lower()
+                    if bid_lower not in existing_battle_ids:
+                        row["clan"] = clan_to_check
+                        rows.append(row)
+                        existing_battle_ids.add(bid_lower)
+            except Exception as exc:
+                print(f"[checkplayer] extra clan fetch failed for {clan_to_check}: {exc}")
+
+        # Re-sort with any new battles
+        rows.sort(key=_battle_sort_key, reverse=True)
 
         embed.add_field(name="\U0001f3e2 Current Clan", value=f"**{current_clan_name}**", inline=True)
         if active_points:
