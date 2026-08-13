@@ -10485,7 +10485,11 @@ async def cache_battle_contributors(battle_id):
 
     except Exception as e:
         print(f"[cross-clan cache] failed for {battle_id}: {e}")
-        conn.rollback()
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
         return 0
 
 
