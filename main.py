@@ -11032,6 +11032,9 @@ async def scrape_members_cmd(interaction: discord.Interaction):
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_roblox_idx ON cross_clan_members (roblox_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_clan_idx ON cross_clan_members (clan_name)")
+            # Add last_checked column if it doesn't exist (table may have been
+            # created by an earlier version without it)
+            cur.execute("ALTER TABLE cross_clan_members ADD COLUMN IF NOT EXISTS last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW()")
 
         # Use hardcoded list (reliable, no API dependency)
         clan_names = list(HARDCODED_TOP_100_CLANS)
