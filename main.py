@@ -3925,6 +3925,9 @@ def format_duration(since: datetime) -> str:
     return f"{minutes}m"
 
 async def resolve_roblox_username(username: str):
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
     url = "https://users.roblox.com/v1/usernames/users"
     async with session.post(
         url,
@@ -10135,6 +10138,10 @@ def db_get_member_war_career(roblox_id):
 async def warinfo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
 
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
     try:
         async with session.get(ACTIVE_BATTLE_API) as r:
             if r.status != 200:
@@ -11082,6 +11089,10 @@ async def profile(interaction: discord.Interaction, roblox_username: str):
 async def clanstats(interaction: discord.Interaction):
     await interaction.response.defer()
 
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
     try:
         async with session.get(CLAN_API) as r:
             if r.status != 200:
@@ -11185,6 +11196,8 @@ async def clanstats(interaction: discord.Interaction):
         embed.add_field(name=f"{mcwv_rank_flair(best['rank'])} Best War", value=best_line, inline=True)
 
     # Live war chip — light check, details belong to /warinfo.
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
     try:
         async with session.get(ACTIVE_BATTLE_API) as r:
             if r.status == 200 and "application/json" in r.headers.get("Content-Type", ""):
