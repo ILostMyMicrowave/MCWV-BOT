@@ -10044,6 +10044,33 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         summary = history.get("summary") if isinstance(history.get("summary"), dict) else {}
         scan = history.get("scan", {}) if isinstance(history.get("scan"), dict) else {}
 
+        # Also check clans from the player summary that might not have been
+        # in the top-100 scan (e.g. a former clan like V1LN). Fetch their
+        # battle data directly and extract this player's contributions.
+        existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows if isinstance(r, dict)}
+        extra_clans_to_check = set()
+
+        # Add the current clan from summary (if not MCWV and not already checked)
+        if current_clan_name and current_clan_name != "Unknown":
+            extra_clans_to_check.add(current_clan_name)
+
+        # Add MCWV (always check it directly for completeness)
+        extra_clans_to_check.add(CLAN_NAME)
+
+        for clan_to_check in extra_clans_to_check:
+            try:
+                clan_data = await _fetch_clan_data(clan_to_check)
+                if not clan_data:
+                    continue
+                for row in _mcwv_history_from_clan_payload(roblox_id, {"data": clan_data}):
+                    bid_lower = str(row.get("battleId") or "").lower()
+                    if bid_lower not in existing_battle_ids:
+                        row["clan"] = clan_to_check
+                        rows.append(row)
+                        existing_battle_ids.add(bid_lower)
+            except Exception as exc:
+                print(f"[checkplayer] extra clan fetch failed for {clan_to_check}: {exc}")
+
         # Sort battles by start time (most recent first)
         rows.sort(key=_battle_sort_key, reverse=True)
 
@@ -10064,12 +10091,26 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         if avatar_url:
             embed.set_thumbnail(url=avatar_url)
 
-        # Current clan (from summary)
+        # Current clan — PS99's /v1/clans/players/ summary is often stale,
+        # so verify against the actual MCWV member list and any rival clan.
         current_clan = summary.get("Clan", {}) if isinstance(summary.get("Clan"), dict) else {}
         current_clan_name = current_clan.get("Name") or "Unknown"
         active_points = _safe_int(summary.get("ActiveBattlePoints"))
         total_battles = max(_safe_int(summary.get("TotalBattles")), len(rows))
         earned_medals = max(_safe_int(summary.get("EarnedMedals")), sum(1 for r in rows if r.get("earnedMedal")))
+
+        # Verify: is this player actually in MCWV right now?
+        mcwv_clan_data = await _fetch_clan_data(CLAN_NAME)
+        in_mcwv_now = False
+        if mcwv_clan_data:
+            mcwv_members = mcwv_clan_data.get("Members", [])
+            if isinstance(mcwv_members, list):
+                in_mcwv_now = any(str(m.get("UserID")) == str(roblox_id) for m in mcwv_members if isinstance(m, dict))
+
+        # If PS99 says they're in a rival clan but they're actually in MCWV,
+        # trust the member list over the stale summary.
+        if in_mcwv_now:
+            current_clan_name = CLAN_NAME
 
         embed.add_field(name="\U0001f3e2 Current Clan", value=f"**{current_clan_name}**", inline=True)
         if active_points:
@@ -10091,21 +10132,46 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             # Check if they've been in rival clans
             rival_clans = [c for c in clans_seen if _normalize_clan_name(c) != _normalize_clan_name(CLAN_NAME)]
 
+            # Also check their CURRENT clan (from the summary, not just battle history)
+            current_clan_norm = _normalize_clan_name(current_clan_name)
+            is_currently_mcwv = current_clan_norm == _normalize_clan_name(CLAN_NAME)
+            is_currently_rival = current_clan_name != "Unknown" and current_clan_norm != _normalize_clan_name(CLAN_NAME)
+
             clan_line = ", ".join(f"**{c}**" for c in clans_seen[:8])
+            if is_currently_rival and current_clan_name not in clans_seen:
+                clan_line += f", **{current_clan_name}** (current)"
             if len(clans_seen) > 8:
                 clan_line += f" + {len(clans_seen) - 8} more"
             embed.add_field(name="\U0001f4cb Clans History", value=clan_line, inline=False)
 
-            if been_in_mcwv and rival_clans:
+            # Smart transfer detection using BOTH battle history AND current clan
+            if been_in_mcwv and is_currently_rival:
+                # Was in MCWV, now in a rival clan
+                embed.add_field(
+                    name="\u26a0\ufe0f Left MCWV",
+                    value=f"Was in **MCWV** but is now in **{current_clan_name}** \u2014 they left for a rival clan.",
+                    inline=False,
+                )
+            elif been_in_mcwv and rival_clans:
+                # Was in MCWV and also in other clans (historically)
                 embed.add_field(
                     name="\u26a0\ufe0f Transfer Detected",
                     value=f"Was in MCWV and also in: **{', '.join(rival_clans[:5])}**",
                     inline=False,
                 )
+            elif is_currently_mcwv and rival_clans:
+                # Currently in MCWV but was in rival clans before
+                embed.add_field(
+                    name="\U0001f575 Recruit from Rivals",
+                    value=f"Now in **MCWV** but previously in: **{', '.join(rival_clans[:5])}**",
+                    inline=False,
+                )
+            elif is_currently_mcwv:
+                embed.add_field(name="\U0001f451 MCWV Member", value="Currently in MCWV", inline=False)
             elif been_in_mcwv:
-                embed.add_field(name="\U0001f451 MCWV Member", value="Has war history with MCWV", inline=False)
-            elif rival_clans:
-                embed.add_field(name="\U0001f575 Rival Clan Player", value=f"Never been in MCWV \u2014 came from: **{', '.join(rival_clans[:5])}**", inline=False)
+                embed.add_field(name="\U0001f451 Former MCWV Member", value=f"Was in MCWV, now in **{current_clan_name}**", inline=False)
+            elif is_currently_rival or rival_clans:
+                embed.add_field(name="\U0001f575 Rival Clan Player", value=f"Never been in MCWV \u2014 current clan: **{current_clan_name}**", inline=False)
 
         # Battle history table
         table_lines = []
