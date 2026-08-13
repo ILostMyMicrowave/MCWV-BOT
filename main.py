@@ -10314,20 +10314,23 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
                 place = row.get("clanPlace")
                 medal = " \U0001f949" if row.get("earnedMedal") else ""
 
-                # Rank + "Better Than" % — same metric CW Bot uses.
-                # pct = betterThan = share of contributors outperformed.
-                # "top X%" = 100 - pct (lower = better).
+                # CW Bot style: "Better Than X%" = share of field outperformed.
                 if rank > 0 and total > 1:
                     pct = float(row.get("betterThan") or ((total - rank) / total * 100))
-                    top_pct = 100 - pct
                     if rank <= 3:
                         rank_emoji = ["\U0001f947", "\U0001f948", "\U0001f949"][rank - 1]
                     elif rank <= 10:
                         rank_emoji = "\U0001f4aa"
                     else:
                         rank_emoji = f"#{rank}"
-                    rank_txt = f" {rank_emoji}/{total}"
-                    better_txt = f" \u00b7 top {top_pct:.0f}%"
+                    rank_txt = f" {rank_emoji}/{total:,}"
+                    # Color-code the percentile: green >80%, yellow 50-80%, red <50%
+                    if pct >= 80:
+                        better_txt = f" \u00b7 **{pct:.1f}%** better"
+                    elif pct >= 50:
+                        better_txt = f" \u00b7 {pct:.1f}% better"
+                    else:
+                        better_txt = f" \u00b7 _{pct:.1f}% better_"
                 else:
                     rank_txt = ""
                     better_txt = ""
@@ -10371,19 +10374,10 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
 
         # ===== PERFORMANCE ANALYSIS =====
         if rank_values:
-            # "pct" stored above is betterThan = share of the field the player
-            # outperformed = (total - rank) / total. The intuitive "top X%"
-            # framing is the inverse: top% = 100 - betterThan (lower = better).
-            # Raw rank numbers are NOT comparable across battles of different
-            # sizes (#1964/2645 is a worse relative finish than #3371/7374), so
-            # Best/Worst are ranked by PERCENTILE with the percentile shown first.
-            def _scope_label(total):
-                # PS99 clans are capped at 75 members, so a contributor count
-                # <= 100 is a within-clan rank; anything larger is the cross-clan
-                # leaderboard. After /backfill_global, this is the true global
-                # leaderboard (all 50k+ clans from the sitemap).
-                return "of clan" if int(total or 0) <= 100 else "globally"
-
+            # pct = betterThan = share of the global field outperformed.
+            # After /backfill_global these are TRUE global percentiles.
+            # Best/Worst ranked by percentile (raw ranks aren't comparable
+            # across battles of different sizes).
             sorted_by_perf = sorted(rank_values, key=lambda r: r["pct"], reverse=True)
             best = sorted_by_perf[0]
             worst = sorted_by_perf[-1]
@@ -10393,21 +10387,21 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             embed.add_field(
                 name="\U0001f3c6 Best Finish",
                 value=(
-                    f"top {100 - best['pct']:.0f}% {_scope_label(best['total'])}\n"
-                    f"**#{best['rank']}**/{best['total']} in {best['clan']}"
+                    f"**{best['pct']:.1f}%** better than global\n"
+                    f"**#{best['rank']:,}**/{best['total']:,} in {best['clan']}"
                 ),
                 inline=True,
             )
             embed.add_field(
                 name="\U0001f4ca Avg Finish",
-                value=f"**#{avg_rank:.0f}** (top {100 - avg_pct:.0f}%)",
+                value=f"**#{avg_rank:,.0f}**\n{avg_pct:.1f}% better than global",
                 inline=True,
             )
             embed.add_field(
                 name="\U0001f53b Worst Finish",
                 value=(
-                    f"top {100 - worst['pct']:.0f}% {_scope_label(worst['total'])}\n"
-                    f"**#{worst['rank']}**/{worst['total']}"
+                    f"**{worst['pct']:.1f}%** better than global\n"
+                    f"**#{worst['rank']:,}**/{worst['total']:,}"
                 ),
                 inline=True,
             )
