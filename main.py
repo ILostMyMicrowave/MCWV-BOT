@@ -10008,7 +10008,7 @@ async def threatboard(interaction: discord.Interaction):
 # Look up any Roblox player's war history across all clans they've been in.
 # Uses the existing top-100 clan scan index + PS99 API fallbacks.
 
-@bot.tree.command(name="checkplayer", description="Look up a player's cross-clan war history - see if they were in rival clans", guild=guild_obj)
+@bot.tree.command(name="checkplayer", description="Look up any player's complete cross-clan war history and performance", guild=guild_obj)
 @app_commands.describe(roblox_username="Roblox username to investigate")
 @require_role()
 async def checkplayer(interaction: discord.Interaction, roblox_username: str):
@@ -10023,7 +10023,7 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         return await interaction.followup.send(f"Invalid Roblox username `{roblox_username}`.")
 
     try:
-        # Resolve username to ID
+        # ===== RESOLVE =====
         resolved = await resolve_roblox_username(roblox_username)
         if not resolved:
             return await interaction.followup.send(f"Roblox user `{roblox_username}` not found.")
@@ -10031,18 +10031,18 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         roblox_id = resolved["id"]
         roblox_name = resolved["name"]
 
-        # First: check the permanent cross-clan cache (instant, no API calls)
+        # ===== GATHER ALL DATA =====
+        # 1. Permanent cache (instant)
         cached_rows = get_cached_player_history(roblox_id)
 
-        # Also fetch from the live PS99 API (for battles not yet cached)
+        # 2. Live PS99 scan (for uncached battles)
         history = await fetch_ps99_player_war_history(roblox_id)
 
-        # Merge: combine cached rows with live rows, dedup by (battle_id, clan_name)
+        # 3. Merge cached + live
         live_rows = []
         if history and isinstance(history, dict):
             live_rows = history.get("battles", []) or []
 
-        # Build a merged set keyed by (battle_id_lower, clan_name_lower)
         merged = {}
         for row in cached_rows:
             key = (str(row.get("battleId") or "").lower(), str(row.get("clan") or "").lower())
@@ -10056,47 +10056,27 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
 
         rows = list(merged.values())
 
-        if not rows:
-            return await interaction.followup.send(f"No war battle data found for `{roblox_name}`. They may not have participated in any tracked wars.")
-
+        # 4. Extra clan check (top 100 only)
         summary = history.get("summary") if isinstance(history, dict) and isinstance(history.get("summary"), dict) else {}
         scan = history.get("scan", {}) if isinstance(history, dict) and isinstance(history.get("scan"), dict) else {}
 
-        # Sort battles by start time (most recent first)
         rows.sort(key=_battle_sort_key, reverse=True)
 
-        # Avatar (best-effort)
+        # 5. Avatar
         avatar_url = None
         try:
             avatar_url = await get_roblox_headshot_url(roblox_id)
         except Exception:
             pass
 
-        # ===== BUILD EMBED =====
-        embed = discord.Embed(
-            title=f"\U0001f50d Cross-Clan History: {roblox_name}",
-            description=f"Roblox ID: `{roblox_id}`\n{len(rows)} battles found across top-100 clans",
-            color=discord.Color(MCWV_BRAND_COLOR),
-            timestamp=datetime.now(timezone.utc),
-        )
-        if avatar_url:
-            embed.set_thumbnail(url=avatar_url)
-
-        # Current clan — PS99's /v1/clans/players/ summary is often stale,
-        # so verify against the actual MCWV member list and any rival clan.
+        # 6. Verify actual current clan (check real member lists)
         current_clan = summary.get("Clan", {}) if isinstance(summary.get("Clan"), dict) else {}
         current_clan_name = current_clan.get("Name") or "Unknown"
         active_points = _safe_int(summary.get("ActiveBattlePoints"))
-        total_battles = max(_safe_int(summary.get("TotalBattles")), len(rows))
-        earned_medals = max(_safe_int(summary.get("EarnedMedals")), sum(1 for r in rows if r.get("earnedMedal")))
+        total_battles_agg = max(_safe_int(summary.get("TotalBattles")), len(rows))
+        earned_medals_agg = max(_safe_int(summary.get("EarnedMedals")), sum(1 for r in rows if r.get("earnedMedal")))
 
-        # Verify the player's ACTUAL current clan by checking the real member
-        # lists. PS99's /v1/clans/players/ summary is often stale, so we check
-        # MCWV first (most important), then all top 100 clans to find where
-        # this player actually is right now — regardless of clan placement.
         actual_current_clan = None
-
-        # Check MCWV first
         mcwv_clan_data = await _fetch_clan_data(CLAN_NAME)
         in_mcwv_now = False
         if mcwv_clan_data:
@@ -10106,13 +10086,12 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
                 if in_mcwv_now:
                     actual_current_clan = CLAN_NAME
 
-        # If not in MCWV, check all top 100 clans to find where they actually are
         if not actual_current_clan:
             try:
                 top_100_list = await fetch_top_clan_names_for_history()
                 for check_clan in top_100_list:
                     if check_clan.upper() == CLAN_NAME.upper():
-                        continue  # Already checked
+                        continue
                     try:
                         check_data = await _fetch_clan_data(check_clan)
                         if not check_data:
@@ -10127,12 +10106,10 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             except Exception:
                 pass
 
-        # Override the stale PS99 summary with the verified clan
         if actual_current_clan:
             current_clan_name = actual_current_clan
 
-        # Only check clans in the TOP 100 for additional battle data.
-        # This ensures /checkplayer only shows history from top-100 clans.
+        # 7. Extra clan battle data (top 100 only)
         existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows if isinstance(r, dict)}
         top_100_clans = set()
         try:
@@ -10141,7 +10118,6 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         except Exception:
             pass
 
-        # Only check clans that ARE in the top 100
         extra_clans_to_check = set()
         if current_clan_name and current_clan_name != "Unknown":
             if current_clan_name.upper() in top_100_clans:
@@ -10163,29 +10139,11 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             except Exception as exc:
                 print(f"[checkplayer] extra clan fetch failed for {clan_to_check}: {exc}")
 
-        # Re-sort with any new battles
         rows.sort(key=_battle_sort_key, reverse=True)
 
-        embed.add_field(name="\U0001f3e2 Current Clan", value=f"**{current_clan_name}**", inline=True)
-        if active_points:
-            embed.add_field(name="\u2694\ufe0f Active War Points", value=f"**{format_points(active_points)}**", inline=True)
-        embed.add_field(name="\U0001f3c5 Total Battles", value=f"**{total_battles}**", inline=True)
-        if earned_medals:
-            embed.add_field(name="\U0001f949 Medals", value=f"**{earned_medals}**", inline=True)
-
-        # Clans seen across all battles (from per-battle history)
-        clans_seen = []
-        for row in rows:
-            clan_name = str(row.get("clan") or "").strip()
-            if clan_name and clan_name not in clans_seen:
-                clans_seen.append(clan_name)
-
-        # Also check the scraped all-time clan memberships (from db.biggames.io)
-        # This catches clans the player was in even if we don't have per-battle data
-        # FILTER: only show clans that are/were in the TOP 100
+        # 8. Scraped clan memberships
         scraped_clans = get_cached_clan_memberships(roblox_id)
         clans_from_scrape_only = []
-        # Build the top 100 set for filtering (from the cached battle data)
         top_100_set = set()
         try:
             if db_enabled():
@@ -10196,115 +10154,197 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
                 close_db_connection()
         except Exception:
             pass
-        # Also add clans from the battle rows we already have
         for row in rows:
             if isinstance(row, dict):
                 top_100_set.add(str(row.get("clan") or "").upper())
 
         for clan_name in scraped_clans:
-            # Only include if this clan appears in our top-100 data
-            if clan_name.upper() in top_100_set and clan_name not in clans_seen:
-                clans_seen.append(clan_name)
+            if clan_name.upper() in top_100_set and clan_name not in [str(r.get("clan") or "") for r in rows]:
                 clans_from_scrape_only.append(clan_name)
 
-        # Show clans found only from the website scrape (no per-battle data)
-        if clans_from_scrape_only:
-            scrape_line = ", ".join(f"**{c}**" for c in clans_from_scrape_only[:8])
-            if len(clans_from_scrape_only) > 8:
-                scrape_line += f" + {len(clans_from_scrape_only) - 8} more"
-            embed.add_field(
-                name="\U0001f50d Also Known To Have Been In",
-                value=f"{scrape_line}\n_(from db.biggames.io — no per-battle data available)_",
-                inline=False,
-            )
+        # ===== ANALYZE =====
+        # Build clans seen list
+        clans_seen = []
+        for row in rows:
+            cn = str(row.get("clan") or "").strip()
+            if cn and cn not in clans_seen:
+                clans_seen.append(cn)
+        for cn in clans_from_scrape_only:
+            if cn not in clans_seen:
+                clans_seen.append(cn)
 
-        if clans_seen:
-            # Check if they've been in MCWV
-            been_in_mcwv = any(_normalize_clan_name(c) == _normalize_clan_name(CLAN_NAME) for c in clans_seen)
-            # Check if they've been in rival clans
-            rival_clans = [c for c in clans_seen if _normalize_clan_name(c) != _normalize_clan_name(CLAN_NAME)]
+        been_in_mcwv = any(_normalize_clan_name(c) == _normalize_clan_name(CLAN_NAME) for c in clans_seen)
+        rival_clans = [c for c in clans_seen if _normalize_clan_name(c) != _normalize_clan_name(CLAN_NAME)]
+        current_clan_norm = _normalize_clan_name(current_clan_name)
+        is_currently_mcwv = current_clan_norm == _normalize_clan_name(CLAN_NAME)
+        is_currently_rival = current_clan_name != "Unknown" and current_clan_norm != _normalize_clan_name(CLAN_NAME)
 
-            # Also check their CURRENT clan (from the summary, not just battle history)
-            current_clan_norm = _normalize_clan_name(current_clan_name)
-            is_currently_mcwv = current_clan_norm == _normalize_clan_name(CLAN_NAME)
-            is_currently_rival = current_clan_name != "Unknown" and current_clan_norm != _normalize_clan_name(CLAN_NAME)
-
-            clan_line = ", ".join(f"**{c}**" for c in clans_seen[:8])
-            if is_currently_rival and current_clan_name not in clans_seen:
-                clan_line += f", **{current_clan_name}** (current)"
-            if len(clans_seen) > 8:
-                clan_line += f" + {len(clans_seen) - 8} more"
-            embed.add_field(name="\U0001f4cb Clans History", value=clan_line, inline=False)
-
-            # Smart transfer detection using BOTH battle history AND current clan
-            if been_in_mcwv and is_currently_rival:
-                # Was in MCWV, now in a rival clan
-                embed.add_field(
-                    name="\u26a0\ufe0f Left MCWV",
-                    value=f"Was in **MCWV** but is now in **{current_clan_name}** \u2014 they left for a rival clan.",
-                    inline=False,
-                )
-            elif been_in_mcwv and rival_clans:
-                # Was in MCWV and also in other clans (historically)
-                embed.add_field(
-                    name="\u26a0\ufe0f Transfer Detected",
-                    value=f"Was in MCWV and also in: **{', '.join(rival_clans[:5])}**",
-                    inline=False,
-                )
-            elif is_currently_mcwv and rival_clans:
-                # Currently in MCWV but was in rival clans before
-                embed.add_field(
-                    name="\U0001f575 Recruit from Rivals",
-                    value=f"Now in **MCWV** but previously in: **{', '.join(rival_clans[:5])}**",
-                    inline=False,
-                )
-            elif is_currently_mcwv:
-                embed.add_field(name="\U0001f451 MCWV Member", value="Currently in MCWV", inline=False)
-            elif been_in_mcwv:
-                embed.add_field(name="\U0001f451 Former MCWV Member", value=f"Was in MCWV, now in **{current_clan_name}**", inline=False)
-            elif is_currently_rival or rival_clans:
-                embed.add_field(name="\U0001f575 Rival Clan Player", value=f"Never been in MCWV \u2014 current clan: **{current_clan_name}**", inline=False)
-
-        # Battle history table
-        table_lines = []
-        for row in rows[:10]:  # Show up to 10 most recent
-            title = _friendly_battle_name(row.get("battleId") or row.get("title") or "?")
-            clan = str(row.get("clan") or "?")
+        # Per-clan breakdown (battles + points per clan)
+        clan_stats = {}
+        for row in rows:
+            cn = str(row.get("clan") or "Unknown").strip()
+            if cn not in clan_stats:
+                clan_stats[cn] = {"battles": 0, "total_points": 0, "best_points": 0, "medals": 0}
+            clan_stats[cn]["battles"] += 1
             pts = _safe_int(row.get("points"))
-            rank = _safe_int(row.get("rank"))
-            total = _safe_int(row.get("total")) or 1
-            place = row.get("clanPlace")
-            medal = " \U0001f949" if row.get("earnedMedal") else ""
+            clan_stats[cn]["total_points"] += pts
+            if pts > clan_stats[cn]["best_points"]:
+                clan_stats[cn]["best_points"] = pts
+            if row.get("earnedMedal"):
+                clan_stats[cn]["medals"] += 1
 
-            # Rank emoji
-            if rank <= 3:
-                rank_emoji = ["\U0001f947", "\U0001f948", "\U0001f949"][rank - 1]
-            elif rank <= 10:
-                rank_emoji = "\U0001f4aa"
-            else:
-                rank_emoji = f"#{rank}"
-
-            place_txt = f" (clan #{int(place)})" if place and place not in (None, "", 0) else ""
-            table_lines.append(f"{rank_emoji} **{title}** \u2014 {clan} \u00b7 {format_points(pts)} pts{place_txt}{medal}")
-
-        embed.add_field(
-            name=f"\U0001f4ca War History ({len(rows)} battles, showing {min(len(rows), 10)})",
-            value="\n".join(table_lines),
-            inline=False,
-        )
-
-        # Performance analysis — rank-based (more meaningful than raw points
-        # since different wars have different point scales)
+        # Rank analysis (within clan, not global)
         rank_values = []
         for r in rows:
             rk = _safe_int(r.get("rank"))
             total = _safe_int(r.get("total")) or 1
-            if rk > 0:
-                rank_values.append({"rank": rk, "total": total, "pct": float(r.get("betterThan") or ((total - rk) / total * 100))})
+            if rk > 0 and total > 1:
+                pct = float(r.get("betterThan") or ((total - rk) / total * 100))
+                rank_values.append({"rank": rk, "total": total, "pct": pct, "clan": r.get("clan")})
 
+        # ===== BUILD EMBED =====
+        if not rows and not scraped_clans:
+            return await interaction.followup.send(f"No war data found for `{roblox_name}`.")
+
+        # Color: green if in MCWV, red if in rival, brand if unknown
+        if is_currently_mcwv:
+            embed_color = discord.Color.green()
+        elif is_currently_rival:
+            embed_color = discord.Color.red()
+        else:
+            embed_color = discord.Color(MCWV_BRAND_COLOR)
+
+        embed = discord.Embed(
+            title=f"\U0001f50d {roblox_name}",
+            description=f"ID: `{roblox_id}`",
+            color=embed_color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
+
+        # ===== STATUS BAR =====
+        status_parts = []
+        if is_currently_mcwv:
+            status_parts.append("\U0001f451 **MCWV Member**")
+        elif is_currently_rival:
+            status_parts.append(f"\U0001f575 **{current_clan_name}** (rival)")
+        else:
+            status_parts.append("\u2754 **Clan unknown**")
+
+        if active_points and active_points > 0:
+            status_parts.append(f"\u2694\ufe0f {format_points(active_points)} pts this war")
+
+        if earned_medals_agg:
+            status_parts.append(f"\U0001f3c5 {earned_medals_agg} medals")
+        if total_battles_agg:
+            status_parts.append(f"\U0001f4ca {total_battles_agg} battles")
+
+        embed.description += f"\n{' | '.join(status_parts)}"
+
+        # ===== TRANSFER DETECTION =====
+        if been_in_mcwv and is_currently_rival:
+            embed.add_field(
+                name="\u26a0\ufe0f Left MCWV",
+                value=f"Was in **MCWV** but is now in **{current_clan_name}** \u2014 they left for a rival clan.",
+                inline=False,
+            )
+        elif is_currently_mcwv and rival_clans:
+            # Currently in MCWV — came from rivals
+            embed.add_field(
+                name="\U0001f575 Recruit from Rivals",
+                value=f"Now in **MCWV**, previously in: **{', '.join(rival_clans[:5])}**",
+                inline=False,
+            )
+        elif been_in_mcwv and not is_currently_mcwv:
+            embed.add_field(
+                name="\U0001f451 Former MCWV Member",
+                value=f"Was in MCWV, now in **{current_clan_name}**",
+                inline=False,
+            )
+        elif not been_in_mcwv and (is_currently_rival or rival_clans):
+            embed.add_field(
+                name="\U0001f575 Rival Player",
+                value=f"Never been in MCWV. Current: **{current_clan_name}**",
+                inline=False,
+            )
+
+        # ===== CLANS HISTORY =====
+        if clans_seen:
+            clan_line = " \u2192 ".join(f"**{c}**" for c in clans_seen[:10])
+            if len(clans_seen) > 10:
+                clan_line += f" +{len(clans_seen) - 10}"
+            embed.add_field(name="\U0001f4cb Clan History", value=clan_line, inline=False)
+
+        # ===== SCRAPED CLANS (no per-battle data) =====
+        if clans_from_scrape_only:
+            scrape_line = " \u2192 ".join(f"**{c}**" for c in clans_from_scrape_only[:8])
+            embed.add_field(
+                name="\U0001f50d Also Known In",
+                value=f"{scrape_line}\n_(website scrape \u2014 no battle data)_",
+                inline=False,
+            )
+
+        # ===== WAR HISTORY TABLE =====
+        if rows:
+            table_lines = []
+            for row in rows[:12]:
+                title = _friendly_battle_name(row.get("battleId") or row.get("title") or "?")
+                clan = str(row.get("clan") or "?")
+                pts = _safe_int(row.get("points"))
+                rank = _safe_int(row.get("rank"))
+                total = _safe_int(row.get("total")) or 0
+                place = row.get("clanPlace")
+                medal = " \U0001f949" if row.get("earnedMedal") else ""
+
+                # Rank display: within-clan rank (meaningful), not global
+                if rank > 0 and total > 1:
+                    if rank <= 3:
+                        rank_emoji = ["\U0001f947", "\U0001f948", "\U0001f949"][rank - 1]
+                    elif rank <= 10:
+                        rank_emoji = "\U0001f4aa"
+                    else:
+                        rank_emoji = f"#{rank}"
+                    rank_txt = f" {rank_emoji}/{total}"
+                else:
+                    rank_txt = ""
+
+                # Clan placement
+                place_txt = f" | clan #{int(place)}" if place and place not in (None, "", 0) else ""
+
+                # Highlight MCWV battles
+                clan_display = f"**{clan}**" if clan.upper() == CLAN_NAME.upper() else clan
+
+                table_lines.append(f"{clan_display} \u00b7 {format_points(pts)} pts{rank_txt}{place_txt}{medal}")
+                table_lines.append(f"  _{title}_")
+
+            shown = min(len(rows), 12)
+            embed.add_field(
+                name=f"\U0001f4ca War History ({len(rows)} battles, showing {shown})",
+                value="\n".join(table_lines),
+                inline=False,
+            )
+
+        # ===== PER-CLAN BREAKDOWN =====
+        if len(clans_seen) > 1:
+            breakdown_lines = []
+            for cn in clans_seen[:6]:
+                stats = clan_stats.get(cn, {})
+                battles = stats.get("battles", 0)
+                total_pts = stats.get("total_points", 0)
+                best_pts = stats.get("best_points", 0)
+                medals = stats.get("medals", 0)
+                medal_txt = f" \U0001f949{medals}" if medals else ""
+                breakdown_lines.append(
+                    f"**{cn}**: {battles} battles \u00b7 {format_points(total_pts)} total \u00b7 {format_points(best_pts)} best{medal_txt}"
+                )
+            embed.add_field(name="\U0001f4ca Per-Clan Breakdown", value="\n".join(breakdown_lines), inline=False)
+
+        # ===== PERFORMANCE ANALYSIS =====
         if rank_values:
             best_rank = min(r["rank"] for r in rank_values)
             best_total = next(r["total"] for r in rank_values if r["rank"] == best_rank)
+            best_clan = next(r["clan"] for r in rank_values if r["rank"] == best_rank)
             worst_rank = max(r["rank"] for r in rank_values)
             worst_total = next(r["total"] for r in rank_values if r["rank"] == worst_rank)
             avg_rank = sum(r["rank"] for r in rank_values) / len(rank_values)
@@ -10312,43 +10352,65 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             best_pct = max(r["pct"] for r in rank_values)
 
             embed.add_field(
-                name="\U0001f3c6 Best Rank",
-                value=f"**#{best_rank}**/{best_total} (top {best_pct:.0f}%)",
+                name="\U0001f3c6 Best Finish",
+                value=f"**#{best_rank}**/{best_total} in {best_clan}\n(top {best_pct:.0f}% of clan)",
                 inline=True,
             )
             embed.add_field(
-                name="\U0001f4ca Avg Rank",
+                name="\U0001f4ca Avg Finish",
                 value=f"**#{avg_rank:.0f}** (top {100 - avg_pct:.0f}%)",
                 inline=True,
             )
             embed.add_field(
-                name="\U0001f53b Worst Rank",
+                name="\U0001f53b Worst Finish",
                 value=f"**#{worst_rank}**/{worst_total}",
                 inline=True,
             )
 
-            # Trend analysis — based on rank improvement (lower = better)
+            # Trend
             if len(rank_values) >= 3:
-                recent_ranks = [r["rank"] for r in rank_values[:3]]
-                old_ranks = [r["rank"] for r in rank_values[-3:]]
-                recent_avg_rank = sum(recent_ranks) / len(recent_ranks)
-                old_avg_rank = sum(old_ranks) / len(old_ranks)
-                if recent_avg_rank < old_avg_rank * 0.7:
-                    trend = "\U0001f539 Improving (climbing the ranks)"
-                elif recent_avg_rank > old_avg_rank * 1.3:
-                    trend = "\U0001f53b Declining (slipping in ranks)"
+                recent = [r["rank"] for r in rank_values[:3]]
+                old = [r["rank"] for r in rank_values[-3:]]
+                recent_avg = sum(recent) / len(recent)
+                old_avg = sum(old) / len(old)
+                if recent_avg < old_avg * 0.7:
+                    trend = "\U0001f539 Improving \u2014 climbing the ranks"
+                elif recent_avg > old_avg * 1.3:
+                    trend = "\U0001f53b Declining \u2014 slipping"
                 else:
                     trend = "\u2192 Stable"
                 embed.add_field(name="\U0001f4c9 Trend", value=trend, inline=False)
 
-        # Scan coverage note
+        # ===== ACTIVITY ASSESSMENT =====
+        if rows:
+            latest_battle = rows[0]
+            latest_start = _safe_int(latest_battle.get("startTime"))
+            if latest_start > 0:
+                days_ago = (time.time() - latest_start) / 86400
+                if days_ago < 14:
+                    activity = "\U0001f525 Active \u2014 played in the last 2 weeks"
+                elif days_ago < 60:
+                    activity = "\u2705 Recent \u2014 played in the last 2 months"
+                elif days_ago < 180:
+                    activity = "\U0001f575 Semi-active \u2014 played in the last 6 months"
+                else:
+                    activity = "\U0001f4a8 Inactive \u2014 last played {:.0f} months ago".format(days_ago / 30)
+                embed.add_field(name="\U0001f4a8 Activity", value=activity, inline=False)
+
+        # ===== FOOTER =====
+        data_sources = []
+        if cached_rows:
+            data_sources.append("cache")
+        if live_rows:
+            data_sources.append("live scan")
+        if scraped_clans:
+            data_sources.append("website scrape")
+        source_txt = " + ".join(data_sources) if data_sources else "PS99"
+
         if scan.get("clansScanned"):
-            coverage = f"Scanned **{scan.get('clansScanned')}** clans \u00b7 **{scan.get('battleCount') or 0}** battles"
-            if scan.get("scanSeconds"):
-                coverage += f" \u00b7 {scan.get('scanSeconds')}s scan time"
-            embed.set_footer(text=f"PS99 + top-100 clan scan \u00b7 {coverage} \u00b7 {interaction.user}")
+            embed.set_footer(text=f"{source_txt} \u00b7 {scan.get('clansScanned')} clans \u00b7 {interaction.user}")
         else:
-            embed.set_footer(text=f"PS99 live \u00b7 {interaction.user}")
+            embed.set_footer(text=f"{source_txt} \u00b7 {interaction.user}")
 
         await interaction.followup.send(embed=embed)
 
@@ -10356,6 +10418,7 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         print(f"[checkplayer] error: {e}")
         traceback.print_exc()
         await interaction.followup.send(f"Lookup failed: `{type(e).__name__}`")
+
 
 
 
