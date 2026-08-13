@@ -10986,28 +10986,39 @@ def get_cached_battle_stats(battle_id):
     return None
 
 
-@bot.tree.command(name="scrape_members", description="Scrape db.biggames.io for ALL member lists across top 100 clans (complete clan history)", guild=guild_obj)
+# Hardcoded top-100 clan names as fallback (updated 2026-08-13).
+# Used when the PS99 API is unreachable from Render.
+HARDCODED_TOP_100_CLANS = [
+    "UN0", "SOPU", "C0LD", "RFIL", "H8M3", "GSTG", "0RBI", "XB0X",
+    "_MGW", "BOSS", "ERX", "POPS", "V1LN", "DGSL", "KOHV", "Y0R",
+    "OLDD", "H8ER", "M2NY", "MCWV", "VLP", "BEZE", "R2FF", "D0S",
+    "GANG", "R0W", "S7PY", "ER2X", "FMLY", "KRR", "LXCC", "TPGD",
+    "SULS", "YLW", "NUUP", "CITC", "GDSQ", "ANG_", "UNTY", "AWZY",
+    "HSTL", "EDS1", "L1GO", "1PNK", "M4RB", "FNXX", "BOSK", "JJ07",
+    "212", "WMSY", "GCEM", "H8R2", "SVLW", "LSQ", "KR7X", "L2BR",
+    "AGZY", "J200", "7476", "IDNZ", "AX0C", "K0I7", "OT3R", "R4YO",
+    "ILDK", "DV_", "AX0K", "VNO1", "0FCL", "BYRD", "LX2C", "IFTM",
+    "WRCK", "TSMU", "BETP", "GST2", "NDSS",
+]
+
+
+@bot.tree.command(name="scrape_members", description="Scrape db.biggames.io for ALL member lists across top 100 clans", guild=guild_obj)
 @require_role()
 async def scrape_members_cmd(interaction: discord.Interaction):
-    """Scrape all top-100 clan pages from db.biggames.io to get FULL member lists.
-    This gives us every player who has ever been in each clan — not just top scorers.
-    Run this once (or periodically to update). Takes ~5-10 minutes for 100 clans."""
     await interaction.response.defer(ephemeral=True)
-
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
 
     if not DATABASE_URL:
         return await interaction.followup.send("Database is not available.", ephemeral=True)
 
-    # Open a dedicated connection (immune to other loops closing the global conn)
-    local_conn = None
-    try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        local_conn.autocommit = True
+    # Use a FRESH session for this command (don't rely on the global one)
+    scrape_session = aiohttp.ClientSession()
 
-        # Ensure the table exists
+    # Use a FRESH DB connection (immune to other loops)
+    local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    local_conn.autocommit = True
+
+    try:
+        # Ensure table exists
         with local_conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS cross_clan_members (
@@ -11022,15 +11033,12 @@ async def scrape_members_cmd(interaction: discord.Interaction):
             cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_roblox_idx ON cross_clan_members (roblox_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_clan_idx ON cross_clan_members (clan_name)")
 
-        # Get the list of top 100 clans to scrape
-        clan_names = await fetch_top_clan_names_for_history()
-        if not clan_names:
-            return await interaction.followup.send("Could not fetch the top 100 clan list.", ephemeral=True)
+        # Use hardcoded list (reliable, no API dependency)
+        clan_names = list(HARDCODED_TOP_100_CLANS)
+        print(f"[scrape_members] Starting scrape of {len(clan_names)} clans")
 
         await interaction.followup.send(
-            f"Scraping **{len(clan_names)}** clan pages from db.biggames.io...\n"
-            f"This gets EVERY member who has ever been in each clan.\n"
-            f"Each clan takes ~2-3 seconds. I will update you every 10 clans.",
+            f"Scraping **{len(clan_names)}** clan pages... Updates every 10 clans.",
             ephemeral=True,
         )
 
@@ -11040,31 +11048,32 @@ async def scrape_members_cmd(interaction: discord.Interaction):
 
         for i, clan_name in enumerate(clan_names, 1):
             try:
-                # Fetch the clan page
                 url = f"https://db.biggames.io/clans/{clan_name}"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers={"User-Agent": "Mozilla/5.0"}) as res:
+                async with scrape_session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}) as res:
                     if res.status != 200:
+                        print(f"[scrape_members] {clan_name}: HTTP {res.status}")
                         clans_failed += 1
                         continue
                     html = await res.text()
 
-                # Extract user IDs from the RSC data
-                # The page contains escaped quoted IDs: \"12345678\"
-                import re as _re
+                # Extract user IDs
                 ids = set()
-                for match in _re.findall(r'\\"(\d{7,12})\\"', html):
-                    uid = int(match)
-                    if uid > 1000000:
-                        ids.add(str(match))
-                # Also try unescaped quotes
-                for match in _re.findall(r'"(\d{7,12})"', html):
-                    uid = int(match)
-                    if uid > 1000000:
-                        ids.add(str(match))
+                for match in re.findall(r'\\"(\d{7,12})\\"', html):
+                    try:
+                        uid = int(match)
+                        if uid > 1000000:
+                            ids.add(str(match))
+                    except Exception:
+                        pass
+                for match in re.findall(r'"(\d{7,12})"', html):
+                    try:
+                        uid = int(match)
+                        if uid > 1000000:
+                            ids.add(str(match))
+                    except Exception:
+                        pass
 
                 if ids:
-                    # Store in DB
-                    added = 0
                     with local_conn.cursor() as cur:
                         for uid in ids:
                             cur.execute("""
@@ -11073,51 +11082,50 @@ async def scrape_members_cmd(interaction: discord.Interaction):
                                 ON CONFLICT (roblox_id, clan_name)
                                 DO UPDATE SET last_checked = NOW()
                             """, (uid, clan_name))
-                            added += cur.rowcount
                     local_conn.commit()
                     total_members += len(ids)
                     clans_done += 1
+                    print(f"[scrape_members] {clan_name}: {len(ids)} members")
                 else:
                     clans_failed += 1
+                    print(f"[scrape_members] {clan_name}: no IDs found")
 
-                # Progress update every 10 clans
                 if i % 10 == 0 or i == len(clan_names):
                     try:
                         await interaction.followup.send(
-                            f"[{i}/{len(clan_names)}] Scraped {clans_done} clans ({clans_failed} failed) "
-                            f"— {total_members:,} total member IDs found so far.",
+                            f"[{i}/{len(clan_names)}] {clans_done} done, {clans_failed} failed, {total_members:,} IDs",
                             ephemeral=True,
                         )
                     except Exception:
                         pass
 
-                # Yield to event loop
                 await asyncio.sleep(0.5)
 
             except Exception as exc:
                 clans_failed += 1
-                print(f"[scrape_members] failed for {clan_name}: {exc}")
+                print(f"[scrape_members] {clan_name}: {type(exc).__name__}: {exc}")
+                continue
 
-        # Final summary
-        summary = (
-            f"\nScrape complete!\n"
-            f"Clans scraped: **{clans_done}/{len(clan_names)}** ({clans_failed} failed)\n"
-            f"Total member IDs stored: **{total_members:,}**\n"
-            f"Use `/checkplayer <username>` to see full cross-clan history."
+        await interaction.followup.send(
+            f"Scrape complete! **{clans_done}/{len(clan_names)}** clans, **{total_members:,}** member IDs.",
+            ephemeral=True,
         )
-        await interaction.followup.send(summary, ephemeral=True)
-        print(f"[scrape_members] done: {clans_done} clans, {total_members} members")
+        print(f"[scrape_members] DONE: {clans_done} clans, {total_members} members")
 
     except Exception as e:
-        print(f"[scrape_members] error: {e}")
+        print(f"[scrape_members] FATAL: {e}")
         traceback.print_exc()
-        await interaction.followup.send(f"Scrape failed: `{type(e).__name__}`", ephemeral=True)
+        try:
+            await interaction.followup.send(f"Scrape failed: `{type(e).__name__}`", ephemeral=True)
+        except Exception:
+            pass
     finally:
-        if local_conn is not None:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        await scrape_session.close()
+        try:
+            local_conn.close()
+        except Exception:
+            pass
+
 
 
 
