@@ -2979,17 +2979,25 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 conn = None
 
 def db_enabled():
+    """Auto-connect: opens a connection on demand so Neon can scale to zero
+    between loops instead of staying awake 24/7 from a persistent connection."""
+    if conn is None and DATABASE_URL:
+        ensure_db_connection()
     return conn is not None
 
-if DATABASE_URL:
+# DB connection is opened on demand by db_enabled()/ensure_db_connection().
+# We do NOT connect at import time — that would keep Neon's compute awake 24/7.
+# Table schema is initialized from init_db_schema() on bot ready instead.
+if not DATABASE_URL:
+    print("DATABASE_URL not set - running without DB")
+
+
+def init_db_schema():
+    """Create/alter tables once on bot ready. Safe to call multiple times."""
+    if not db_enabled():
+        return
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = True  # 🔥 important fix
-
-        print("Database connected")
-
         with conn.cursor() as cur:
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     roblox_id TEXT PRIMARY KEY,
@@ -2997,14 +3005,12 @@ if DATABASE_URL:
                     username TEXT
                 )
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_status (
                     roblox_id TEXT PRIMARY KEY,
@@ -3012,7 +3018,6 @@ if DATABASE_URL:
                     updated_at TIMESTAMP
                 )
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_alts (
                     discord_id BIGINT NOT NULL,
@@ -3022,7 +3027,6 @@ if DATABASE_URL:
                     PRIMARY KEY (discord_id, roblox_id)
                 )
             """)
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS player_presence_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -3032,11 +3036,8 @@ if DATABASE_URL:
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-
             cur.execute("CREATE INDEX IF NOT EXISTS player_presence_events_roblox_created_idx ON player_presence_events (roblox_id, created_at DESC)")
-
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT")
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS admin_logs (
                     id BIGSERIAL PRIMARY KEY,
@@ -3050,15 +3051,21 @@ if DATABASE_URL:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
-
         print("DB tables ready")
-
     except Exception as e:
-        print("DB connection failed:", e)
-        conn = None
+        print("DB schema init failed:", e)
 
-else:
-    print("DATABASE_URL not set - running without DB")
+
+def close_db_connection():
+    """Close the DB connection so Neon can scale to zero between loops.
+    Called at the end of each DB-heavy loop iteration."""
+    global conn
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = None
 
 
 def db_add(roblox_id, discord_id, username):
@@ -12668,6 +12675,7 @@ async def check_loop():
 
     except Exception as e:
         print("Loop processing error:", e)
+    close_db_connection()
 
 # ---------------- REMINDER LOOP ----------------
 @tasks.loop(minutes=30)
@@ -12711,6 +12719,7 @@ async def reminder_loop():
 
     except Exception as e:
         print("Reminder loop error:", e)
+    close_db_connection()
 
 # ---------------- PS99 WAR POLL ----------------
 ps99_first_check = True
@@ -12800,6 +12809,7 @@ async def war_poll_loop():
 
     except Exception as e:
         print("War poll error:", e)
+    close_db_connection()
         
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
 @tasks.loop(minutes=10)
@@ -12879,6 +12889,7 @@ async def clan_leave_loop():
 
     except Exception as e:
         print("Clan leave loop error:", e)
+    close_db_connection()
 
 # ---------------- CLAN REVIEW VIEW ----------------
 class ClanReviewView(discord.ui.View):
@@ -15146,6 +15157,7 @@ async def hourly_stats_loop():
         print(f"[hourly stats] card sent to {channel_id} for slot {scheduled_slot.isoformat()}")
     except Exception as exc:
         print(f"[hourly stats] auto-send failed: {exc}")
+    close_db_connection()
 
 
 @hourly_stats_loop.before_loop
@@ -15168,6 +15180,7 @@ async def hourly_player_snapshot_loop():
             print("[hourly stats] player snapshot saved/refreshed")
     except Exception as exc:
         print(f"[hourly stats] player snapshot loop failed: {exc}")
+    close_db_connection()
 
 
 @hourly_player_snapshot_loop.before_loop
@@ -15264,6 +15277,7 @@ async def clan_log_loop():
         await process_clan_logs()
     except Exception as exc:
         print(f"[clan logs] loop failed: {exc}")
+    close_db_connection()
 
 
 @clan_log_loop.before_loop
@@ -15663,6 +15677,7 @@ async def hub_war_collect_loop():
                 print(f"[hub war collector] failed: {data or text[:300]}")
     except Exception as exc:
         print("[hub war collector] error:", exc)
+    close_db_connection()
 
 
 @hub_war_collect_loop.before_loop
@@ -15737,6 +15752,13 @@ async def on_ready():
         return
 
     bot._ready_done = True
+
+    # ---------------- DB SCHEMA INIT ----------------
+    try:
+        init_db_schema()
+        print("✅ DB schema initialized")
+    except Exception as e:
+        print(f"❌ DB schema init error: {e}")
 
     try:
         bot.add_view(MCWVTicketPanelView())
