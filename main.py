@@ -10200,32 +10200,50 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             inline=False,
         )
 
-        # Performance analysis
-        better_values = [float(r.get("betterThan")) for r in rows if isinstance(r.get("betterThan"), (int, float))]
-        point_values = [_safe_int(r.get("points")) for r in rows if _safe_int(r.get("points")) > 0]
+        # Performance analysis — rank-based (more meaningful than raw points
+        # since different wars have different point scales)
+        rank_values = []
+        for r in rows:
+            rk = _safe_int(r.get("rank"))
+            total = _safe_int(r.get("total")) or 1
+            if rk > 0:
+                rank_values.append({"rank": rk, "total": total, "pct": float(r.get("betterThan") or ((total - rk) / total * 100))})
 
-        if better_values:
-            best_pct = max(better_values)
-            avg_pct = sum(better_values) / len(better_values)
-            embed.add_field(name="\U0001f4c8 Best Percentile", value=f"**{best_pct:.1f}%** (outperformed {best_pct:.1f}% of clan)", inline=True)
-            embed.add_field(name="\U0001f4ca Avg Percentile", value=f"**{avg_pct:.1f}%**", inline=True)
+        if rank_values:
+            best_rank = min(r["rank"] for r in rank_values)
+            best_total = next(r["total"] for r in rank_values if r["rank"] == best_rank)
+            worst_rank = max(r["rank"] for r in rank_values)
+            worst_total = next(r["total"] for r in rank_values if r["rank"] == worst_rank)
+            avg_rank = sum(r["rank"] for r in rank_values) / len(rank_values)
+            avg_pct = sum(r["pct"] for r in rank_values) / len(rank_values)
+            best_pct = max(r["pct"] for r in rank_values)
 
-        if point_values:
-            best_pts = max(point_values)
-            worst_pts = min(point_values)
-            avg_pts = sum(point_values) / len(point_values)
-            embed.add_field(name="\U0001f539 Best War", value=f"**{format_points(best_pts)}** pts", inline=True)
-            embed.add_field(name="\U0001f53b Worst War", value=f"**{format_points(worst_pts)}** pts", inline=True)
-            embed.add_field(name="\U0001f4ca Avg/War", value=f"**{format_points(int(avg_pts))}** pts", inline=True)
+            embed.add_field(
+                name="\U0001f3c6 Best Rank",
+                value=f"**#{best_rank}**/{best_total} (top {best_pct:.0f}%)",
+                inline=True,
+            )
+            embed.add_field(
+                name="\U0001f4ca Avg Rank",
+                value=f"**#{avg_rank:.0f}** (top {100 - avg_pct:.0f}%)",
+                inline=True,
+            )
+            embed.add_field(
+                name="\U0001f53b Worst Rank",
+                value=f"**#{worst_rank}**/{worst_total}",
+                inline=True,
+            )
 
-            # Trend analysis
-            if len(point_values) >= 3:
-                recent_avg = sum(point_values[:3]) / 3
-                old_avg = sum(point_values[-3:]) / 3
-                if recent_avg > old_avg * 1.1:
-                    trend = "\U0001f539 Improving (recent avg higher)"
-                elif recent_avg < old_avg * 0.9:
-                    trend = "\U0001f53b Declining (recent avg lower)"
+            # Trend analysis — based on rank improvement (lower = better)
+            if len(rank_values) >= 3:
+                recent_ranks = [r["rank"] for r in rank_values[:3]]
+                old_ranks = [r["rank"] for r in rank_values[-3:]]
+                recent_avg_rank = sum(recent_ranks) / len(recent_ranks)
+                old_avg_rank = sum(old_ranks) / len(old_ranks)
+                if recent_avg_rank < old_avg_rank * 0.7:
+                    trend = "\U0001f539 Improving (climbing the ranks)"
+                elif recent_avg_rank > old_avg_rank * 1.3:
+                    trend = "\U0001f53b Declining (slipping in ranks)"
                 else:
                     trend = "\u2192 Stable"
                 embed.add_field(name="\U0001f4c9 Trend", value=trend, inline=False)
