@@ -10379,8 +10379,9 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             def _scope_label(total):
                 # PS99 clans are capped at 75 members, so a contributor count
                 # <= 100 is a within-clan rank; anything larger is the cross-clan
-                # scan pool (top ~100 clans, not the full global leaderboard).
-                return "of clan" if int(total or 0) <= 100 else "of scanned pool"
+                # leaderboard. After /backfill_global, this is the true global
+                # leaderboard (all 50k+ clans from the sitemap).
+                return "of clan" if int(total or 0) <= 100 else "globally"
 
             sorted_by_perf = sorted(rank_values, key=lambda r: r["pct"], reverse=True)
             best = sorted_by_perf[0]
@@ -10451,9 +10452,9 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         source_txt = " + ".join(data_sources) if data_sources else "PS99"
 
         if scan.get("clansScanned"):
-            embed.set_footer(text=f"{source_txt} \u00b7 top {scan.get('clansScanned')} clans \u00b7 ranks vs scanned pool \u00b7 {interaction.user}")
+            embed.set_footer(text=f"{source_txt} \u00b7 {scan.get('clansScanned')} clans \u00b7 {interaction.user}")
         else:
-            embed.set_footer(text=f"{source_txt} \u00b7 ranks vs scanned pool \u00b7 {interaction.user}")
+            embed.set_footer(text=f"{source_txt} \u00b7 {interaction.user}")
 
         await interaction.followup.send(embed=embed)
 
@@ -11281,6 +11282,380 @@ async def scrape_members_cmd(interaction: discord.Interaction):
     asyncio.create_task(_run_scrape())
 
 
+# ---------------- GLOBAL BACKFILL (all clans from sitemap) ----------------
+# Scans every clan on db.biggames.io (50k+) via the legacy PS99 API, extracts
+# PointContributions for every battle, and rebuilds the cross_clan_player_history
+# table with TRUE global ranks + totalContributors — same data CW Bot has.
+#
+# Two-pass design:
+#   Pass 1: Fetch all clans concurrently, INSERT raw contributions (rank=NULL)
+#   Pass 2: SQL window function computes global rank + total per battle
+
+GLOBAL_BACKFILL_RUNNING = False
+
+
+async def fetch_all_clan_names_from_sitemap():
+    """Fetch every clan name from the db.biggames.io sitemap."""
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.get(
+            "https://db.biggames.io/sitemap.xml?sub=clans",
+            headers={"User-Agent": "MCWV-Bot/1.0"},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as res:
+            if res.status != 200:
+                print(f"[global backfill] sitemap HTTP {res.status}")
+                return []
+            text = await res.text()
+        names = re.findall(r"/clans/([^<]+)", text)
+        cleaned = []
+        seen = set()
+        for name in names:
+            name = name.strip()
+            if name and name not in seen:
+                seen.add(name)
+                cleaned.append(name)
+        print(f"[global backfill] sitemap: {len(cleaned)} clans")
+        return cleaned
+    except Exception as exc:
+        print(f"[global backfill] sitemap fetch failed: {exc}")
+        return []
+
+
+def _insert_raw_contributions(local_conn, rows):
+    """Batch-insert raw contribution rows (rank/total left NULL, set by SQL later)."""
+    if not rows:
+        return 0
+    try:
+        with local_conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO cross_clan_player_history
+                    (roblox_id, battle_id, battle_name, clan_name, points,
+                     clan_place, earned_medal, start_time, cached_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (roblox_id, battle_id, clan_name)
+                DO UPDATE SET
+                    points = GREATEST(cross_clan_player_history.points, EXCLUDED.points),
+                    clan_place = COALESCE(EXCLUDED.clan_place, cross_clan_player_history.clan_place),
+                    earned_medal = cross_clan_player_history.earned_medal OR EXCLUDED.earned_medal,
+                    start_time = COALESCE(EXCLUDED.start_time, cross_clan_player_history.start_time),
+                    cached_at = NOW()
+            """, rows)
+        local_conn.commit()
+        return len(rows)
+    except Exception as exc:
+        try:
+            local_conn.rollback()
+        except Exception:
+            pass
+        print(f"[global backfill] insert failed: {exc}")
+        return 0
+
+
+def _compute_global_ranks_sql(local_conn):
+    """Pass 2: compute true global rank + total per battle via SQL window function."""
+    try:
+        with local_conn.cursor() as cur:
+            cur.execute("""
+                WITH ranked AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY battle_id
+                               ORDER BY points DESC, roblox_id ASC
+                           ) AS global_rank,
+                           COUNT(*) OVER (PARTITION BY battle_id) AS global_total
+                    FROM cross_clan_player_history
+                )
+                UPDATE cross_clan_player_history h
+                SET rank = r.global_rank,
+                    total_contributors = r.global_total
+                FROM ranked r
+                WHERE h.id = r.id
+            """)
+            updated = cur.rowcount
+        local_conn.commit()
+        return updated
+    except Exception as exc:
+        try:
+            local_conn.rollback()
+        except Exception:
+            pass
+        print(f"[global backfill] rank computation failed: {exc}")
+        return 0
+
+
+@bot.tree.command(name="backfill_global", description="Scan ALL clans (50k+) for true global battle ranks — takes ~30min, runs in background", guild=guild_obj)
+@require_role()
+async def backfill_global_cmd(interaction: discord.Interaction):
+    global GLOBAL_BACKFILL_RUNNING
+    await interaction.response.defer(ephemeral=True)
+
+    if GLOBAL_BACKFILL_RUNNING:
+        return await interaction.followup.send("Global backfill is already running. Check logs for progress.", ephemeral=True)
+
+    if not DATABASE_URL:
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    GLOBAL_BACKFILL_RUNNING = True
+    await interaction.followup.send(
+        "Starting global backfill... This scans all 50k+ clans from the sitemap and may take ~30 minutes.\n"
+        "The bot stays fully responsive. Progress is logged to console.\n"
+        "When done, `/checkplayer` will show true global ranks.",
+        ephemeral=True,
+    )
+    asyncio.create_task(_run_global_backfill(interaction.channel_id))
+
+
+@bot.tree.command(name="backfill_status", description="Check if the global backfill is running and see cache stats", guild=guild_obj)
+@require_role()
+async def backfill_status_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    running = GLOBAL_BACKFILL_RUNNING
+    if not db_enabled():
+        return await interaction.followup.send(f"Backfill running: **{'yes' if running else 'no'}**\nDatabase not available for stats.", ephemeral=True)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(DISTINCT battle_id), COUNT(DISTINCT roblox_id), COUNT(*) FROM cross_clan_player_history")
+            battles, players, rows = cur.fetchone()
+            cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC NULLS LAST LIMIT 5")
+            top = cur.fetchall()
+        close_db_connection()
+
+        lines = [f"Backfill running: **{'yes' if running else 'no'}**"]
+        lines.append(f"Battles cached: **{battles}**")
+        lines.append(f"Unique players: **{players:,}**")
+        lines.append(f"Total rows: **{rows:,}**")
+        if top:
+            lines.append("\n**Top battles by contributor count:**")
+            for bid, total in top:
+                lines.append(f"  {bid}: {total:,} contributors" if total else f"  {bid}: (no rank data)")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    except Exception as e:
+        close_db_connection()
+        await interaction.followup.send(f"Backfill running: **{'yes' if running else 'no'}**\nStats error: `{e}`", ephemeral=True)
+
+
+async def _fetch_clan_contributions(scan_session, clan_name):
+    """Fetch one clan's legacy data and extract all battle contributions as raw rows."""
+    try:
+        async with scan_session.get(
+            f"{PS99_API}/api/clan/{clan_name}",
+            headers={"User-Agent": "MCWV-Bot/1.0"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as res:
+            if res.status != 200:
+                return []
+            payload = await res.json(content_type=None)
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict) or not data:
+            return []
+
+        battles = data.get("Battles") or data.get("battles") or {}
+        if not isinstance(battles, dict) or not battles:
+            return []
+
+        rows = []
+        for battle_id, battle in battles.items():
+            if not isinstance(battle, dict):
+                continue
+            contribs = battle.get("PointContributions") or battle.get("pointContributions") or []
+            if not isinstance(contribs, list) or not contribs:
+                continue
+
+            clan_place = battle.get("Place") or battle.get("place")
+            clan_place_int = int(clan_place) if isinstance(clan_place, (int, float)) and clan_place else None
+            earned_medal = bool(battle.get("EarnedMedal") or battle.get("earnedMedal"))
+            start_time = _safe_int(battle.get("StartTime") or battle.get("startTime"))
+            battle_id_str = str(battle_id)
+            battle_name = str(battle.get("Title") or battle_id_str)
+
+            for c in contribs:
+                if not isinstance(c, dict):
+                    continue
+                uid = str(c.get("UserID") or c.get("userId") or c.get("UserId") or "").strip()
+                if not uid:
+                    continue
+                pts = _safe_int(c.get("Points") or c.get("points"))
+                if pts <= 0:
+                    continue
+                rows.append((
+                    uid, battle_id_str, battle_name, str(clan_name),
+                    pts, clan_place_int, earned_medal,
+                    start_time if start_time > 0 else None,
+                ))
+        return rows
+    except asyncio.TimeoutError:
+        return []
+    except Exception:
+        return []
+
+
+async def _run_global_backfill(progress_channel_id):
+    """Background task: scan all clans, rebuild global battle leaderboards."""
+    global GLOBAL_BACKFILL_RUNNING
+
+    scan_session = aiohttp.ClientSession()
+    local_conn = None
+    started = time.time()
+
+    try:
+        # 1. Fetch sitemap
+        clan_names = await fetch_all_clan_names_from_sitemap()
+        if not clan_names:
+            print("[global backfill] no clans from sitemap, aborting")
+            return
+
+        # 2. Open a local DB connection (avoids race condition with other loops)
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        local_conn.autocommit = False
+
+        # Ensure the table exists before inserting
+        try:
+            with local_conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS cross_clan_player_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        roblox_id TEXT NOT NULL,
+                        battle_id TEXT NOT NULL,
+                        battle_name TEXT,
+                        clan_name TEXT NOT NULL,
+                        points BIGINT NOT NULL DEFAULT 0,
+                        rank INTEGER,
+                        total_contributors INTEGER,
+                        clan_place INTEGER,
+                        earned_medal BOOLEAN DEFAULT FALSE,
+                        start_time BIGINT,
+                        cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (roblox_id, battle_id, clan_name)
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_clan_idx ON cross_clan_player_history (clan_name, battle_id)")
+            local_conn.commit()
+        except Exception:
+            try:
+                local_conn.rollback()
+            except Exception:
+                pass
+
+        # 3. Concurrent scan: process in batches of CONCURRENCY clans at a time
+        CONCURRENCY = 8
+        INSERT_EVERY = 200  # commit to DB every 200 clans
+        clans_done = 0
+        clans_with_data = 0
+        clans_failed = 0
+        total_contribs = 0
+        pending_rows = []
+
+        print(f"[global backfill] starting scan of {len(clan_names)} clans ({CONCURRENCY} concurrent)")
+
+        for batch_start in range(0, len(clan_names), CONCURRENCY):
+            batch = clan_names[batch_start:batch_start + CONCURRENCY]
+            # Fetch all clans in this batch concurrently
+            results = await asyncio.gather(
+                *(_fetch_clan_contributions(scan_session, name) for name in batch),
+                return_exceptions=True,
+            )
+
+            for rows in results:
+                if isinstance(rows, Exception):
+                    clans_failed += 1
+                elif rows:
+                    clans_with_data += 1
+                    total_contribs += len(rows)
+                    pending_rows.extend(rows)
+                else:
+                    clans_failed += 1
+                clans_done += 1
+
+            # Batch-insert when buffer is large enough or every INSERT_EVERY clans
+            if len(pending_rows) >= 5000 or clans_done % INSERT_EVERY == 0:
+                if pending_rows:
+                    _insert_raw_contributions(local_conn, pending_rows)
+                    pending_rows.clear()
+
+            # Progress log every 500 clans
+            if clans_done % 500 == 0:
+                elapsed = time.time() - started
+                rate = clans_done / elapsed if elapsed > 0 else 0
+                remaining = (len(clan_names) - clans_done) / rate if rate > 0 else 0
+                print(
+                    f"[global backfill] {clans_done}/{len(clan_names)} clans "
+                    f"({clans_with_data} with data, {total_contribs:,} contribs, {clans_failed} failed) "
+                    f"| {rate:.1f} clans/s | ETA {remaining/60:.0f}min"
+                )
+                # Yield to event loop so heartbeats are acked
+                await asyncio.sleep(0)
+
+        # Insert any remaining rows
+        if pending_rows:
+            _insert_raw_contributions(local_conn, pending_rows)
+            pending_rows.clear()
+
+        elapsed_scan = time.time() - started
+        print(f"[global backfill] scan done in {elapsed_scan/60:.1f}min. Computing global ranks via SQL...")
+
+        # 4. Pass 2: compute global ranks
+        ranked = _compute_global_ranks_sql(local_conn)
+        elapsed_total = time.time() - started
+
+        # 5. Count results
+        try:
+            with local_conn.cursor() as cur:
+                cur.execute("SELECT COUNT(DISTINCT battle_id) FROM cross_clan_player_history")
+                battle_count = int(cur.fetchone()[0] or 0)
+                cur.execute("SELECT COUNT(DISTINCT roblox_id) FROM cross_clan_player_history")
+                player_count = int(cur.fetchone()[0] or 0)
+                cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC LIMIT 5")
+                top_battles = cur.fetchall()
+        except Exception:
+            battle_count = 0
+            player_count = 0
+            top_battles = []
+
+        summary = (
+            f"Global backfill complete!\n"
+            f"Clans scanned: **{clans_done:,}/{len(clan_names):,}** ({clans_with_data:,} with battle data)\n"
+            f"Battles cached: **{battle_count}**\n"
+            f"Unique players: **{player_count:,}**\n"
+            f"Total contribution rows: **{ranked:,}**\n"
+            f"Time: **{elapsed_total/60:.1f} minutes**\n"
+        )
+        if top_battles:
+            summary += "\n**Top battles by contributor count:**\n"
+            for bid, total in top_battles:
+                summary += f"  {bid}: {total:,} contributors\n"
+        summary += "\n`/checkplayer` now shows true global ranks. 🎯"
+
+        print(f"[global backfill] {summary}")
+
+        # Send summary to channel
+        try:
+            ch = bot.get_channel(progress_channel_id)
+            if ch is None:
+                ch = await bot.fetch_channel(progress_channel_id)
+            if ch:
+                await ch.send(summary)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[global backfill] FATAL: {e}")
+        traceback.print_exc()
+    finally:
+        GLOBAL_BACKFILL_RUNNING = False
+        await scan_session.close()
+        if local_conn is not None:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 @bot.tree.command(name="backfill_history", description="Backfill all historical war data into the permanent cross-clan cache", guild=guild_obj)
