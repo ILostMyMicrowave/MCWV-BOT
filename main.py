@@ -7893,7 +7893,7 @@ async def fetch_ps99_player_war_history(roblox_id):
         "summary": summary if isinstance(summary, dict) else None,
         "activeBattleId": summary_data.get("activeBattleId") if isinstance(summary_data, dict) else None,
         "sampledClans": summary_data.get("sampledClans") if isinstance(summary_data, dict) else None,
-        "battles": player_rows[:13],
+        "battles": player_rows[:20],
         "scan": {
             "mode": f"Top {top_index.get('limit', TOP_CLAN_HISTORY_LIMIT)} legacy clan scan" if isinstance(top_index, dict) else "Top clan scan",
             "clansScanned": len(top_index.get("clansScanned", [])) if isinstance(top_index, dict) else 0,
@@ -10125,6 +10125,19 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         if CLAN_NAME.upper() in top_100_clans:
             extra_clans_to_check.add(CLAN_NAME)
 
+        # Also check clans from the website scrape — the player may have battle
+        # data in previous clans that we'd miss if we only check current + MCWV.
+        # Cap at 5 extra clans to avoid excessive API calls.
+        try:
+            scraped_clans_preview = get_cached_clan_memberships(roblox_id)
+            for sc in scraped_clans_preview:
+                if sc.upper() in top_100_clans and sc.upper() not in {c.upper() for c in extra_clans_to_check}:
+                    extra_clans_to_check.add(sc)
+                    if len(extra_clans_to_check) >= 7:  # current + MCWV + 5 scraped
+                        break
+        except Exception:
+            pass
+
         for clan_to_check in extra_clans_to_check:
             try:
                 extra_clan_data = await _fetch_clan_data(clan_to_check)
@@ -10288,7 +10301,10 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         # ===== WAR HISTORY TABLE =====
         if rows:
             table_lines = []
-            for row in rows[:12]:
+            # Discord embed field values are capped at 1024 chars. Build lines
+            # for up to 20 battles but stop early if we'd overflow.
+            MAX_FIELD_LEN = 1020
+            for row in rows[:20]:
                 title = _friendly_battle_name(row.get("battleId") or row.get("title") or "?")
                 clan = str(row.get("clan") or "?")
                 pts = _safe_int(row.get("points"))
@@ -10297,8 +10313,12 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
                 place = row.get("clanPlace")
                 medal = " \U0001f949" if row.get("earnedMedal") else ""
 
-                # Rank display: within-clan rank (meaningful), not global
+                # Rank + "Better Than" % — same metric CW Bot uses.
+                # pct = betterThan = share of contributors outperformed.
+                # "top X%" = 100 - pct (lower = better).
                 if rank > 0 and total > 1:
+                    pct = float(row.get("betterThan") or ((total - rank) / total * 100))
+                    top_pct = 100 - pct
                     if rank <= 3:
                         rank_emoji = ["\U0001f947", "\U0001f948", "\U0001f949"][rank - 1]
                     elif rank <= 10:
@@ -10306,8 +10326,10 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
                     else:
                         rank_emoji = f"#{rank}"
                     rank_txt = f" {rank_emoji}/{total}"
+                    better_txt = f" \u00b7 top {top_pct:.0f}%"
                 else:
                     rank_txt = ""
+                    better_txt = ""
 
                 # Clan placement
                 place_txt = f" | clan #{int(place)}" if place and place not in (None, "", 0) else ""
@@ -10315,13 +10337,19 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
                 # Highlight MCWV battles
                 clan_display = f"**{clan}**" if clan.upper() == CLAN_NAME.upper() else clan
 
-                table_lines.append(f"{clan_display} \u00b7 {format_points(pts)} pts{rank_txt}{place_txt}{medal}")
-                table_lines.append(f"  _{title}_")
+                line1 = f"{clan_display} \u00b7 {format_points(pts)} pts{rank_txt}{better_txt}{place_txt}{medal}"
+                line2 = f"  _{title}_"
+                # Check if adding these 2 lines would overflow the field
+                projected = len("\n".join(table_lines + [line1, line2]))
+                if projected > MAX_FIELD_LEN:
+                    break
+                table_lines.append(line1)
+                table_lines.append(line2)
 
-            shown = min(len(rows), 12)
+            shown = len(table_lines) // 2
             embed.add_field(
                 name=f"\U0001f4ca War History ({len(rows)} battles, showing {shown})",
-                value="\n".join(table_lines),
+                value="\n".join(table_lines) or "No battle data.",
                 inline=False,
             )
 
@@ -10342,18 +10370,30 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
 
         # ===== PERFORMANCE ANALYSIS =====
         if rank_values:
-            best_rank = min(r["rank"] for r in rank_values)
-            best_total = next(r["total"] for r in rank_values if r["rank"] == best_rank)
-            best_clan = next(r["clan"] for r in rank_values if r["rank"] == best_rank)
-            worst_rank = max(r["rank"] for r in rank_values)
-            worst_total = next(r["total"] for r in rank_values if r["rank"] == worst_rank)
+            # "pct" stored above is betterThan = share of the field the player
+            # outperformed = (total - rank) / total. The intuitive "top X%"
+            # framing is the inverse: top% = 100 - betterThan (lower = better).
+            # Raw rank numbers are NOT comparable across battles of different
+            # sizes (#1964/2645 is a worse relative finish than #3371/7374), so
+            # Best/Worst are ranked by PERCENTILE with the percentile shown first.
+            def _scope_label(total):
+                # PS99 clans are capped at 75 members, so a contributor count
+                # <= 100 is a within-clan rank; anything larger is the cross-clan
+                # scan pool (top ~100 clans, not the full global leaderboard).
+                return "of clan" if int(total or 0) <= 100 else "of scanned pool"
+
+            sorted_by_perf = sorted(rank_values, key=lambda r: r["pct"], reverse=True)
+            best = sorted_by_perf[0]
+            worst = sorted_by_perf[-1]
             avg_rank = sum(r["rank"] for r in rank_values) / len(rank_values)
             avg_pct = sum(r["pct"] for r in rank_values) / len(rank_values)
-            best_pct = max(r["pct"] for r in rank_values)
 
             embed.add_field(
                 name="\U0001f3c6 Best Finish",
-                value=f"**#{best_rank}**/{best_total} in {best_clan}\n(top {best_pct:.0f}% of clan)",
+                value=(
+                    f"top {100 - best['pct']:.0f}% {_scope_label(best['total'])}\n"
+                    f"**#{best['rank']}**/{best['total']} in {best['clan']}"
+                ),
                 inline=True,
             )
             embed.add_field(
@@ -10363,7 +10403,10 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             )
             embed.add_field(
                 name="\U0001f53b Worst Finish",
-                value=f"**#{worst_rank}**/{worst_total}",
+                value=(
+                    f"top {100 - worst['pct']:.0f}% {_scope_label(worst['total'])}\n"
+                    f"**#{worst['rank']}**/{worst['total']}"
+                ),
                 inline=True,
             )
 
@@ -10408,9 +10451,9 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         source_txt = " + ".join(data_sources) if data_sources else "PS99"
 
         if scan.get("clansScanned"):
-            embed.set_footer(text=f"{source_txt} \u00b7 {scan.get('clansScanned')} clans \u00b7 {interaction.user}")
+            embed.set_footer(text=f"{source_txt} \u00b7 top {scan.get('clansScanned')} clans \u00b7 ranks vs scanned pool \u00b7 {interaction.user}")
         else:
-            embed.set_footer(text=f"{source_txt} \u00b7 {interaction.user}")
+            embed.set_footer(text=f"{source_txt} \u00b7 ranks vs scanned pool \u00b7 {interaction.user}")
 
         await interaction.followup.send(embed=embed)
 
