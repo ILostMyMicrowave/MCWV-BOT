@@ -10334,17 +10334,44 @@ def ensure_cross_clan_history_table():
 
 async def cache_battle_contributors(battle_id):
     """Fetch and cache ALL contributor data for a single battle.
-    Combines the v1/clans/battles endpoint (top 200 globally) with
-    each top-100 clan's legacy PointContributions to get maximum coverage.
+    Uses its OWN DB connection so other loops closing the global conn
+    can't interrupt the cache mid-write.
     Returns the number of rows cached."""
-    if not battle_id or not db_enabled():
+    if not battle_id or not DATABASE_URL:
         return 0
 
-    ensure_cross_clan_history_table()
-    battle_name = _friendly_battle_name(battle_id)
-    cached_count = 0
-
+    # Open a dedicated connection for this battle cache operation.
+    local_conn = None
     try:
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        local_conn.autocommit = True
+
+        # Ensure the table exists on this connection
+        with local_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_player_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    battle_id TEXT NOT NULL,
+                    battle_name TEXT,
+                    clan_name TEXT NOT NULL,
+                    points BIGINT NOT NULL DEFAULT 0,
+                    rank INTEGER,
+                    total_contributors INTEGER,
+                    clan_place INTEGER,
+                    earned_medal BOOLEAN DEFAULT FALSE,
+                    start_time BIGINT,
+                    cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (roblox_id, battle_id, clan_name)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_clan_idx ON cross_clan_player_history (clan_name, battle_id)")
+
+        battle_name = _friendly_battle_name(battle_id)
+        cached_count = 0
+
         global session
         if session is None or session.closed:
             session = aiohttp.ClientSession()
@@ -10462,7 +10489,7 @@ async def cache_battle_contributors(battle_id):
 
         # Insert into DB (upsert — update if exists with higher points)
         if best_rows:
-            with conn.cursor() as cur:
+            with local_conn.cursor() as cur:
                 for row in best_rows.values():
                     cur.execute("""
                         INSERT INTO cross_clan_player_history
@@ -10486,7 +10513,7 @@ async def cache_battle_contributors(battle_id):
                         row["total_contributors"], row["clan_place"],
                         row["earned_medal"], row["start_time"],
                     ))
-            conn.commit()
+            local_conn.commit()
             cached_count = len(best_rows)
 
         print(f"[cross-clan cache] {battle_id}: cached {cached_count} contributor rows")
@@ -10495,11 +10522,17 @@ async def cache_battle_contributors(battle_id):
     except Exception as e:
         print(f"[cross-clan cache] failed for {battle_id}: {e}")
         try:
-            if conn is not None:
-                conn.rollback()
+            if local_conn is not None:
+                local_conn.rollback()
         except Exception:
             pass
         return 0
+    finally:
+        if local_conn is not None:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 async def get_all_battle_ids():
