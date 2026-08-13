@@ -11363,38 +11363,53 @@ def _insert_raw_contributions(local_conn, rows):
 
 
 def _compute_global_ranks_sql(local_conn):
-    """Pass 2: compute true global rank + total per battle via SQL window function."""
+    """Pass 2: compute true global rank + total per battle.
+    Done per-battle in a loop to avoid Neon statement timeouts on 888k+ rows."""
     try:
         with local_conn.cursor() as cur:
-            # First count how many rows have NULL ranks (need computing)
-            cur.execute("SELECT COUNT(*) FROM cross_clan_player_history WHERE rank IS NULL")
-            null_count = int(cur.fetchone()[0] or 0)
-            print(f"[global backfill] computing ranks for {null_count:,} NULL rows + recompute all...")
-
-            # For each battle, rank all contributors by points descending.
-            # Also compute the true total per battle. This updates ALL rows
-            # (not just NULL ones) so existing scan-pool ranks get overwritten
-            # with true global ranks.
+            # Get all battle IDs and their actual row counts
             cur.execute("""
-                WITH ranked AS (
-                    SELECT id,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY battle_id
-                               ORDER BY points DESC, roblox_id ASC
-                           ) AS global_rank,
-                           COUNT(*) OVER (PARTITION BY battle_id) AS global_total
-                    FROM cross_clan_player_history
-                )
-                UPDATE cross_clan_player_history h
-                SET rank = r.global_rank,
-                    total_contributors = r.global_total
-                FROM ranked r
-                WHERE h.id = r.id
+                SELECT battle_id, COUNT(*) as actual_total
+                FROM cross_clan_player_history
+                GROUP BY battle_id
             """)
-            updated = cur.rowcount
-        local_conn.commit()
-        print(f"[global backfill] rank computation complete: {updated:,} rows updated")
-        return updated
+            battles = cur.fetchall()
+
+        print(f"[global backfill] computing ranks for {len(battles)} battles...")
+        total_updated = 0
+
+        for battle_id, actual_total in battles:
+            try:
+                with local_conn.cursor() as cur:
+                    # Window function per battle — small, fast, no timeout
+                    cur.execute("""
+                        WITH ranked AS (
+                            SELECT id,
+                                   ROW_NUMBER() OVER (
+                                       ORDER BY points DESC, roblox_id ASC
+                                   ) AS global_rank,
+                                   %s AS global_total
+                            FROM cross_clan_player_history
+                            WHERE battle_id = %s
+                        )
+                        UPDATE cross_clan_player_history h
+                        SET rank = r.global_rank,
+                            total_contributors = r.global_total
+                        FROM ranked r
+                        WHERE h.id = r.id
+                    """, (actual_total, battle_id))
+                    updated = cur.rowcount
+                local_conn.commit()
+                total_updated += updated if updated > 0 else 0
+            except Exception as exc:
+                try:
+                    local_conn.rollback()
+                except Exception:
+                    pass
+                print(f"[global backfill] rank failed for {battle_id}: {exc}")
+
+        print(f"[global backfill] rank computation complete: {total_updated:,} rows updated across {len(battles)} battles")
+        return total_updated
     except Exception as exc:
         try:
             local_conn.rollback()
