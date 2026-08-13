@@ -2972,6 +2972,7 @@ ps99_first_check = True       # suppresses announcement on first poll (mid-war s
 # DATABASE ------------------------------
 
 import psycopg2
+from psycopg2.extras import execute_values
 import os
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -11332,16 +11333,17 @@ async def fetch_all_clan_names_from_sitemap(scan_session=None):
 
 
 def _insert_raw_contributions(local_conn, rows):
-    """Batch-insert raw contribution rows (rank/total left NULL, set by SQL later)."""
+    """Batch-insert raw contribution rows using execute_values (one INSERT, not N).
+    Called via asyncio.to_thread() so it never blocks the event loop."""
     if not rows:
         return 0
     try:
         with local_conn.cursor() as cur:
-            cur.executemany("""
+            execute_values(cur, """
                 INSERT INTO cross_clan_player_history
                     (roblox_id, battle_id, battle_name, clan_name, points,
                      clan_place, earned_medal, start_time, cached_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES %s
                 ON CONFLICT (roblox_id, battle_id, clan_name)
                 DO UPDATE SET
                     points = GREATEST(cross_clan_player_history.points, EXCLUDED.points),
@@ -11349,7 +11351,7 @@ def _insert_raw_contributions(local_conn, rows):
                     earned_medal = cross_clan_player_history.earned_medal OR EXCLUDED.earned_medal,
                     start_time = COALESCE(EXCLUDED.start_time, cross_clan_player_history.start_time),
                     cached_at = NOW()
-            """, rows)
+            """, rows, page_size=1000)
         local_conn.commit()
         return len(rows)
     except Exception as exc:
@@ -11530,35 +11532,37 @@ async def _run_global_backfill(progress_channel_id):
         local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
         local_conn.autocommit = False
 
-        # Ensure the table exists before inserting
-        try:
-            with local_conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS cross_clan_player_history (
-                        id BIGSERIAL PRIMARY KEY,
-                        roblox_id TEXT NOT NULL,
-                        battle_id TEXT NOT NULL,
-                        battle_name TEXT,
-                        clan_name TEXT NOT NULL,
-                        points BIGINT NOT NULL DEFAULT 0,
-                        rank INTEGER,
-                        total_contributors INTEGER,
-                        clan_place INTEGER,
-                        earned_medal BOOLEAN DEFAULT FALSE,
-                        start_time BIGINT,
-                        cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        UNIQUE (roblox_id, battle_id, clan_name)
-                    )
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
-                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
-                cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_clan_idx ON cross_clan_player_history (clan_name, battle_id)")
-            local_conn.commit()
-        except Exception:
+        # Ensure the table exists before inserting (off the event loop)
+        def _ensure_table():
             try:
-                local_conn.rollback()
+                with local_conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS cross_clan_player_history (
+                            id BIGSERIAL PRIMARY KEY,
+                            roblox_id TEXT NOT NULL,
+                            battle_id TEXT NOT NULL,
+                            battle_name TEXT,
+                            clan_name TEXT NOT NULL,
+                            points BIGINT NOT NULL DEFAULT 0,
+                            rank INTEGER,
+                            total_contributors INTEGER,
+                            clan_place INTEGER,
+                            earned_medal BOOLEAN DEFAULT FALSE,
+                            start_time BIGINT,
+                            cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            UNIQUE (roblox_id, battle_id, clan_name)
+                        )
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_clan_idx ON cross_clan_player_history (clan_name, battle_id)")
+                local_conn.commit()
             except Exception:
-                pass
+                try:
+                    local_conn.rollback()
+                except Exception:
+                    pass
+        await asyncio.to_thread(_ensure_table)
 
         # 3. Concurrent scan: process in batches of CONCURRENCY clans at a time
         CONCURRENCY = 8
@@ -11593,7 +11597,7 @@ async def _run_global_backfill(progress_channel_id):
             # Batch-insert when buffer is large enough or every INSERT_EVERY clans
             if len(pending_rows) >= 5000 or clans_done % INSERT_EVERY == 0:
                 if pending_rows:
-                    _insert_raw_contributions(local_conn, pending_rows)
+                    await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
                     pending_rows.clear()
 
             # Progress log every 500 clans
@@ -11611,29 +11615,30 @@ async def _run_global_backfill(progress_channel_id):
 
         # Insert any remaining rows
         if pending_rows:
-            _insert_raw_contributions(local_conn, pending_rows)
+            await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
             pending_rows.clear()
 
         elapsed_scan = time.time() - started
         print(f"[global backfill] scan done in {elapsed_scan/60:.1f}min. Computing global ranks via SQL...")
 
-        # 4. Pass 2: compute global ranks
-        ranked = _compute_global_ranks_sql(local_conn)
+        # 4. Pass 2: compute global ranks (off the event loop — this is a big UPDATE)
+        ranked = await asyncio.to_thread(_compute_global_ranks_sql, local_conn)
         elapsed_total = time.time() - started
 
-        # 5. Count results
-        try:
-            with local_conn.cursor() as cur:
-                cur.execute("SELECT COUNT(DISTINCT battle_id) FROM cross_clan_player_history")
-                battle_count = int(cur.fetchone()[0] or 0)
-                cur.execute("SELECT COUNT(DISTINCT roblox_id) FROM cross_clan_player_history")
-                player_count = int(cur.fetchone()[0] or 0)
-                cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC LIMIT 5")
-                top_battles = cur.fetchall()
-        except Exception:
-            battle_count = 0
-            player_count = 0
-            top_battles = []
+        # 5. Count results (also off the event loop)
+        def _count_results():
+            try:
+                with local_conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(DISTINCT battle_id) FROM cross_clan_player_history")
+                    bc = int(cur.fetchone()[0] or 0)
+                    cur.execute("SELECT COUNT(DISTINCT roblox_id) FROM cross_clan_player_history")
+                    pc = int(cur.fetchone()[0] or 0)
+                    cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC LIMIT 5")
+                    tb = cur.fetchall()
+                return bc, pc, tb
+            except Exception:
+                return 0, 0, []
+        battle_count, player_count, top_battles = await asyncio.to_thread(_count_results)
 
         summary = (
             f"Global backfill complete!\n"
