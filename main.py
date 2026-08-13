@@ -9331,6 +9331,407 @@ async def toggle_automation(interaction: discord.Interaction, system: app_comman
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+# ---------------- CROSS-CLAN SPY ----------------
+# Fetch rival clan data from PS99 + clan_history PPH to give officers
+# real-time intel on competitors.
+
+def _normalize_clan_name(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+async def _fetch_clan_data(clan_name):
+    """Fetch any clan's data from PS99 API. Returns the 'data' dict or None."""
+    name = str(clan_name or "").strip()
+    if not name:
+        return None
+    payload = await fetch_json_for_placement(f"{PS99_API}/api/clan/{name}")
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data", {})
+    return data if isinstance(data, dict) and data else None
+
+
+async def _get_clan_pph_from_history(clan_name, battle_id):
+    """Compute a rival clan's PPH from clan_history (last 60 min of snapshots).
+    Returns None if we don't have enough data."""
+    if not battle_id or not db_enabled():
+        return None
+    try:
+        battle_key = normalize_hourly_battle_key(battle_id)
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT points, captured_at
+                   FROM clan_history
+                   WHERE battle_id = %s
+                     AND LOWER(clan_name) = LOWER(%s)
+                     AND captured_at >= NOW() - INTERVAL '3 hours'
+                   ORDER BY captured_at ASC""",
+                (battle_key, clan_name),
+            )
+            rows = cur.fetchall()
+        if not rows or len(rows) < 2:
+            return None
+
+        latest = rows[-1]
+        latest_pts = int(latest[0] or 0)
+        latest_ms = latest[1].timestamp() * 1000 if hasattr(latest[1], "timestamp") else 0
+
+        cutoff_ms = latest_ms - 60 * 60 * 1000
+        baseline = None
+        for row in rows:
+            row_ms = row[1].timestamp() * 1000 if hasattr(row[1], "timestamp") else 0
+            if row_ms <= cutoff_ms:
+                baseline = int(row[0] or 0)
+        if baseline is None:
+            return None
+        return max(0, latest_pts - baseline)
+    except Exception as exc:
+        print(f"[spy] clan PPH lookup failed for {clan_name}: {exc}")
+        return None
+
+
+async def _get_clan_rank_from_standings(clan_name):
+    """Get a clan's rank from the PS99 top-100 leaderboard."""
+    payload = await fetch_json_for_placement(
+        f"{PS99_API}/api/clans?page=1&pageSize=100&sort=Points&sortOrder=desc"
+    )
+    if not isinstance(payload, dict):
+        return None, None
+    rows = payload.get("data", [])
+    if not isinstance(rows, list):
+        return None, None
+    target = _normalize_clan_name(clan_name)
+    for i, row in enumerate(rows):
+        name = str(row.get("Name") or row.get("name") or "")
+        if _normalize_clan_name(name) == target:
+            pts = int(row.get("Points") or row.get("points") or 0)
+            return i + 1, pts
+    return None, None
+
+
+@bot.tree.command(name="spy", description="Spy on a rival clan - members, points, PPH, top contributors", guild=guild_obj)
+@app_commands.describe(clan_name="Clan tag to spy on (e.g. ABCD)")
+@require_role()
+async def spy(interaction: discord.Interaction, clan_name: str):
+    await interaction.response.defer()
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    clan_name = clan_name.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]{1,8}", clan_name):
+        return await interaction.followup.send(f"Invalid clan tag `{clan_name}`. Use 1-8 letters/numbers.")
+
+    try:
+        data = await _fetch_clan_data(clan_name)
+        if not data:
+            return await interaction.followup.send(f"Could not find clan `{clan_name}` on PS99.")
+
+        name = data.get("Name", clan_name)
+        members = data.get("Members", [])
+        if not isinstance(members, list):
+            members = []
+        member_count = len(members)
+        member_capacity = int(data.get("MemberCapacity") or 0)
+
+        level = pick_first_int(data, ("Level", "ClanLevel", "level", "Lvl"))
+        gem_candidates = [data.get("Diamonds"), data.get("Bank"), data.get("ClanBank"), data.get("TotalDiamonds")]
+        gems = next((int(g) for g in gem_candidates if isinstance(g, (int, float)) and int(g) > 0), None)
+
+        battle_id = await get_active_battle_id_for_placement()
+        battles = data.get("Battles", {})
+        if not isinstance(battles, dict):
+            battles = {}
+
+        battle = None
+        if battle_id:
+            battle = battles.get(battle_id) or battles.get(str(battle_id))
+            if not battle:
+                norm = normalize_hourly_battle_key(battle_id)
+                battle = next((v for k, v in battles.items() if normalize_hourly_battle_key(k) == norm), None)
+
+        total_points = None
+        contributions = []
+        if isinstance(battle, dict):
+            total_points = pick_first_int(battle, ("Points", "points", "BattlePoints"))
+            contributions = sorted(
+                battle.get("PointContributions") or battle.get("pointContributions") or [],
+                key=lambda x: int(x.get("Points", 0) or 0),
+                reverse=True,
+            )
+
+        rank, standings_points = await _get_clan_rank_from_standings(clan_name)
+        if total_points is None:
+            total_points = standings_points
+
+        pph = await _get_clan_pph_from_history(clan_name, battle_id) if battle_id else None
+
+        icon = data.get("Icon")
+        icon_id = extract_asset_id(icon) if icon else None
+
+        embed = discord.Embed(
+            title=f"Spy Report: {name}",
+            color=discord.Color.red() if battle_id else discord.Color(MCWV_BRAND_COLOR),
+            timestamp=datetime.now(timezone.utc),
+        )
+        if icon_id:
+            embed.set_thumbnail(url=f"{PS99_API}/image/{icon_id}")
+
+        embed.add_field(name="Members", value=f"**{member_count}**/{member_capacity or '?'}", inline=True)
+        if level:
+            embed.add_field(name="Level", value=f"**{level}**", inline=True)
+        if rank:
+            embed.add_field(name="Rank", value=f"**#{rank}**", inline=True)
+        if total_points is not None:
+            embed.add_field(name="War Points", value=f"**{format_points(total_points)}**", inline=True)
+        if pph is not None and pph > 0:
+            embed.add_field(name="PPH", value=f"**{format_points(pph)}/h**", inline=True)
+        if gems:
+            embed.add_field(name="Gems", value=f"**{format_points(gems)}**", inline=True)
+        if battle_id:
+            friendly = _friendly_battle_name(battle_id)
+            embed.description = f"Active war: **{friendly}**"
+        else:
+            embed.description = "No active war detected."
+
+        if contributions:
+            linked_by_roblox = {}
+            try:
+                for u in db_get_all() or []:
+                    linked_by_roblox[int(u[0])] = u[2]
+            except Exception:
+                pass
+
+            top_lines = []
+            medals = ["1st", "2nd", "3rd"]
+            for i, entry in enumerate(contributions[:3]):
+                rid = int(entry.get("UserID", 0) or 0)
+                pts = int(entry.get("Points", 0) or 0)
+                linked_name = linked_by_roblox.get(rid)
+                display_name = linked_name or str(rid)
+                top_lines.append(f"**{medals[i]}** {display_name} - {format_points(pts)} pts")
+            embed.add_field(name="Top Contributors", value="\n".join(top_lines), inline=False)
+
+        if total_points and member_count:
+            avg = total_points / member_count
+            embed.add_field(name="Avg/Member", value=f"**{format_points(int(avg))}**", inline=True)
+
+        embed.set_footer(text=f"PS99 live | Spied by {interaction.user}")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[spy] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Spy report failed: `{type(e).__name__}`")
+
+
+@bot.tree.command(name="spycompare", description="Compare MCWV head-to-head with a rival clan", guild=guild_obj)
+@app_commands.describe(clan_name="Rival clan tag to compare against (e.g. ABCD)")
+@require_role()
+async def spycompare(interaction: discord.Interaction, clan_name: str):
+    await interaction.response.defer()
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    clan_name = clan_name.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]{1,8}", clan_name):
+        return await interaction.followup.send(f"Invalid clan tag `{clan_name}`.")
+
+    try:
+        battle_id = await get_active_battle_id_for_placement()
+
+        mcwv_data, rival_data = await asyncio.gather(
+            _fetch_clan_data(CLAN_NAME),
+            _fetch_clan_data(clan_name),
+        )
+
+        if not rival_data:
+            return await interaction.followup.send(f"Could not find clan `{clan_name}`.")
+
+        rival_name = rival_data.get("Name", clan_name)
+
+        # MCWV stats
+        mcwv_members = len(mcwv_data.get("Members", []) or []) if mcwv_data else 0
+        mcwv_battles = (mcwv_data or {}).get("Battles", {})
+        mcwv_battle = None
+        if battle_id and isinstance(mcwv_battles, dict):
+            mcwv_battle = mcwv_battles.get(battle_id) or mcwv_battles.get(str(battle_id))
+        mcwv_points = pick_first_int(mcwv_battle, ("Points", "points")) if isinstance(mcwv_battle, dict) else None
+
+        # Rival stats
+        rival_members = len(rival_data.get("Members", []) or [])
+        rival_battles = rival_data.get("Battles", {})
+        rival_battle = None
+        if battle_id and isinstance(rival_battles, dict):
+            rival_battle = rival_battles.get(battle_id) or rival_battles.get(str(battle_id))
+        rival_points = pick_first_int(rival_battle, ("Points", "points")) if isinstance(rival_battle, dict) else None
+
+        # Ranks
+        mcwv_rank, mcwv_standings_pts = await _get_clan_rank_from_standings(CLAN_NAME)
+        rival_rank, rival_standings_pts = await _get_clan_rank_from_standings(clan_name)
+        if mcwv_points is None:
+            mcwv_points = mcwv_standings_pts
+        if rival_points is None:
+            rival_points = rival_standings_pts
+
+        # PPH
+        mcwv_pph = await _get_clan_pph_from_history(CLAN_NAME, battle_id) if battle_id else None
+        rival_pph = await _get_clan_pph_from_history(clan_name, battle_id) if battle_id else None
+
+        embed = discord.Embed(
+            title=f"MCWV vs {rival_name}",
+            color=discord.Color.red() if battle_id else discord.Color(MCWV_BRAND_COLOR),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        gap = None
+        if mcwv_points is not None and rival_points is not None:
+            gap = rival_points - mcwv_points
+
+        embed.add_field(name="Rank", value=f"MCWV: **#{mcwv_rank or '?'}**\n{rival_name}: **#{rival_rank or '?'}**", inline=True)
+        embed.add_field(name="Points", value=f"MCWV: **{format_points(mcwv_points or 0)}**\n{rival_name}: **{format_points(rival_points or 0)}**", inline=True)
+        embed.add_field(name="Members", value=f"MCWV: **{mcwv_members}**\n{rival_name}: **{rival_members}**", inline=True)
+
+        if mcwv_pph is not None or rival_pph is not None:
+            mcwv_pph_txt = format_points(mcwv_pph) if mcwv_pph else "?"
+            rival_pph_txt = format_points(rival_pph) if rival_pph else "?"
+            embed.add_field(name="PPH", value=f"MCWV: **{mcwv_pph_txt}/h**\n{rival_name}: **{rival_pph_txt}/h**", inline=True)
+
+        if gap is not None:
+            if gap > 0:
+                gap_txt = f"**{format_points(gap)}** pts behind {rival_name}"
+                if mcwv_pph and rival_pph:
+                    net = mcwv_pph - rival_pph
+                    if net > 0:
+                        eta = gap / net
+                        gap_txt += f"\nClosing at **{format_points(net)}/h** net - ETA ~{math.ceil(eta)}h"
+                    else:
+                        gap_txt += f"\nThey're out-pacing us by **{format_points(-net)}/h**"
+            elif gap < 0:
+                gap_txt = f"**{format_points(-gap)}** pts ahead of {rival_name}"
+                if mcwv_pph and rival_pph:
+                    net = rival_pph - mcwv_pph
+                    if net > 0:
+                        eta = (-gap) / net
+                        gap_txt += f"\nThey're closing at **{format_points(net)}/h** - ETA ~{math.ceil(eta)}h"
+                    else:
+                        gap_txt += f"\nWe're pulling away by **{format_points(-net)}/h**"
+            else:
+                gap_txt = "Level - same points!"
+            embed.add_field(name="Gap Analysis", value=gap_txt, inline=False)
+
+        if mcwv_points and mcwv_members and rival_points and rival_members:
+            mcwv_avg = mcwv_points / mcwv_members
+            rival_avg = rival_points / rival_members
+            embed.add_field(name="Avg/Member", value=f"MCWV: **{format_points(int(mcwv_avg))}**\n{rival_name}: **{format_points(int(rival_avg))}**", inline=True)
+
+        embed.set_footer(text=f"PS99 live | Compared by {interaction.user}")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[spycompare] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Comparison failed: `{type(e).__name__}`")
+
+
+@bot.tree.command(name="threatboard", description="Show the 5 clans closest to MCWV in the standings with their pace", guild=guild_obj)
+@require_role()
+async def threatboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    try:
+        battle_id = await get_active_battle_id_for_placement()
+        if not battle_id:
+            return await interaction.followup.send("No active war detected - threat board is only useful during a war.")
+
+        mcwv_snapshot = await get_mcwv_placement_snapshot()
+        if not mcwv_snapshot:
+            return await interaction.followup.send("Can't determine MCWV's current placement.")
+
+        mcwv_rank = mcwv_snapshot["rank"]
+        mcwv_points = mcwv_snapshot["points"]
+        mcwv_pph = await _get_clan_pph_from_history(CLAN_NAME, battle_id)
+
+        payload = await fetch_json_for_placement(
+            f"{PS99_API}/api/clans?page=1&pageSize=100&sort=Points&sortOrder=desc"
+        )
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            return await interaction.followup.send("Can't load the clan standings right now.")
+
+        rivals = []
+        for i, row in enumerate(rows):
+            name = str(row.get("Name") or row.get("name") or "")
+            pts = int(row.get("Points") or row.get("points") or 0)
+            if _normalize_clan_name(name) == _normalize_clan_name(CLAN_NAME):
+                continue
+            gap = pts - mcwv_points
+            rivals.append({
+                "name": name,
+                "rank": i + 1,
+                "points": pts,
+                "gap": gap,
+                "above": gap > 0,
+            })
+
+        rivals.sort(key=lambda x: abs(x["gap"]))
+        top5 = rivals[:5]
+
+        if not top5:
+            return await interaction.followup.send("No rival clans found near MCWV in the standings.")
+
+        pph_tasks = await asyncio.gather(
+            *[_get_clan_pph_from_history(r["name"], battle_id) for r in top5],
+            return_exceptions=True,
+        )
+        for i, pph_result in enumerate(pph_tasks):
+            top5[i]["pph"] = pph_result if not isinstance(pph_result, Exception) else None
+
+        embed = discord.Embed(
+            title="Threat Board",
+            description=f"5 clans closest to MCWV (**#{mcwv_rank}**, {format_points(mcwv_points)} pts)",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if mcwv_pph:
+            embed.description += f"\nOur pace: **{format_points(mcwv_pph)}/h**"
+
+        lines = []
+        for r in top5:
+            direction = "Above" if r["above"] else "Below"
+            gap_txt = f"{format_points(abs(r['gap']))} pts {'ahead' if r['above'] else 'behind'}"
+            pph_txt = ""
+            if r["pph"] and r["pph"] > 0:
+                pph_txt = f" | {format_points(r['pph'])}/h"
+                if mcwv_pph:
+                    net = r["pph"] - mcwv_pph if r["above"] else mcwv_pph - r["pph"]
+                    if net > 0:
+                        eta = abs(r["gap"]) / net
+                        pph_txt += f" -> {'overtakes us' if not r['above'] else 'pulls away'} in ~{math.ceil(eta)}h"
+                    elif net < 0:
+                        pph_txt += f" -> we're {'closing' if r['above'] else 'pulling away'}"
+
+            lines.append(f"[{direction}] **{r['name']}** (#{r['rank']}) - {gap_txt}{pph_txt}")
+
+        embed.add_field(name="Nearest Rivals", value="\n".join(lines), inline=False)
+        embed.set_footer(text=f"PS99 live + clan_history | {interaction.user}")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[threatboard] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Threat board failed: `{type(e).__name__}`")
+
+
+
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
 @app_commands.describe(
     channel="Channel to send the panel in. Defaults to configured panel channel.",
