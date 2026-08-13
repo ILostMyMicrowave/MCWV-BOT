@@ -10032,57 +10032,56 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         roblox_id = resolved["id"]
         roblox_name = resolved["name"]
 
-        # ===== GATHER ALL DATA =====
-        # 1. Permanent cache (instant)
+        # ===== GATHER ALL DATA — cache first, live scan only for active battles =====
+        # The global backfill scanned all 50k clans and cached every battle
+        # contribution. The cache is the primary source — it has true global
+        # ranks. Live scan is only used to update points for the active battle.
+
+        # 1. Permanent cache (instant) — ALL battles the player ever participated in
         cached_rows = get_cached_player_history(roblox_id)
 
-        # 2. Live PS99 scan (for uncached battles)
+        # 2. Live PS99 scan (only needed for active battle points + current clan)
         history = await fetch_ps99_player_war_history(roblox_id)
+        summary = history.get("summary") if isinstance(history, dict) and isinstance(history.get("summary"), dict) else {}
+        live_rows = history.get("battles", []) if isinstance(history, dict) else []
 
-        # 3. Merge cached + live
-        live_rows = []
-        if history and isinstance(history, dict):
-            live_rows = history.get("battles", []) or []
-
+        # 3. Merge: cache is truth for ranks/totals, live only updates active points
         merged = {}
         for row in cached_rows:
             key = (str(row.get("battleId") or "").lower(), str(row.get("clan") or "").lower())
-            merged[key] = row
+            merged[key] = dict(row)  # copy so we don't mutate the cache
+
         for row in live_rows:
             if not isinstance(row, dict):
                 continue
             key = (str(row.get("battleId") or "").lower(), str(row.get("clan") or "").lower())
             if key not in merged:
-                # Battle not in cache — add it
+                # Battle not in cache (shouldn't happen after backfill, but just in case)
                 merged[key] = row
-            elif _safe_int(row.get("points")) > _safe_int(merged[key].get("points")):
-                # Active battle with higher live points — update points but
-                # KEEP the cached global rank/total (live has scan-pool ranks)
-                merged[key]["points"] = _safe_int(row.get("points"))
+            else:
+                # Update points for active battles, keep cached global rank/total
+                live_pts = _safe_int(row.get("points"))
+                if live_pts > _safe_int(merged[key].get("points")):
+                    merged[key]["points"] = live_pts
 
         rows = list(merged.values())
-
-        # 4. Extra clan check (top 100 only)
-        summary = history.get("summary") if isinstance(history, dict) and isinstance(history.get("summary"), dict) else {}
-        scan = history.get("scan", {}) if isinstance(history, dict) and isinstance(history.get("scan"), dict) else {}
-
         rows.sort(key=_battle_sort_key, reverse=True)
 
-        # 5. Avatar
+        # 4. Avatar
         avatar_url = None
         try:
             avatar_url = await get_roblox_headshot_url(roblox_id)
         except Exception:
             pass
 
-        # 6. Verify actual current clan (check real member lists)
+        # 5. Current clan — check MCWV member list first, then PS99 summary
         current_clan = summary.get("Clan", {}) if isinstance(summary.get("Clan"), dict) else {}
         current_clan_name = current_clan.get("Name") or "Unknown"
         active_points = _safe_int(summary.get("ActiveBattlePoints"))
         total_battles_agg = max(_safe_int(summary.get("TotalBattles")), len(rows))
         earned_medals_agg = max(_safe_int(summary.get("EarnedMedals")), sum(1 for r in rows if r.get("earnedMedal")))
 
-        actual_current_clan = None
+        # Check if player is currently in MCWV
         mcwv_clan_data = await _fetch_clan_data(CLAN_NAME)
         in_mcwv_now = False
         if mcwv_clan_data:
@@ -10090,95 +10089,18 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
             if isinstance(mcwv_members, list):
                 in_mcwv_now = any(str(m.get("UserID")) == str(roblox_id) for m in mcwv_members if isinstance(m, dict))
                 if in_mcwv_now:
-                    actual_current_clan = CLAN_NAME
+                    current_clan_name = CLAN_NAME
 
-        if not actual_current_clan:
-            try:
-                top_100_list = await fetch_top_clan_names_for_history()
-                for check_clan in top_100_list:
-                    if check_clan.upper() == CLAN_NAME.upper():
-                        continue
-                    try:
-                        check_data = await _fetch_clan_data(check_clan)
-                        if not check_data:
-                            continue
-                        check_members = check_data.get("Members", [])
-                        if isinstance(check_members, list):
-                            if any(str(m.get("UserID")) == str(roblox_id) for m in check_members if isinstance(m, dict)):
-                                actual_current_clan = check_clan
-                                break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-        if actual_current_clan:
-            current_clan_name = actual_current_clan
-
-        # 7. Extra clan battle data (top 100 only)
-        existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows if isinstance(r, dict)}
-        top_100_clans = set()
-        try:
-            top_100_list = await fetch_top_clan_names_for_history()
-            top_100_clans = {c.upper() for c in top_100_list}
-        except Exception:
-            pass
-
-        extra_clans_to_check = set()
-        if current_clan_name and current_clan_name != "Unknown":
-            if current_clan_name.upper() in top_100_clans:
-                extra_clans_to_check.add(current_clan_name)
-        if CLAN_NAME.upper() in top_100_clans:
-            extra_clans_to_check.add(CLAN_NAME)
-
-        # Also check clans from the website scrape — the player may have battle
-        # data in previous clans that we'd miss if we only check current + MCWV.
-        # Cap at 5 extra clans to avoid excessive API calls.
-        try:
-            scraped_clans_preview = get_cached_clan_memberships(roblox_id)
-            for sc in scraped_clans_preview:
-                if sc.upper() in top_100_clans and sc.upper() not in {c.upper() for c in extra_clans_to_check}:
-                    extra_clans_to_check.add(sc)
-                    if len(extra_clans_to_check) >= 7:  # current + MCWV + 5 scraped
-                        break
-        except Exception:
-            pass
-
-        for clan_to_check in extra_clans_to_check:
-            try:
-                extra_clan_data = await _fetch_clan_data(clan_to_check)
-                if not extra_clan_data:
-                    continue
-                for row in _mcwv_history_from_clan_payload(roblox_id, {"data": extra_clan_data}):
-                    bid_lower = str(row.get("battleId") or "").lower()
-                    if bid_lower not in existing_battle_ids:
-                        row["clan"] = clan_to_check
-                        rows.append(row)
-                        existing_battle_ids.add(bid_lower)
-            except Exception as exc:
-                print(f"[checkplayer] extra clan fetch failed for {clan_to_check}: {exc}")
-
-        rows.sort(key=_battle_sort_key, reverse=True)
-
-        # 8. Scraped clan memberships
+        # 6. Scraped clan memberships (for clans with no battle data)
         scraped_clans = get_cached_clan_memberships(roblox_id)
         clans_from_scrape_only = []
-        top_100_set = set()
-        try:
-            if db_enabled():
-                with conn.cursor() as cur:
-                    cur.execute("SELECT DISTINCT clan_name FROM cross_clan_player_history")
-                    for row in cur.fetchall():
-                        top_100_set.add(str(row[0]).upper())
-                close_db_connection()
-        except Exception:
-            pass
+        clans_in_cache = set()
         for row in rows:
             if isinstance(row, dict):
-                top_100_set.add(str(row.get("clan") or "").upper())
+                clans_in_cache.add(str(row.get("clan") or "").upper())
 
         for clan_name in scraped_clans:
-            if clan_name.upper() in top_100_set and clan_name not in [str(r.get("clan") or "") for r in rows]:
+            if clan_name.upper() not in clans_in_cache and clan_name not in clans_from_scrape_only:
                 clans_from_scrape_only.append(clan_name)
 
         # ===== ANALYZE =====
@@ -10444,17 +10366,14 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         # ===== FOOTER =====
         data_sources = []
         if cached_rows:
-            data_sources.append("cache")
+            data_sources.append("global cache")
         if live_rows:
-            data_sources.append("live scan")
+            data_sources.append("live")
         if scraped_clans:
-            data_sources.append("website scrape")
+            data_sources.append("scrape")
         source_txt = " + ".join(data_sources) if data_sources else "PS99"
 
-        if scan.get("clansScanned"):
-            embed.set_footer(text=f"{source_txt} \u00b7 {scan.get('clansScanned')} clans \u00b7 {interaction.user}")
-        else:
-            embed.set_footer(text=f"{source_txt} \u00b7 {interaction.user}")
+        embed.set_footer(text=f"{source_txt} \u00b7 {len(rows)} battles \u00b7 {interaction.user}")
 
         await interaction.followup.send(embed=embed)
 
