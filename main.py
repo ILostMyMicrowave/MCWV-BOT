@@ -10136,11 +10136,18 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         if earned_medals:
             embed.add_field(name="\U0001f949 Medals", value=f"**{earned_medals}**", inline=True)
 
-        # Clans seen across all battles
+        # Clans seen across all battles (from per-battle history)
         clans_seen = []
         for row in rows:
             clan_name = str(row.get("clan") or "").strip()
             if clan_name and clan_name not in clans_seen:
+                clans_seen.append(clan_name)
+
+        # Also check the scraped all-time clan memberships (from db.biggames.io)
+        # This catches clans the player was in even if we don't have per-battle data
+        scraped_clans = get_cached_clan_memberships(roblox_id)
+        for clan_name in scraped_clans:
+            if clan_name not in clans_seen:
                 clans_seen.append(clan_name)
 
         if clans_seen:
@@ -10291,6 +10298,45 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
 CROSS_CLAN_CACHE_VERSION = 1
 
 
+def ensure_cross_clan_members_table():
+    """Create the all-time clan members table if it doesn't exist."""
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_members (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    clan_name TEXT NOT NULL,
+                    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (roblox_id, clan_name)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_members_roblox_idx ON cross_clan_members (roblox_id)")
+        conn.commit()
+    except Exception as e:
+        print("[cross-clan cache] members table creation failed:", e)
+        conn.rollback()
+
+
+def get_cached_clan_memberships(roblox_id):
+    """Get all clans a player has been a member of (from website scrape)."""
+    if not db_enabled():
+        return []
+    ensure_cross_clan_members_table()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT clan_name FROM cross_clan_members
+                WHERE roblox_id = %s
+                ORDER BY first_seen DESC
+            """, (str(roblox_id),))
+            return [str(row[0]) for row in cur.fetchall()]
+    except Exception:
+        return []
+
+
 def ensure_cross_clan_history_table():
     """Create the permanent cache table if it doesn't exist."""
     if not db_enabled():
@@ -10330,6 +10376,55 @@ def ensure_cross_clan_history_table():
     except Exception as e:
         print("[cross-clan cache] table creation failed:", e)
         conn.rollback()
+
+
+async def scrape_clan_member_ids(clan_name):
+    """Scrape db.biggames.io for a clan's FULL member list (all-time).
+    Returns a set of Roblox user IDs. The public PS99 API only returns
+    top 2-6 contributors per battle, but the website shows ALL members.
+    This fetches the clan page and extracts user IDs from the RSC data."""
+    if not clan_name:
+        return set()
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        url = f"https://db.biggames.io/clans/{clan_name}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers={"User-Agent": "Mozilla/5.0"}) as res:
+            if res.status != 200:
+                return set()
+            html = await res.text()
+        # The RSC flight data contains user IDs as escaped quoted strings: \"12345678\"
+        import re as _re
+        ids = set()
+        for match in _re.findall(r'\\"(\d{7,12})\\"', html):
+            uid = int(match)
+            if uid > 1000000:  # Filter out asset IDs and small numbers
+                ids.add(str(uid))
+        # Also try unescaped quotes (in case the page format differs)
+        for match in _re.findall(r'"(\d{7,12})"', html):
+            uid = int(match)
+            if uid > 1000000:
+                ids.add(str(uid))
+        if ids:
+            print(f"[cross-clan scrape] {clan_name}: found {len(ids)} member IDs from website")
+        return ids
+    except Exception as exc:
+        print(f"[cross-clan scrape] failed for {clan_name}: {exc}")
+        return set()
+
+
+# Cache of scraped clan members so we don't re-fetch per battle
+SCRAPED_CLAN_MEMBERS = {}
+
+
+async def get_clan_member_ids(clan_name):
+    """Get a clan's full member list, using cache to avoid re-fetching."""
+    if clan_name in SCRAPED_CLAN_MEMBERS:
+        return SCRAPED_CLAN_MEMBERS[clan_name]
+    ids = await scrape_clan_member_ids(clan_name)
+    SCRAPED_CLAN_MEMBERS[clan_name] = ids
+    return ids
 
 
 async def cache_battle_contributors(battle_id):
@@ -10476,6 +10571,36 @@ async def cache_battle_contributors(battle_id):
                 clans_failed += 1
 
         print(f"[cross-clan cache] {battle_id}: scanned {clans_scanned} clans ({clans_failed} failed)")
+
+        # Source 3: Scrape db.biggames.io for FULL clan member lists.
+        # Store as all-time clan membership (not per-battle, since the page
+        # shows all members ever, not per-battle rosters).
+        # This goes into a separate table so /checkplayer can show
+        # "was in V1LN" even without per-battle data.
+        try:
+            ensure_cross_clan_members_table()
+            scrape_added = 0
+            for clan_name in clan_names:
+                try:
+                    member_ids = await get_clan_member_ids(clan_name)
+                    if not member_ids:
+                        continue
+                    with local_conn.cursor() as cur:
+                        for uid in member_ids:
+                            cur.execute("""
+                                INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen)
+                                VALUES (%s, %s, NOW())
+                                ON CONFLICT (roblox_id, clan_name) DO NOTHING
+                            """, (uid, clan_name))
+                            scrape_added += cur.rowcount
+                    local_conn.commit()
+                    await asyncio.sleep(0)
+                except Exception:
+                    pass
+            if scrape_added:
+                print(f"[cross-clan cache] {battle_id}: +{scrape_added} all-time clan members from website scrape")
+        except Exception as exc:
+            print(f"[cross-clan cache] member scrape failed: {exc}")
 
         # Yield to event loop between battles
         await asyncio.sleep(0)
