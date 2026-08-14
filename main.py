@@ -10479,8 +10479,38 @@ async def generate_checkplayer_card(data, avatar_url=None):
 
 # ---------------- CHECKPLAYER COMMAND ----------------
 
+# Recent username searches for autocomplete
+RECENT_PLAYER_SEARCHES = []
+MAX_RECENT_SEARCHES = 25
+
+
+async def checkplayer_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete for /checkplayer — shows recent searches + tracked members."""
+    choices = []
+    current_lower = current.lower().strip()
+
+    # Recent searches first
+    for name in RECENT_PLAYER_SEARCHES:
+        if not current_lower or current_lower in name.lower():
+            choices.append(app_commands.Choice(name=name, value=name))
+
+    # Tracked members from DB
+    try:
+        users = db_get_all_tracked()
+        for row in users:
+            username = str(row[2]) if len(row) > 2 and row[2] else str(row[0])
+            if not current_lower or current_lower in username.lower():
+                if not any(c.value == username for c in choices):
+                    choices.append(app_commands.Choice(name=username, value=username))
+    except Exception:
+        pass
+
+    return choices[:25]
+
+
 @bot.tree.command(name="checkplayer", description="Look up any player's complete cross-clan war history and performance", guild=guild_obj)
 @app_commands.describe(roblox_username="Roblox username to investigate")
+@app_commands.autocomplete(roblox_username=checkplayer_autocomplete)
 @require_role()
 async def checkplayer(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer()
@@ -10492,6 +10522,11 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
     roblox_username = roblox_username.strip()
     if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", roblox_username):
         return await interaction.followup.send(f"Invalid Roblox username `{roblox_username}`.")
+
+    # Track recent search
+    if roblox_username not in RECENT_PLAYER_SEARCHES:
+        RECENT_PLAYER_SEARCHES.insert(0, roblox_username)
+        del RECENT_PLAYER_SEARCHES[MAX_RECENT_SEARCHES:]
 
     try:
         resolved = await resolve_roblox_username(roblox_username)
@@ -10554,6 +10589,7 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
 
 @bot.tree.command(name="compareplayer", description="Compare two players' war history side-by-side", guild=guild_obj)
 @app_commands.describe(player1="First Roblox username", player2="Second Roblox username")
+@app_commands.autocomplete(player1=checkplayer_autocomplete, player2=checkplayer_autocomplete)
 @require_role()
 async def compareplayer(interaction: discord.Interaction, player1: str, player2: str):
     await interaction.response.defer()
@@ -15432,6 +15468,35 @@ PS99_CURRENT_WAR_NAME = None
 
 ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
 
+
+async def update_bot_presence():
+    """Update the bot's Discord presence based on current state."""
+    try:
+        if ps99_war_active and PS99_CURRENT_WAR_NAME:
+            war_name = _friendly_battle_name(PS99_CURRENT_WAR_NAME)
+            await bot.change_presence(
+                status=discord.Status.online,
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"⚔️ {war_name}",
+                ),
+            )
+        else:
+            try:
+                count = len(db_get_all_tracked())
+            except Exception:
+                count = 0
+            await bot.change_presence(
+                status=discord.Status.online,
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"🛡️ MCWV · {count} members",
+                ),
+            )
+    except Exception:
+        pass
+
+
 @tasks.loop(minutes=10)
 async def war_poll_loop():
     global bot_enabled, ps99_war_active, ps99_first_check, PS99_CURRENT_WAR_NAME, session
@@ -15474,11 +15539,13 @@ async def war_poll_loop():
             ps99_war_active = currently_active
             bot_enabled = currently_active
             print(f"[INIT] War state set to {currently_active}")
+            await update_bot_presence()
             return
 
         if ps99_war_active != currently_active:
             ps99_war_active = currently_active
             bot_enabled = currently_active
+            await update_bot_presence()
 
             channel = await _get_channel(CHANNEL_ID)
             if not channel:
@@ -15794,6 +15861,8 @@ async def ticket_screenshot_reminder_loop():
             if channel is None:
                 channel = await bot.fetch_channel(int(channel_id))
             if not isinstance(channel, discord.TextChannel):
+                # Channel deleted — mark as reminded so we stop retrying
+                db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Channel no longer exists — reminder skipped")
                 continue
 
             embed = discord.Embed(
@@ -15818,6 +15887,9 @@ async def ticket_screenshot_reminder_loop():
             )
             db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Screenshot reminder sent after 6 hours")
             await asyncio.sleep(0.5)
+        except discord.NotFound:
+            # Channel deleted — mark as reminded so we stop retrying every 30 min
+            db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Channel deleted — reminder skipped")
         except Exception as exc:
             print(f"ticket_screenshot_reminder_loop error for {ticket_id}: {exc}")
 
@@ -18553,6 +18625,12 @@ async def on_ready():
         print(f"🎫 Ticket review restore done ({restored} re-posted)")
     except Exception as e:
         print(f"❌ Ticket review restore error: {e}")
+
+    # ---------------- UPDATE PRESENCE ----------------
+    try:
+        await update_bot_presence()
+    except Exception:
+        pass
 
     print("✅ ON_READY DONE")
 # ---------------- CLEANUP ----------------
