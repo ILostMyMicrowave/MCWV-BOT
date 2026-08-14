@@ -493,41 +493,54 @@ def _ticket_action_payload(row):
 
 
 def db_admin_list_mcwv_tickets():
+    if not db_enabled():
+        return []
     db_ensure_mcwv_ticket_tables()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
-                   status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
-                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason,
-                   EXISTS (
-                     SELECT 1 FROM mcwv_ticket_actions a
-                     WHERE a.ticket_id = mcwv_tickets.ticket_id
-                       AND a.action = 'screenshots/uploaded'
-                   ) AS screenshots_uploaded
-            FROM mcwv_tickets
-            ORDER BY updated_at DESC
-            LIMIT 200
-        """)
-        rows = cur.fetchall()
-    return [_ticket_row_to_payload(row) for row in rows]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
+                       status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
+                       rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason,
+                       EXISTS (
+                         SELECT 1 FROM mcwv_ticket_actions a
+                         WHERE a.ticket_id = mcwv_tickets.ticket_id
+                           AND a.action = 'screenshots/uploaded'
+                       ) AS screenshots_uploaded
+                FROM mcwv_tickets
+                ORDER BY updated_at DESC
+                LIMIT 200
+            """)
+            rows = cur.fetchall()
+        return [_ticket_row_to_payload(row) for row in rows]
+    except Exception as e:
+        print("db_admin_list_mcwv_tickets error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
 
 
 def db_admin_get_mcwv_ticket(ticket_id):
+    if not db_enabled():
+        return None
     db_ensure_mcwv_ticket_tables()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
-                   status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
-                   rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason,
-                   EXISTS (
-                     SELECT 1 FROM mcwv_ticket_actions a
-                     WHERE a.ticket_id = mcwv_tickets.ticket_id
-                       AND a.action = 'screenshots/uploaded'
-                   ) AS screenshots_uploaded
-            FROM mcwv_tickets
-            WHERE ticket_id = %s OR channel_id::text = %s OR id::text = %s
-            LIMIT 1
-        """, (str(ticket_id), str(ticket_id), str(ticket_id)))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username,
+                       status, claimed_by, created_at, updated_at, accepted_at, accepted_by,
+                       rejected_at, rejected_by, reject_reason, closed_at, closed_by, close_reason,
+                       EXISTS (
+                         SELECT 1 FROM mcwv_ticket_actions a
+                         WHERE a.ticket_id = mcwv_tickets.ticket_id
+                           AND a.action = 'screenshots/uploaded'
+                       ) AS screenshots_uploaded
+                FROM mcwv_tickets
+                WHERE ticket_id = %s OR channel_id::text = %s OR id::text = %s
+                LIMIT 1
+            """, (str(ticket_id), str(ticket_id), str(ticket_id)))
         ticket = cur.fetchone()
         if not ticket:
             return None
@@ -555,12 +568,19 @@ def db_admin_get_mcwv_ticket(ticket_id):
             LIMIT 1
         """, (canonical,))
         transcript = cur.fetchone()
-    payload = _ticket_row_to_payload(ticket)
-    payload["application"] = _ticket_application_payload(app_row)
-    payload["actions"] = [_ticket_action_payload(row) for row in actions]
-    payload["screenshotsUploaded"] = bool(payload.get("screenshotsUploaded")) or any(action.get("action") == "screenshots/uploaded" for action in payload["actions"])
-    payload["transcript"] = {"text": transcript[0], "createdAt": transcript[1].isoformat()} if transcript else None
-    return payload
+        payload = _ticket_row_to_payload(ticket)
+        payload["application"] = _ticket_application_payload(app_row)
+        payload["actions"] = [_ticket_action_payload(row) for row in actions]
+        payload["screenshotsUploaded"] = bool(payload.get("screenshotsUploaded")) or any(action.get("action") == "screenshots/uploaded" for action in payload["actions"])
+        payload["transcript"] = {"text": transcript[0], "createdAt": transcript[1].isoformat()} if transcript else None
+        return payload
+    except Exception as e:
+        print("db_admin_get_mcwv_ticket error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
 
 
 async def enrich_ticket_last_message(ticket):
@@ -2375,7 +2395,7 @@ def db_remove_all_links_for_discord(discord_id):
     try:
         with conn.cursor() as cur:
             if db_is_owner_discord(did):
-                return False, "Owner accounts cannot be removed from Roblox Links. Restore or edit the owner manually in Neon."
+                return False, "Owner accounts cannot be removed from Roblox Links. Restore or edit the owner manually in the database."
 
             cur.execute("DELETE FROM user_alts WHERE discord_id = %s", (did,))
             cur.execute("DELETE FROM users WHERE discord_id = %s", (did,))
@@ -2989,14 +3009,14 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 conn = None
 
 def db_enabled():
-    """Auto-connect: opens a connection on demand so Neon can scale to zero
+    """Auto-connect: opens a connection on demand
     between loops instead of staying awake 24/7 from a persistent connection."""
     if conn is None and DATABASE_URL:
         ensure_db_connection()
     return conn is not None
 
 # DB connection is opened on demand by db_enabled()/ensure_db_connection().
-# We do NOT connect at import time — that would keep Neon's compute awake 24/7.
+# We do NOT connect at import time — connect on demand instead.
 # Table schema is initialized from init_db_schema() on bot ready instead.
 if not DATABASE_URL:
     print("DATABASE_URL not set - running without DB")
@@ -3131,7 +3151,7 @@ def init_db_schema():
 
 
 def close_db_connection():
-    """Close the DB connection so Neon can scale to zero between loops.
+    """No-op — connection stays alive (Supabase has no compute hour limit).
     Called at the end of each DB-heavy loop iteration."""
     global conn
     if conn is not None:
@@ -5950,15 +5970,23 @@ def db_create_broadcast_template(name, audience, delivery, style, message, value
     ensure_broadcast_feature_tables()
     if not db_enabled():
         raise ValueError("Database is not available.")
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO broadcast_templates (name, audience, value, delivery, style, message, image_url, created_by, updated_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (name, audience, value or "", delivery, style, message, clean_broadcast_image_url(image_url), actor, actor))
-        new_id = cur.fetchone()[0]
-    conn.commit()
-    return int(new_id)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO broadcast_templates (name, audience, value, delivery, style, message, image_url, created_by, updated_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (name, audience, value or "", delivery, style, message, clean_broadcast_image_url(image_url), actor, actor))
+            new_id = cur.fetchone()[0]
+        conn.commit()
+        return int(new_id)
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[broadcast] create template failed: {e}")
+        raise
 
 
 def db_delete_broadcast_template(ref):
@@ -11458,7 +11486,7 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
                 except Exception:
                     pass
 
-        # Close and reopen DB between battles (Neon scale-to-zero friendly)
+        # No need to close DB between battles (Supabase)
         pass  # keep connection alive
         await asyncio.sleep(1)  # Small delay to avoid hammering the API
 
@@ -11943,7 +11971,7 @@ def _insert_raw_contributions(local_conn, rows):
 
 def _compute_global_ranks_sql(local_conn):
     """Pass 2: compute true global rank + total per battle.
-    Done per-battle in a loop to avoid Neon statement timeouts on 888k+ rows."""
+    Done per-battle in a loop to avoid statement timeouts on large tables."""
     try:
         with local_conn.cursor() as cur:
             # Get all battle IDs and their actual row counts
@@ -17677,7 +17705,7 @@ async def generate_hourly_stats_card(payload):
 
     await asyncio.sleep(0)
 
-    # Logo: clean full neon ring. Keep it symmetrical and avoid the broken-looking
+    # Logo: clean full ring. Keep it symmetrical and avoid the broken-looking
     # segmented gaps that appeared around the previous version.
     logo_center = (sc(112), sc(132))
     ring_r = sc(56)
