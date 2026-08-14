@@ -3786,11 +3786,11 @@ def db_bulk_set_user_statuses(updates):
     if not cleaned or not DATABASE_URL:
         return
 
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        local_conn.autocommit = False
-        with local_conn.cursor() as cur:
+        ensure_db_connection()
+        conn.autocommit = False
+        with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_status (
                     roblox_id TEXT PRIMARY KEY,
@@ -3835,20 +3835,15 @@ def db_bulk_set_user_statuses(updates):
                     VALUES (%s, %s, %s, NOW())
                 """, events)
 
-        local_conn.commit()
+        conn.commit()
     except Exception as exc:
         print("db_bulk_set_user_statuses error:", exc)
         try:
-            if local_conn:
-                local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
     finally:
-        try:
-            if local_conn:
-                local_conn.close()
-        except Exception:
-            pass
+        pass
 
 
 def db_get_user_status(rid):
@@ -11060,10 +11055,10 @@ def get_cached_clan_memberships(roblox_id):
     Uses a local connection to avoid race conditions."""
     if not DATABASE_URL:
         return []
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        with local_conn.cursor() as cur:
+        ensure_db_connection()
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT clan_name FROM cross_clan_members
                 WHERE roblox_id = %s
@@ -11073,11 +11068,7 @@ def get_cached_clan_memberships(roblox_id):
     except Exception:
         return []
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def ensure_cross_clan_history_table():
@@ -11179,13 +11170,13 @@ async def cache_battle_contributors(battle_id):
         return 0
 
     # Open a dedicated connection for this battle cache operation.
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        local_conn.autocommit = True
+        ensure_db_connection()
+        conn.autocommit = True
 
         # Ensure the table exists on this connection
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS cross_clan_player_history (
                     id BIGSERIAL PRIMARY KEY,
@@ -11328,7 +11319,7 @@ async def cache_battle_contributors(battle_id):
                     member_ids = await get_clan_member_ids(clan_name)
                     if not member_ids:
                         continue
-                    with local_conn.cursor() as cur:
+                    with conn.cursor() as cur:
                         for uid in member_ids:
                             cur.execute("""
                                 INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen)
@@ -11336,7 +11327,7 @@ async def cache_battle_contributors(battle_id):
                                 ON CONFLICT (roblox_id, clan_name) DO NOTHING
                             """, (uid, clan_name))
                             scrape_added += cur.rowcount
-                    local_conn.commit()
+                    conn.commit()
                     await asyncio.sleep(0)
                 except Exception:
                     pass
@@ -11357,7 +11348,7 @@ async def cache_battle_contributors(battle_id):
 
         # Insert into DB (upsert — update if exists with higher points)
         if best_rows:
-            with local_conn.cursor() as cur:
+            with conn.cursor() as cur:
                 for row in best_rows.values():
                     cur.execute("""
                         INSERT INTO cross_clan_player_history
@@ -11381,7 +11372,7 @@ async def cache_battle_contributors(battle_id):
                         row["total_contributors"], row["clan_place"],
                         row["earned_medal"], row["start_time"],
                     ))
-            local_conn.commit()
+            conn.commit()
             cached_count = len(best_rows)
 
         print(f"[cross-clan cache] {battle_id}: cached {cached_count} contributor rows")
@@ -11390,17 +11381,12 @@ async def cache_battle_contributors(battle_id):
     except Exception as e:
         print(f"[cross-clan cache] failed for {battle_id}: {e}")
         try:
-            if local_conn is not None:
-                local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         return 0
     finally:
-        if local_conn is not None:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 async def get_all_battle_ids():
@@ -11620,7 +11606,7 @@ async def _auto_cache_full_scan(battle_id):
     battle_id = str(battle_id)
     GLOBAL_BACKFILL_RUNNING = True
     scan_session = aiohttp.ClientSession()
-    local_conn = None
+    pass
     started = time.time()
 
     try:
@@ -11629,13 +11615,13 @@ async def _auto_cache_full_scan(battle_id):
             print(f"[auto-cache] no clans from sitemap for {battle_id}")
             return
 
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        local_conn.autocommit = False
+        ensure_db_connection()
+        conn.autocommit = False
 
         # Ensure table exists
         def _ensure():
             try:
-                with local_conn.cursor() as cur:
+                with conn.cursor() as cur:
                     cur.execute("""CREATE TABLE IF NOT EXISTS cross_clan_player_history (
                         id BIGSERIAL PRIMARY KEY, roblox_id TEXT NOT NULL, battle_id TEXT NOT NULL,
                         battle_name TEXT, clan_name TEXT NOT NULL, points BIGINT NOT NULL DEFAULT 0,
@@ -11645,9 +11631,9 @@ async def _auto_cache_full_scan(battle_id):
                         UNIQUE (roblox_id, battle_id, clan_name))""")
                     cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
                     cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
-                local_conn.commit()
+                conn.commit()
             except Exception:
-                local_conn.rollback()
+                conn.rollback()
         await asyncio.to_thread(_ensure)
 
         CONCURRENCY = 8
@@ -11675,7 +11661,7 @@ async def _auto_cache_full_scan(battle_id):
                     pending_rows.extend(battle_rows)
 
             if len(pending_rows) >= 5000:
-                await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
+                await asyncio.to_thread(_insert_raw_contributions, conn, pending_rows)
                 pending_rows.clear()
 
             if (batch_start // CONCURRENCY + 1) % 100 == 0:
@@ -11684,13 +11670,13 @@ async def _auto_cache_full_scan(battle_id):
                 await asyncio.sleep(0)
 
         if pending_rows:
-            await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
+            await asyncio.to_thread(_insert_raw_contributions, conn, pending_rows)
             pending_rows.clear()
 
         # Recompute ranks for this battle only
         def _rank_battle():
             try:
-                with local_conn.cursor() as cur:
+                with conn.cursor() as cur:
                     cur.execute("SELECT COUNT(*) FROM cross_clan_player_history WHERE battle_id = %s", (battle_id,))
                     actual_total = int(cur.fetchone()[0] or 0)
                     if actual_total == 0:
@@ -11704,10 +11690,10 @@ async def _auto_cache_full_scan(battle_id):
                         FROM ranked r WHERE h.id = r.id
                     """, (actual_total, battle_id))
                     updated = cur.rowcount
-                local_conn.commit()
+                conn.commit()
                 return updated
             except Exception as exc:
-                local_conn.rollback()
+                conn.rollback()
                 print(f"[auto-cache] rank failed: {exc}")
                 return 0
 
@@ -11721,11 +11707,7 @@ async def _auto_cache_full_scan(battle_id):
     finally:
         GLOBAL_BACKFILL_RUNNING = False
         await scan_session.close()
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def get_cached_player_history(roblox_id):
@@ -11735,10 +11717,10 @@ def get_cached_player_history(roblox_id):
     that close the global conn."""
     if not DATABASE_URL:
         return []
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        with local_conn.cursor() as cur:
+        ensure_db_connection()
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT battle_id, battle_name, clan_name, points, rank,
                        total_contributors, clan_place, earned_medal, start_time
@@ -11765,11 +11747,7 @@ def get_cached_player_history(roblox_id):
         print(f"[cross-clan cache] player history read failed: {e}")
         return []
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def get_cached_battle_stats(battle_id):
@@ -11831,18 +11809,18 @@ async def scrape_members_cmd(interaction: discord.Interaction):
         """Background scrape task — fully isolated from the bot's event loop."""
         # Fresh aiohttp session (don't touch the global one)
         scrape_session = aiohttp.ClientSession()
-        local_conn = None
+        pass
         total_members = 0
         clans_done = 0
         clans_failed = 0
         failed_clans = []
 
         try:
-            local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-            local_conn.autocommit = True
+            ensure_db_connection()
+            conn.autocommit = True
 
             # Ensure table exists + migrate
-            with local_conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS cross_clan_members (
                         id BIGSERIAL PRIMARY KEY,
@@ -11905,7 +11883,7 @@ async def scrape_members_cmd(interaction: discord.Interaction):
                             flat_args = []
                             for uid, cn in args:
                                 flat_args.extend([uid, cn])
-                            with local_conn.cursor() as cur:
+                            with conn.cursor() as cur:
                                 cur.execute(
                                     f"""INSERT INTO cross_clan_members (roblox_id, clan_name, first_seen, last_checked)
                                     VALUES {values_clause}
@@ -11913,7 +11891,7 @@ async def scrape_members_cmd(interaction: discord.Interaction):
                                     DO UPDATE SET last_checked = NOW()""",
                                     flat_args,
                                 )
-                            local_conn.commit()
+                            conn.commit()
                             await asyncio.sleep(0)  # CRITICAL: yield to event loop
 
                         total_members += len(ids)
@@ -11972,11 +11950,7 @@ async def scrape_members_cmd(interaction: discord.Interaction):
                 pass
         finally:
             await scrape_session.close()
-            if local_conn is not None:
-                try:
-                    local_conn.close()
-                except Exception:
-                    pass
+            pass
 
     # Run as a background task so the bot stays fully responsive
     asyncio.create_task(_run_scrape())
@@ -12031,13 +12005,13 @@ async def fetch_all_clan_names_from_sitemap(scan_session=None):
             await scan_session.close()
 
 
-def _insert_raw_contributions(local_conn, rows):
+def _insert_raw_contributions(conn, rows):
     """Batch-insert raw contribution rows using execute_values (one INSERT, not N).
     Called via asyncio.to_thread() so it never blocks the event loop."""
     if not rows:
         return 0
     try:
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO cross_clan_player_history
                     (roblox_id, battle_id, battle_name, clan_name, points,
@@ -12051,22 +12025,22 @@ def _insert_raw_contributions(local_conn, rows):
                     start_time = COALESCE(EXCLUDED.start_time, cross_clan_player_history.start_time),
                     cached_at = NOW()
             """, rows, page_size=1000)
-        local_conn.commit()
+        conn.commit()
         return len(rows)
     except Exception as exc:
         try:
-            local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         print(f"[global backfill] insert failed: {exc}")
         return 0
 
 
-def _compute_global_ranks_sql(local_conn):
+def _compute_global_ranks_sql(conn):
     """Pass 2: compute true global rank + total per battle.
     Done per-battle in a loop to avoid statement timeouts on large tables."""
     try:
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             # Get all battle IDs and their actual row counts
             cur.execute("""
                 SELECT battle_id, COUNT(*) as actual_total
@@ -12080,7 +12054,7 @@ def _compute_global_ranks_sql(local_conn):
 
         for battle_id, actual_total in battles:
             try:
-                with local_conn.cursor() as cur:
+                with conn.cursor() as cur:
                     # Window function per battle — small, fast, no timeout
                     cur.execute("""
                         WITH ranked AS (
@@ -12099,11 +12073,11 @@ def _compute_global_ranks_sql(local_conn):
                         WHERE h.id = r.id
                     """, (actual_total, battle_id))
                     updated = cur.rowcount
-                local_conn.commit()
+                conn.commit()
                 total_updated += updated if updated > 0 else 0
             except Exception as exc:
                 try:
-                    local_conn.rollback()
+                    conn.rollback()
                 except Exception:
                     pass
                 print(f"[global backfill] rank failed for {battle_id}: {exc}")
@@ -12112,7 +12086,7 @@ def _compute_global_ranks_sql(local_conn):
         return total_updated
     except Exception as exc:
         try:
-            local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         print(f"[global backfill] rank computation FAILED: {exc}")
@@ -12191,20 +12165,20 @@ async def recompute_ranks_cmd(interaction: discord.Interaction):
     await interaction.followup.send("Recomputing global ranks... This takes a few seconds.", ephemeral=True)
 
     def _do_recompute():
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        local_conn.autocommit = False
+        ensure_db_connection()
+        conn.autocommit = False
         try:
-            ranked = _compute_global_ranks_sql(local_conn)
-            with local_conn.cursor() as cur:
+            ranked = _compute_global_ranks_sql(conn)
+            with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(DISTINCT battle_id) FROM cross_clan_player_history WHERE rank IS NOT NULL")
                 battles_with_ranks = int(cur.fetchone()[0] or 0)
                 cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC NULLS LAST LIMIT 5")
                 top = cur.fetchall()
-            local_conn.commit()
+            conn.commit()
             return ranked, battles_with_ranks, top
         finally:
             try:
-                local_conn.close()
+                pass
             except Exception:
                 pass
 
@@ -12242,11 +12216,11 @@ async def fix_battle_times_cmd(interaction: discord.Interaction):
     scan_session = aiohttp.ClientSession()
     try:
         # Get all distinct battle IDs from the cache
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        local_conn.autocommit = False
+        ensure_db_connection()
+        conn.autocommit = False
 
         def _get_battle_ids():
-            with local_conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute("SELECT DISTINCT battle_id FROM cross_clan_player_history")
                 return [str(row[0]) for row in cur.fetchall()]
 
@@ -12274,16 +12248,16 @@ async def fix_battle_times_cmd(interaction: discord.Interaction):
                 if start_time and start_time > 0:
                     def _update_battle():
                         try:
-                            with local_conn.cursor() as cur:
+                            with conn.cursor() as cur:
                                 cur.execute("""
                                     UPDATE cross_clan_player_history
                                     SET start_time = %s, battle_name = %s
                                     WHERE battle_id = %s AND start_time IS NULL
                                 """, (start_time, title, bid))
                                 return cur.rowcount
-                            local_conn.commit()
+                            conn.commit()
                         except Exception:
-                            local_conn.rollback()
+                            conn.rollback()
                             return 0
                     rows_updated = await asyncio.to_thread(_update_battle)
                     updated += rows_updated
@@ -12307,7 +12281,7 @@ async def fix_battle_times_cmd(interaction: discord.Interaction):
             pass
         await interaction.followup.send(summary, ephemeral=True)
 
-        local_conn.close()
+        pass
     except Exception as e:
         await interaction.followup.send(f"Failed: `{type(e).__name__}: {e}`", ephemeral=True)
     finally:
@@ -17239,13 +17213,13 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
         return {}
 
     result = {rid: {"pph": 0, "ready": False} for rid in ids}
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        ensure_db_connection()
         battle_keys = sorted({str(battle_id), normalize_hourly_battle_key(battle_id)})
         grouped = {rid: [] for rid in ids}
 
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS exists
             """)
@@ -17293,11 +17267,7 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
         print(f"[hourly stats] history lookup failed: {exc}")
         return result
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def save_hourly_player_snapshot(payload):
@@ -17308,14 +17278,14 @@ def save_hourly_player_snapshot(payload):
     if not entries:
         return
 
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        ensure_db_connection()
         battle_key = normalize_hourly_battle_key(payload.get("battleId"))
         if not battle_key:
             return
 
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS player_leaderboard_history (
                     id BIGSERIAL PRIMARY KEY,
@@ -17358,19 +17328,15 @@ def save_hourly_player_snapshot(payload):
                         (battle_id, roblox_id, username, rank, points, pph, change_5m, captured_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 """, values)
-        local_conn.commit()
+        conn.commit()
     except Exception as exc:
         try:
-            local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         print(f"[hourly stats] snapshot save failed: {exc}")
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def draw_gradient_text_on_image(img, xy, text, font, left_color, right_color, shadow=True):
@@ -17429,13 +17395,13 @@ def ensure_hourly_exact_table(cur):
 def save_hourly_exact_snapshot(battle_id, scheduled_at, entries):
     if not DATABASE_URL or not entries:
         return False
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        ensure_db_connection()
         battle_key = normalize_hourly_battle_key(battle_id)
         scheduled_dt = scheduled_at if isinstance(scheduled_at, datetime) else datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
         scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             ensure_hourly_exact_table(cur)
             values = []
             for entry in entries:
@@ -17458,34 +17424,30 @@ def save_hourly_exact_snapshot(battle_id, scheduled_at, entries):
                     points = EXCLUDED.points,
                     captured_at = NOW()
             """, values)
-        local_conn.commit()
+        conn.commit()
         return True
     except Exception as exc:
         try:
-            local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         print(f"[hourly stats] exact snapshot save failed: {exc}")
         return False
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def load_hourly_exact_entries(battle_id, scheduled_at):
     if not DATABASE_URL:
         return None
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        ensure_db_connection()
         battle_key = normalize_hourly_battle_key(battle_id)
         scheduled_dt = scheduled_at if isinstance(scheduled_at, datetime) else datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
         scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
         previous_dt = scheduled_dt - timedelta(minutes=max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60)))
-        with local_conn.cursor() as cur:
+        with conn.cursor() as cur:
             ensure_hourly_exact_table(cur)
             cur.execute("""
                 SELECT
@@ -17524,20 +17486,16 @@ def load_hourly_exact_entries(battle_id, scheduled_at):
         print(f"[hourly stats] exact snapshot load failed: {exc}")
         return None
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 def get_latest_hourly_exact_slot(battle_id=None):
     if not DATABASE_URL:
         return None
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        with local_conn.cursor() as cur:
+        ensure_db_connection()
+        with conn.cursor() as cur:
             ensure_hourly_exact_table(cur)
             if battle_id:
                 cur.execute("""
@@ -17552,11 +17510,7 @@ def get_latest_hourly_exact_slot(battle_id=None):
     except Exception:
         return None
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
         return None
 
 
@@ -18040,10 +17994,10 @@ def fetch_hourly_ping_targets(entries, threshold):
         return []
 
     linked = {}
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        with local_conn.cursor() as cur:
+        ensure_db_connection()
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT roblox_id::text, discord_id::text, username
                 FROM users
@@ -18067,11 +18021,7 @@ def fetch_hourly_ping_targets(entries, threshold):
         print(f"[hourly stats] ping target lookup failed: {exc}")
         return []
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
     targets = []
     seen_discord = set()
@@ -18097,10 +18047,10 @@ def fetch_hourly_ping_targets(entries, threshold):
 def record_hourly_ping_targets(targets, threshold):
     if not DATABASE_URL or not targets:
         return
-    local_conn = None
+    pass
     try:
-        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        with local_conn.cursor() as cur:
+        ensure_db_connection()
+        with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS hourly_stats_ping_records (
                     id BIGSERIAL PRIMARY KEY,
@@ -18123,19 +18073,15 @@ def record_hourly_ping_targets(targets, threshold):
                 )
                 for target in targets
             ])
-        local_conn.commit()
+        conn.commit()
     except Exception:
         try:
-            local_conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         raise
     finally:
-        if local_conn:
-            try:
-                local_conn.close()
-            except Exception:
-                pass
+        pass
 
 
 async def send_hourly_ping_followup(channel, entries, threshold, message=None):
