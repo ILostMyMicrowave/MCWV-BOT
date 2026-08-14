@@ -2126,16 +2126,18 @@ def ensure_db_connection():
 
     try:
         if conn is None or conn.closed != 0:
-            print("🔄 Reconnecting to Neon DB...")
-
+            print("🔄 Reconnecting to database...")
             conn = psycopg2.connect(
                 DATABASE_URL,
                 sslmode="require",
-                connect_timeout=10
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
             )
-
             conn.autocommit = True
-
+            print("✅ Database connected")
     except Exception as e:
         print("DB reconnect failed:", repr(e))
         conn = None
@@ -3056,6 +3058,70 @@ def init_db_schema():
                     actor_user_id INTEGER,
                     actor_username TEXT,
                     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            # Ticket tables (created on startup so /reject etc. always work)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_tickets (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT UNIQUE NOT NULL,
+                    channel_id BIGINT UNIQUE,
+                    guild_id BIGINT,
+                    opener_discord_id BIGINT NOT NULL,
+                    roblox_id TEXT,
+                    roblox_username TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    claimed_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    accepted_at TIMESTAMPTZ,
+                    accepted_by BIGINT,
+                    rejected_at TIMESTAMPTZ,
+                    rejected_by BIGINT,
+                    reject_reason TEXT,
+                    closed_at TIMESTAMPTZ,
+                    closed_by BIGINT,
+                    close_reason TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_applications (
+                    ticket_id TEXT PRIMARY KEY,
+                    roblox_username TEXT,
+                    roblox_id TEXT,
+                    afk_247 TEXT,
+                    activity TEXT,
+                    liquid_gems TEXT,
+                    why_accept TEXT,
+                    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_actions (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT,
+                    actor_discord_id BIGINT,
+                    action TEXT NOT NULL,
+                    message TEXT,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_transcripts (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT,
+                    channel_id BIGINT,
+                    transcript_text TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_blacklist (
+                    discord_id BIGINT PRIMARY KEY,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_by BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
@@ -11318,7 +11384,7 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
 
     if battle_filter:
         count = await cache_battle_contributors(battle_filter)
-        close_db_connection()
+        pass  # keep connection alive
         if interaction:
             await interaction.followup.send(f"Done! Cached **{count:,}** rows for {battle_filter}.", ephemeral=True)
         return 1, count
@@ -11353,7 +11419,7 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
     if not to_cache:
         if interaction:
             await interaction.followup.send(f"All {len(battle_ids)} battles are already cached!", ephemeral=True)
-        close_db_connection()
+        pass  # keep connection alive
         return 0, 0
 
     if interaction:
@@ -11393,7 +11459,7 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
                     pass
 
         # Close and reopen DB between battles (Neon scale-to-zero friendly)
-        close_db_connection()
+        pass  # keep connection alive
         await asyncio.sleep(1)  # Small delay to avoid hammering the API
 
     if interaction:
@@ -11403,7 +11469,7 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
         await interaction.followup.send(summary, ephemeral=True)
 
     print(f"[cross-clan cache] backfill done: {battles_cached} battles, {total_rows} rows, {len(failed)} failed")
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
     return battles_cached, total_rows
 
 
@@ -11978,7 +12044,7 @@ async def backfill_status_cmd(interaction: discord.Interaction):
             battles, players, rows = cur.fetchone()
             cur.execute("SELECT battle_id, total_contributors FROM cross_clan_player_history ORDER BY total_contributors DESC NULLS LAST LIMIT 5")
             top = cur.fetchall()
-        close_db_connection()
+        pass  # keep connection alive
 
         lines = [f"Backfill running: **{'yes' if running else 'no'}**"]
         lines.append(f"Battles cached: **{battles}**")
@@ -11990,7 +12056,7 @@ async def backfill_status_cmd(interaction: discord.Interaction):
                 lines.append(f"  {bid}: {total:,} contributors" if total else f"  {bid}: (no rank data)")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
     except Exception as e:
-        close_db_connection()
+        pass  # keep connection alive
         await interaction.followup.send(f"Backfill running: **{'yes' if running else 'no'}**\nStats error: `{e}`", ephemeral=True)
 
 
@@ -12147,7 +12213,7 @@ async def backfill_history(interaction: discord.Interaction, battle_name: str = 
     )
 
     battles, rows = await backfill_cross_clan_history(interaction=interaction, battle_filter=battle_filter)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 
 @bot.tree.command(name="cachewar", description="Cache a specific war's data into the permanent cross-clan cache", guild=guild_obj)
@@ -12161,7 +12227,7 @@ async def cachewar(interaction: discord.Interaction, battle_id: str):
 
     battle_id = battle_id.strip()
     count = await cache_battle_contributors(battle_id)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
     if count > 0:
         stats = get_cached_battle_stats(battle_id)
@@ -12217,7 +12283,7 @@ async def cachedbstats(interaction: discord.Interaction):
 
         embed.set_footer(text="Use /backfill_history to cache more battles")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        close_db_connection()
+        pass  # keep connection alive
 
     except Exception as e:
         await interaction.response.send_message(f"Error: `{e}`", ephemeral=True)
@@ -15682,7 +15748,7 @@ async def check_loop():
 
     except Exception as e:
         print("Loop processing error:", e)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 # ---------------- REMINDER LOOP ----------------
 @tasks.loop(minutes=30)
@@ -15726,7 +15792,7 @@ async def reminder_loop():
 
     except Exception as e:
         print("Reminder loop error:", e)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 # ---------------- PS99 WAR POLL ----------------
 ps99_first_check = True
@@ -15851,7 +15917,7 @@ async def war_poll_loop():
 
     except Exception as e:
         print("War poll error:", e)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
         
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
 @tasks.loop(minutes=10)
@@ -15931,7 +15997,7 @@ async def clan_leave_loop():
 
     except Exception as e:
         print("Clan leave loop error:", e)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 # ---------------- CLAN REVIEW VIEW ----------------
 class ClanReviewView(discord.ui.View):
@@ -18222,7 +18288,7 @@ async def hourly_stats_loop():
         print(f"[hourly stats] card sent to {channel_id} for slot {scheduled_slot.isoformat()}")
     except Exception as exc:
         print(f"[hourly stats] auto-send failed: {exc}")
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 
 @hourly_stats_loop.before_loop
@@ -18245,7 +18311,7 @@ async def hourly_player_snapshot_loop():
             print("[hourly stats] player snapshot saved/refreshed")
     except Exception as exc:
         print(f"[hourly stats] player snapshot loop failed: {exc}")
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 
 @hourly_player_snapshot_loop.before_loop
@@ -18342,7 +18408,7 @@ async def clan_log_loop():
         await process_clan_logs()
     except Exception as exc:
         print(f"[clan logs] loop failed: {exc}")
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 
 @clan_log_loop.before_loop
@@ -18742,7 +18808,7 @@ async def hub_war_collect_loop():
                 print(f"[hub war collector] failed: {data or text[:300]}")
     except Exception as exc:
         print("[hub war collector] error:", exc)
-    close_db_connection()
+    pass  # keep connection alive (Supabase has no compute hour limit)
 
 
 @hub_war_collect_loop.before_loop
