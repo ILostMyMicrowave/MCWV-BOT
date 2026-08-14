@@ -45,7 +45,7 @@ ADMIN_API_KEY = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API
 ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
 HUB_BASE_URL = (os.environ.get("MCWV_HUB_URL") or os.environ.get("HUB_URL") or "https://mcwv-hub.vercel.app").rstrip("/")
 WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "")
-WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "5") or "5"))
+WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "1") or "1"))
 OFFICER_GUIDE_ROLE_ID = int(os.environ.get("OFFICER_GUIDE_ROLE_ID", "1501986357516701827"))
 STARTED_AT = time.time()
 LAST_HEARTBEAT = datetime.now(timezone.utc).isoformat()
@@ -15306,13 +15306,9 @@ async def run_initial_presence_check():
         print("Initial sync error:", e)
 
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=2)
 async def check_loop():
     if not bot_enabled:
-        return
-
-    # Skip presence checks during peacetime to save Neon compute hours
-    if not ps99_war_active:
         return
 
     users = db_get_all_tracked()
@@ -15418,10 +15414,6 @@ async def check_loop():
 async def reminder_loop():
     try:
         if not bot_enabled or not offline_ping_enabled:
-            return
-
-        # Skip during peacetime
-        if not ps99_war_active:
             return
 
         if not offline_since:
@@ -15587,7 +15579,7 @@ async def war_poll_loop():
     close_db_connection()
         
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=10)
 async def clan_leave_loop():
     try:
         users = db_get_all_tracked()
@@ -15848,7 +15840,7 @@ def db_tickets_needing_screenshot_reminder():
         return []
 
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=10)
 async def ticket_screenshot_reminder_loop():
     await bot.wait_until_ready()
     rows = db_tickets_needing_screenshot_reminder()
@@ -17908,7 +17900,7 @@ def set_hourly_stats_channel_id(channel_id):
     db_set_setting("mcwv_hourly_stats_channel_id", int(channel_id))
 
 
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=1)
 async def hourly_stats_loop():
     await bot.wait_until_ready()
     try:
@@ -17945,7 +17937,7 @@ async def before_hourly_stats_loop():
     await bot.wait_until_ready()
 
 
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=1)
 async def hourly_player_snapshot_loop():
     await bot.wait_until_ready()
     try:
@@ -18048,12 +18040,9 @@ async def process_clan_logs():
     save_clan_log_state(current_state)
 
 
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=60)
 async def clan_log_loop():
     await bot.wait_until_ready()
-    # Skip during peacetime — clan logs only matter during war
-    if not ps99_war_active:
-        return
     if not clan_logs_enabled():
         return
     try:
@@ -18374,13 +18363,10 @@ async def send_placement_alert(snapshot, old_rank):
     return True
 
 
-@tasks.loop(seconds=120)
+@tasks.loop(seconds=30)
 async def placement_alert_loop():
     await bot.wait_until_ready()
     if not placement_alerts_enabled():
-        return
-    # Skip during peacetime — no battle to track
-    if not ps99_war_active:
         return
     snapshot = await get_mcwv_placement_snapshot()
     if not snapshot:
@@ -18431,10 +18417,6 @@ async def hub_war_collect_loop():
     global session
 
     if not HUB_BASE_URL:
-        return
-
-    # Skip during peacetime to save Neon compute hours
-    if not ps99_war_active:
         return
 
     try:
