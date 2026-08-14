@@ -12129,6 +12129,265 @@ async def fix_battle_times_cmd(interaction: discord.Interaction):
         await scan_session.close()
 
 
+@bot.tree.command(name="migrate_db", description="Copy ALL data from old DATABASE_URL (Neon) to new DATABASE_URL (Supabase)", guild=guild_obj)
+@require_role()
+async def migrate_db_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    old_url = os.environ.get("OLD_DATABASE_URL")
+    if not old_url:
+        return await interaction.followup.send("Set `OLD_DATABASE_URL` env var to the Neon connection string first.", ephemeral=True)
+    if not DATABASE_URL:
+        return await interaction.followup.send("New `DATABASE_URL` is not set.", ephemeral=True)
+
+    await interaction.followup.send(
+        "Starting full database migration...\n"
+        "Reading from `OLD_DATABASE_URL` (Neon) → writing to `DATABASE_URL` (Supabase)\n"
+        "This runs in the background. Check logs for progress.",
+        ephemeral=True,
+    )
+    asyncio.create_task(_run_db_migration(interaction.channel_id, old_url, DATABASE_URL))
+
+
+async def _run_db_migration(progress_channel_id, old_url, new_url):
+    """Background task: copy all tables from old DB to new DB."""
+    from psycopg2.extras import execute_values
+
+    started = time.time()
+
+    # Tables in dependency order (parents first)
+    ALL_TABLES = [
+        "users", "settings", "user_status", "user_alts", "player_presence_events",
+        "admin_logs", "mcwv_tickets", "mcwv_ticket_applications", "mcwv_ticket_actions",
+        "mcwv_ticket_transcripts", "mcwv_ticket_blacklist",
+        "cross_clan_player_history", "cross_clan_members",
+        "invite_events", "invite_counts", "invite_used_users", "invite_cache",
+        "giveaway_events", "player_leaderboard_history",
+        "hourly_stats_player_snapshots", "hourly_stats_ping_records", "clan_history",
+    ]
+
+    old_conn = None
+    new_conn = None
+    total_rows = 0
+
+    try:
+        print(f"[migrate_db] connecting to old DB (Neon)...")
+        old_conn = psycopg2.connect(old_url, sslmode="require", connect_timeout=10)
+        old_conn.autocommit = True
+
+        print(f"[migrate_db] connecting to new DB (Supabase)...")
+        new_conn = psycopg2.connect(new_url, sslmode="require", connect_timeout=10)
+        new_conn.autocommit = False
+
+        # Get all tables that actually exist in old DB
+        with old_conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """)
+            existing = {row[0] for row in cur.fetchall()}
+
+        tables = [t for t in ALL_TABLES if t in existing]
+        # Add any tables we didn't list
+        for t in sorted(existing):
+            if t not in tables:
+                tables.append(t)
+
+        print(f"[migrate_db] {len(tables)} tables to migrate")
+
+        for table_name in tables:
+            print(f"[migrate_db] migrating {table_name}...")
+
+            # Get row count
+            with old_conn.cursor() as cur:
+                cur.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+            old_count = int(cur.fetchone()[0])
+
+            if old_count == 0:
+                print(f"[migrate_db] {table_name}: empty, skipping data (table will be created on startup)")
+                continue
+
+            # Get column names
+            with old_conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = %s AND table_schema = 'public'
+                    ORDER BY ordinal_position
+                """, (table_name,))
+                col_names = [row[0] for row in cur.fetchall()]
+
+            # Get CREATE TABLE SQL from old DB
+            with old_conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        c.column_name, c.data_type, c.character_maximum_length,
+                        c.column_default, c.is_nullable
+                    FROM information_schema.columns c
+                    WHERE c.table_name = %s AND c.table_schema = 'public'
+                    ORDER BY c.ordinal_position
+                """, (table_name,))
+                cols_info = cur.fetchall()
+
+                # Get PK
+                cur.execute("""
+                    SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                    WHERE tc.table_name = %s AND tc.constraint_type = 'PRIMARY KEY'
+                """, (table_name,))
+                pk_cols = [row[0] for row in cur.fetchall()]
+
+                # Get unique constraints
+                cur.execute("""
+                    SELECT con.conname, string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position)
+                    FROM information_schema.table_constraints tc
+                    JOIN pg_constraint con ON con.conname = tc.constraint_name
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                    WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
+                    GROUP BY con.conname
+                """, (table_name,))
+                unique_constraints = cur.fetchall()
+
+            # Build CREATE TABLE for new DB
+            col_defs = []
+            for col_name, data_type, max_len, default, nullable in cols_info:
+                type_str = data_type
+                if max_len:
+                    type_str = f"{data_type}({max_len})"
+                parts = [f'"{col_name}"', type_str]
+                if default and "nextval" not in str(default):
+                    parts.append(f"DEFAULT {default}")
+                if nullable == "NO":
+                    parts.append("NOT NULL")
+                col_defs.append(" ".join(parts))
+            if pk_cols:
+                col_defs.append(f"PRIMARY KEY ({', '.join(f'\"{c}\"' for c in pk_cols)})")
+            for con_name, con_cols in unique_constraints:
+                col_defs.append(f"UNIQUE ({con_cols})")
+
+            create_sql = f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n  ' + ",\n  ".join(col_defs) + "\n)"
+
+            # Create table in new DB
+            def _create_table():
+                try:
+                    with new_conn.cursor() as cur:
+                        cur.execute(create_sql)
+                    new_conn.commit()
+                except Exception:
+                    new_conn.rollback()
+            await asyncio.to_thread(_create_table)
+
+            # Copy data in batches
+            BATCH = 5000
+            col_list = ", ".join(f'"{c}"' for c in col_names)
+            migrated = 0
+
+            with old_conn.cursor() as old_cur:
+                old_cur.execute(f'SELECT {col_list} FROM "{table_name}"')
+
+                while True:
+                    batch = old_cur.fetchmany(BATCH)
+                    if not batch:
+                        break
+
+                    def _insert_batch(btch=batch, cl=col_list, tn=table_name, cn=col_names):
+                        try:
+                            with new_conn.cursor() as cur:
+                                # Skip the serial/identity column if it's auto-increment
+                                # by using OVERRIDING SYSTEM VALUE
+                                placeholders = ", ".join(["%s"] * len(cn))
+                                sql = f'INSERT INTO "{tn}" ({cl}) OVERRIDING SYSTEM VALUE VALUES ({placeholders})'
+                                cur.executemany(sql, btch)
+                            new_conn.commit()
+                            return len(btch)
+                        except Exception:
+                            new_conn.rollback()
+                            # Try with execute_values
+                            try:
+                                with new_conn.cursor() as cur:
+                                    execute_values(cur, f'INSERT INTO "{tn}" ({cl}) VALUES %s', btch, page_size=1000)
+                                new_conn.commit()
+                                return len(btch)
+                            except Exception:
+                                new_conn.rollback()
+                                # Row by row, skip conflicts
+                                ok = 0
+                                for row in btch:
+                                    try:
+                                        with new_conn.cursor() as cur:
+                                            cur.execute(f'INSERT INTO "{tn}" ({cl}) VALUES %s', (row,))
+                                        new_conn.commit()
+                                        ok += 1
+                                    except Exception:
+                                        new_conn.rollback()
+                                return ok
+
+                    inserted = await asyncio.to_thread(_insert_batch)
+                    migrated += inserted
+                    print(f"[migrate_db] {table_name}: {migrated:,}/{old_count:,}", end="\r")
+                    await asyncio.sleep(0)
+
+            # Recreate indexes
+            with old_conn.cursor() as cur:
+                cur.execute("""
+                    SELECT indexdef FROM pg_indexes
+                    WHERE tablename = %s AND schemaname = 'public'
+                    AND indexname NOT LIKE '%_pkey'
+                """, (table_name,))
+                for (idx_sql,) in cur.fetchall():
+                    try:
+                        def _create_idx(sql=idx_sql):
+                            try:
+                                with new_conn.cursor() as cur:
+                                    cur.execute(sql)
+                                new_conn.commit()
+                            except Exception:
+                                new_conn.rollback()
+                        await asyncio.to_thread(_create_idx)
+                    except Exception:
+                        pass
+
+            print(f"[migrate_db] ✅ {table_name}: {migrated:,} rows")
+            total_rows += migrated
+
+        elapsed = time.time() - started
+        summary = (
+            f"Database migration complete!\n"
+            f"Tables: **{len(tables)}**\n"
+            f"Total rows: **{total_rows:,}**\n"
+            f"Time: **{elapsed:.0f}s**\n"
+            f"All data copied from Neon to Supabase."
+        )
+        print(f"[migrate_db] {summary}")
+
+        try:
+            ch = bot.get_channel(progress_channel_id)
+            if ch is None:
+                ch = await bot.fetch_channel(progress_channel_id)
+            if ch:
+                await ch.send(summary)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[migrate_db] FATAL: {e}")
+        traceback.print_exc()
+    finally:
+        if old_conn:
+            try:
+                old_conn.close()
+            except Exception:
+                pass
+        if new_conn:
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+
+
 async def _fetch_clan_contributions(scan_session, clan_name):
     """Fetch one clan's legacy data and extract all battle contributions as raw rows."""
     try:
@@ -18409,9 +18668,12 @@ async def process_clan_logs():
     save_clan_log_state(current_state)
 
 
-@tasks.loop(seconds=180)
+@tasks.loop(minutes=5)
 async def clan_log_loop():
     await bot.wait_until_ready()
+    # Skip during peacetime — clan logs only matter during war
+    if not ps99_war_active:
+        return
     if not clan_logs_enabled():
         return
     try:
