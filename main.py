@@ -2953,13 +2953,20 @@ async def track_admin_command_completion(interaction: discord.Interaction, comma
     global COMMANDS_EXECUTED
     COMMANDS_EXECUTED += 1
 
-cooldowns = commands.CooldownMapping.from_cooldown(
-    1, 10, commands.BucketType.user
-)
+# Automatic cooldown: 1 command per 3 seconds per user
+COOLDOWN_SECONDS = 3
+_user_cooldowns = {}
+
 def check_cooldown(interaction: discord.Interaction):
-    bucket = cooldowns.get_bucket(interaction)
-    retry_after = bucket.update_rate_limit()
-    return retry_after
+    """Returns retry_after seconds if on cooldown, 0 if OK."""
+    uid = interaction.user.id
+    now = time.time()
+    last = _user_cooldowns.get(uid, 0)
+    retry = COOLDOWN_SECONDS - (now - last)
+    if retry > 0:
+        return retry
+    _user_cooldowns[uid] = now
+    return 0
 
 session = None
 bot_enabled = True
@@ -3956,11 +3963,34 @@ def require_role():
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        await interaction.response.send_message(
-            "❌ You don't have permission to use this command.", ephemeral=True
-        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        except Exception:
+            pass
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        retry = error.retry_after
+        msg = f"\u23f3 Slow down! Try again in **{retry:.1f}s**."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
     else:
-        print("Command error:", error)
+        print(f"[command error] {error}")
+        traceback.print_exc()
+        try:
+            err_msg = f"\u26a0\ufe0f Something went wrong. The error has been logged."
+            if interaction.response.is_done():
+                await interaction.followup.send(err_msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(err_msg, ephemeral=True)
+        except Exception:
+            pass
 
 # ---------------- SLASH COMMANDS ----------------
 import random
@@ -10067,8 +10097,6 @@ def build_checkplayer_embed(data, page=0, per_page=7):
         status_parts.append("\u2754 Clan unknown")
     if active_points and active_points > 0:
         status_parts.append(f"\u2694\ufe0f {format_points(active_points)} pts")
-    if earned_medals_agg:
-        status_parts.append(f"\U0001f3c5 {earned_medals_agg}")
     if total_battles_agg:
         status_parts.append(f"\U0001f4ca {total_battles_agg} battles")
     embed.description = f"ID: `{roblox_id}`\n{' | '.join(status_parts)}"
@@ -10116,14 +10144,13 @@ def build_checkplayer_embed(data, page=0, per_page=7):
             rank = _safe_int(row.get("rank"))
             total = _safe_int(row.get("total")) or 0
             place = row.get("clanPlace")
-            medal = " \U0001f949" if row.get("earnedMedal") else ""
             clan_display = f"**{clan}**" if clan.upper() == CLAN_NAME.upper() else clan
             participated = row.get("participated_only")
 
             if participated:
                 # Participated but no score data (from AwardUserIDs)
                 place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
-                line1 = f"`{title}` \u2014 {clan_display}{medal}"
+                line1 = f"`{title}` \u2014 {clan_display}"
                 line2 = f"\u2713 participated (no score data){place_str}"
             elif rank > 0 and total > 1:
                 pct = float(row.get("betterThan") or ((total - rank) / total * 100))
@@ -10139,14 +10166,14 @@ def build_checkplayer_embed(data, page=0, per_page=7):
                 else:
                     better_txt = f"\U0001f534 _{pct:.1f}%_"
                 place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
-                line1 = f"`{title}` \u2014 {clan_display}{medal}"
+                line1 = f"`{title}` \u2014 {clan_display}"
                 stats_parts = [f"**{format_points(pts)}**", rank_txt, f"{better_txt} better"]
                 if place_str:
                     stats_parts.append(f"clan #{int(place)}")
                 line2 = " \u00b7 ".join(stats_parts)
             else:
                 place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
-                line1 = f"`{title}` \u2014 {clan_display}{medal}"
+                line1 = f"`{title}` \u2014 {clan_display}"
                 line2 = f"{format_points(pts)} pts{place_str}"
 
             projected = len("\n".join(table_lines + [line1, line2]))
@@ -10252,6 +10279,8 @@ class CheckPlayerView(discord.ui.View):
         return max(1, (len(rows) + self.per_page - 1) // self.per_page)
 
     async def _move(self, interaction, delta):
+        # Defer FIRST so Discord doesn't timeout while we generate the image
+        await interaction.response.defer()
         self.page = (self.page + delta) % self.total_pages()
         embed = build_checkplayer_embed(self.data, page=self.page, per_page=self.per_page)
         if self.avatar_url:
@@ -10260,16 +10289,14 @@ class CheckPlayerView(discord.ui.View):
             image = await generate_checkplayer_card(self.data, self.avatar_url, page=self.page, per_page=self.per_page)
             file = discord.File(image, filename="checkplayer-card.png")
             embed.set_image(url="attachment://checkplayer-card.png")
-            await interaction.response.edit_message(embed=embed, attachments=[file], view=self)
+            await interaction.edit_original_response(embed=embed, attachments=[file], view=self)
         except Exception as exc:
             print(f"[checkplayer] page {self.page} image failed: {exc}")
+            traceback.print_exc()
             try:
-                await interaction.response.edit_message(embed=embed, view=self)
+                await interaction.edit_original_response(embed=embed, view=self)
             except Exception:
-                try:
-                    await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
-                except Exception:
-                    pass
+                pass
 
     @discord.ui.button(label="\u25c0", style=discord.ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -10425,8 +10452,6 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
         badges.append("MCWV")
     elif data["is_currently_rival"]:
         badges.append(data["current_clan_name"])
-    if data.get("earned_medals_agg"):
-        badges.append(f"{data['earned_medals_agg']} medals")
     if data.get("total_battles_agg"):
         badges.append(f"{data['total_battles_agg']} battles")
 
@@ -10493,8 +10518,6 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
             # Clan tag
             cc = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (130, 140, 165, 255)
             clan_str = f"[{clan}]"
-            if row.get("earnedMedal"):
-                clan_str += "  \u00b7 medal"
             d.text((C_NAME, y + sc(22)), clan_str, font=F["stats"], fill=cc)
 
             # Points (aligned)
@@ -10744,8 +10767,7 @@ async def compareplayer(interaction: discord.Interaction, player1: str, player2:
             elif d["is_currently_rival"]:
                 parts.append(f"\U0001f575 {d['current_clan_name']}")
             if d["earned_medals_agg"]:
-                parts.append(f"\U0001f3c5 {d['earned_medals_agg']}")
-            parts.append(f"\U0001f4ca {d['total_battles_agg']} battles")
+                parts.append(f"\U0001f4ca {d['total_battles_agg']} battles")
             return " | ".join(parts)
 
         embed.description = f"**{d1['roblox_name']}**\n{player_summary(d1)}\n\n**{d2['roblox_name']}**\n{player_summary(d2)}"
@@ -10754,9 +10776,6 @@ async def compareplayer(interaction: discord.Interaction, player1: str, player2:
         r1_battles = len(d1["rows"])
         r2_battles = len(d2["rows"])
         embed.add_field(name="\U0001f4ca Battles", value=f"**{d1['roblox_name']}**: {r1_battles}\n**{d2['roblox_name']}**: {r2_battles}", inline=True)
-
-        # Medals
-        embed.add_field(name="\U0001f3c5 Medals", value=f"**{d1['roblox_name']}**: {d1['earned_medals_agg']}\n**{d2['roblox_name']}**: {d2['earned_medals_agg']}", inline=True)
 
         # Best percentile
         def best_pct(d):
@@ -15338,6 +15357,156 @@ async def status(interaction: discord.Interaction, member: discord.Member):
     except Exception as e:
         print("[status error]", e)
         await interaction.followup.send("❌ Error", ephemeral=True)
+
+
+# ---------------- /whois COMMAND ----------------
+
+@bot.tree.command(name="whois", description="Look up a Discord member's linked Roblox account and war stats", guild=guild_obj)
+@app_commands.describe(member="Discord member to look up")
+@require_role()
+async def whois(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        discord_id = member.id
+        main_link = db_get_main_link(discord_id)
+        alts = db_get_alts(discord_id)
+
+        if not main_link and not alts:
+            return await interaction.followup.send(f"No Roblox account linked for **{member.display_name}**.", ephemeral=True)
+
+        embed = discord.Embed(title=f"\U0001f464 {member.display_name}", description=f"<@{discord_id}>", color=discord.Color(MCWV_BRAND_COLOR), timestamp=datetime.now(timezone.utc))
+
+        if main_link:
+            roblox_id, roblox_name = main_link
+            embed.add_field(name="\U0001f3ae Main Roblox", value=f"**{roblox_name}**\n`ID: {roblox_id}`\n[Profile](https://www.roblox.com/users/{roblox_id}/profile)", inline=True)
+            try:
+                status_val = status_cache.get(str(roblox_id).strip())
+                status_label = status_text(status_val) if status_val is not None else "Unknown"
+                embed.add_field(name="\U0001f7e2 Status", value=status_label, inline=True)
+            except Exception:
+                embed.add_field(name="\U0001f7e2 Status", value="Unknown", inline=True)
+            try:
+                avatar_url = await get_roblox_headshot_url(roblox_id)
+                if avatar_url:
+                    embed.set_thumbnail(url=avatar_url)
+            except Exception:
+                pass
+            try:
+                cached = get_cached_player_history(roblox_id)
+                if cached:
+                    bc = len(cached)
+                    medals = sum(1 for r in cached if r.get("earnedMedal"))
+                    clans = list(dict.fromkeys(str(r.get("clan") or "") for r in cached if r.get("clan")))
+                    best_pct = 0
+                    ranked = [r for r in cached if r.get("rank") and r.get("total")]
+                    if ranked:
+                        best_pct = max(float(r.get("betterThan") or ((int(r.get("total")) - int(r.get("rank"))) / int(r.get("total")) * 100)) for r in ranked)
+                    embed.add_field(name="\u2694\ufe0f War History", value=f"{bc} battles \u00b7 {medals} medals \u00b7 best {best_pct:.0f}%", inline=True)
+                    if clans:
+                        embed.add_field(name="\U0001f4cb Clans", value=" \u2192 ".join(clans[:6]), inline=False)
+            except Exception:
+                pass
+
+        if alts:
+            alt_lines = [f"**{name}** (`{rid}`)" for rid, name in alts[:5]]
+            embed.add_field(name=f"\U0001f510 Alt Accounts ({len(alts)})", value="\n".join(alt_lines), inline=False)
+
+        created = member.created_at
+        joined = member.joined_at if hasattr(member, "joined_at") else None
+        embed.add_field(name="\U0001f4c5 Discord", value=f"Account: {discord.utils.format_dt(created, 'R')}\nJoined: {discord.utils.format_dt(joined, 'R') if joined else 'Unknown'}", inline=True)
+        role_names = [r.name for r in member.roles if r.name != "@everyone"][:8]
+        if role_names:
+            embed.add_field(name="\U0001f3c5 Roles", value=", ".join(role_names), inline=True)
+
+        embed.set_footer(text=f"Lookup by {interaction.user}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"[whois] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Lookup failed: `{type(e).__name__}`", ephemeral=True)
+
+
+# ---------------- /botstats COMMAND ----------------
+
+@bot.tree.command(name="botstats", description="Show bot health, uptime, loop status, and stats", guild=guild_obj)
+@require_role()
+async def botstats(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        uptime = int(time.time() - STARTED_AT)
+        hours, rem = divmod(uptime, 3600)
+        minutes, seconds = divmod(rem, 60)
+        days, hours = divmod(hours, 24)
+        uptime_str = f"{days}d {hours}h {minutes}m"
+
+        ping = round(bot.latency * 1000) if bot.latency else 0
+        ready = bot.is_ready()
+
+        embed = discord.Embed(title="\U0001f9fe Bot Status", color=discord.Color.green() if ready else discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+        embed.description = f"{'\U0001f7e2 Online' if ready else '\U0001f7e1 Starting'} \u00b7 Ping: **{ping}ms**"
+
+        embed.add_field(name="\u23f1 Uptime", value=uptime_str, inline=True)
+        embed.add_field(name="\U0001f4e6 Commands Run", value=str(COMMANDS_EXECUTED), inline=True)
+        embed.add_field(name="\U0001f3d8 Servers", value=str(len(bot.guilds)), inline=True)
+
+        db_ok = _db_connected()
+        tracked = _tracked_players()
+        embed.add_field(name="\U0001f4be Database", value=f"{'\u2705 Connected' if db_ok else '\u274c Disconnected'}\n{tracked} tracked", inline=True)
+        embed.add_field(name="\u2694\ufe0f War", value=f"{'Active' if ps99_war_active else 'Peacetime'}\n{PS99_CURRENT_WAR_NAME or 'None'}", inline=True)
+
+        loop_names = [("Presence", "check_loop"), ("War Poll", "war_poll_loop"), ("Reminder", "reminder_loop"), ("Clan Leave", "clan_leave_loop"), ("Placement", "placement_alert_loop"), ("Clan Logs", "clan_log_loop"), ("Hourly Stats", "hourly_stats_loop"), ("Hourly Snapshot", "hourly_player_snapshot_loop"), ("Hub Collector", "hub_war_collect_loop"), ("Screenshot", "ticket_screenshot_reminder_loop"), ("Broadcast", "broadcast_scheduler_loop"), ("Giveaway", "check_giveaway_event")]
+        loop_lines = []
+        for label, ln in loop_names:
+            lo = globals().get(ln)
+            if lo:
+                running = lo.is_running()
+                icon = "\u2705" if running else "\u26ab"
+                interval = ""
+                if hasattr(lo, "seconds") and lo.seconds:
+                    interval = f" ({lo.seconds}s)"
+                elif hasattr(lo, "minutes") and lo.minutes:
+                    interval = f" ({lo.minutes}m)"
+                loop_lines.append(f"{icon} {label}{interval}")
+            else:
+                loop_lines.append(f"\u2753 {label}")
+        embed.add_field(name="\U0001f501 Loops", value="\n".join(loop_lines), inline=False)
+
+        try:
+            if psutil:
+                proc = psutil.Process(os.getpid())
+                mem_mb = round(proc.memory_info().rss / 1024 / 1024, 1)
+                cpu = round(psutil.cpu_percent(interval=None), 1)
+                embed.add_field(name="\U0001f4be RAM", value=f"{mem_mb} MB", inline=True)
+                embed.add_field(name="\U0001f9ee CPU", value=f"{cpu}%", inline=True)
+        except Exception:
+            pass
+
+        embed.set_footer(text=f"Bot ID: {bot.user.id if bot.user else '?'}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"[botstats] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Stats failed: `{type(e).__name__}`", ephemeral=True)
+
+
+# ---------------- AUTO-RECONNECT ----------------
+
+@bot.event
+async def on_resumed():
+    print("\u2705 Session resumed (gateway reconnected)")
+    try:
+        await update_bot_presence()
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_connect():
+    print("\u2705 Connected to Discord gateway")
+    global session
+    if session is None or (hasattr(session, "closed") and session.closed):
+        session = aiohttp.ClientSession()
+
 
         import asyncio
 from datetime import datetime, timezone, timedelta
