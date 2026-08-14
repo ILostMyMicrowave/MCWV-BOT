@@ -45,7 +45,7 @@ ADMIN_API_KEY = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API
 ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
 HUB_BASE_URL = (os.environ.get("MCWV_HUB_URL") or os.environ.get("HUB_URL") or "https://mcwv-hub.vercel.app").rstrip("/")
 WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "")
-WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "1") or "1"))
+WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "5") or "5"))
 OFFICER_GUIDE_ROLE_ID = int(os.environ.get("OFFICER_GUIDE_ROLE_ID", "1501986357516701827"))
 STARTED_AT = time.time()
 LAST_HEARTBEAT = datetime.now(timezone.utc).isoformat()
@@ -10021,6 +10021,7 @@ async def gather_player_data(roblox_id, roblox_name):
 
     # 1. Cache (instant)
     cached_rows = get_cached_player_history(roblox_id)
+    print(f"[checkplayer] {roblox_name} (ID:{roblox_id}) — cache: {len(cached_rows)} rows")
 
     # 2. V1 summary (1 API call) for current clan + active points
     summary_payload = await _ps99_json(f"{PS99_API}/v1/clans/players/{roblox_id}")
@@ -10067,6 +10068,61 @@ async def gather_player_data(roblox_id, roblox_name):
     for cn in scraped_clans:
         if cn.upper() not in clans_in_cache and cn not in clans_from_scrape_only:
             clans_from_scrape_only.append(cn)
+
+    # 6b. Scan AwardUserIDs for clans the player was in but has no battle data for.
+    # The API returns AwardUserIDs (full 75-member roster) even for past battles
+    # where PointContributions only has top scorers. This captures battles where
+    # the player participated but wasn't a top scorer.
+    existing_battle_ids = {str(r.get("battleId") or "").lower() for r in rows}
+    award_battles = []
+    clans_to_scan = set()
+    # Add clans from scrape that have no battle data
+    for cn in clans_from_scrape_only:
+        clans_to_scan.add(cn)
+    # Also add rival clans from cache that have 0 battles
+    for cn, stats in clan_stats.items():
+        if stats["battles"] == 0:
+            clans_to_scan.add(cn)
+
+    for clan_name in list(clans_to_scan)[:5]:  # cap at 5 to limit API calls
+        try:
+            clan_data = await _fetch_clan_data(clan_name)
+            if not clan_data or not isinstance(clan_data, dict):
+                continue
+            battles = clan_data.get("Battles") or {}
+            if not isinstance(battles, dict):
+                continue
+            for bid, battle in battles.items():
+                if not isinstance(battle, dict):
+                    continue
+                bid_lower = str(bid).lower()
+                if bid_lower in existing_battle_ids:
+                    continue
+                award_ids = battle.get("AwardUserIDs") or []
+                if not isinstance(award_ids, list):
+                    continue
+                if int(roblox_id) in award_ids:
+                    # Player participated but points unknown
+                    award_battles.append({
+                        "battleId": str(bid),
+                        "title": _friendly_battle_name(str(bid)),
+                        "clan": str(clan_name),
+                        "points": 0,
+                        "rank": None,
+                        "total": None,
+                        "clanPlace": battle.get("Place") or battle.get("place"),
+                        "earnedMedal": bool(battle.get("EarnedMedal") or battle.get("earnedMedal")),
+                        "startTime": _safe_int(battle.get("StartTime") or battle.get("startTime")),
+                        "participated_only": True,
+                    })
+                    existing_battle_ids.add(bid_lower)
+        except Exception as exc:
+            print(f"[checkplayer] AwardUserIDs scan failed for {clan_name}: {exc}")
+
+    if award_battles:
+        print(f"[checkplayer] {roblox_name} — found {len(award_battles)} participated-only battles via AwardUserIDs")
+        rows.extend(award_battles)
+        rows.sort(key=_battle_sort_key, reverse=True)
 
     # 7. Analyze
     clans_seen = []
@@ -10225,30 +10281,36 @@ def build_checkplayer_embed(data, page=0, per_page=7):
             place = row.get("clanPlace")
             medal = " \U0001f949" if row.get("earnedMedal") else ""
             clan_display = f"**{clan}**" if clan.upper() == CLAN_NAME.upper() else clan
+            participated = row.get("participated_only")
 
-            if rank > 0 and total > 1:
+            if participated:
+                # Participated but no score data (from AwardUserIDs)
+                place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
+                line1 = f"`{title}` \u2014 {clan_display}{medal}"
+                line2 = f"\u2713 participated (no score data){place_str}"
+            elif rank > 0 and total > 1:
                 pct = float(row.get("betterThan") or ((total - rank) / total * 100))
                 rank_txt = f"#{rank:,}/{total:,}"
-                if pct >= 90:
-                    better_txt = f"**{pct:.1f}%** better"
+                # Percentile with visual indicator
+                if pct >= 95:
+                    pct_icon = "\U0001f451"
+                    better_txt = f"{pct_icon} **{pct:.1f}%**"
+                elif pct >= 80:
+                    better_txt = f"\U0001f7e2 **{pct:.1f}%**"
                 elif pct >= 50:
-                    better_txt = f"{pct:.1f}% better"
+                    better_txt = f"\U0001f7e1 {pct:.1f}%"
                 else:
-                    better_txt = f"_{pct:.1f}% better_"
+                    better_txt = f"\U0001f534 _{pct:.1f}%_"
+                place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
+                line1 = f"`{title}` \u2014 {clan_display}{medal}"
+                stats_parts = [f"**{format_points(pts)}**", rank_txt, f"{better_txt} better"]
+                if place_str:
+                    stats_parts.append(f"clan #{int(place)}")
+                line2 = " \u00b7 ".join(stats_parts)
             else:
-                rank_txt = ""
-                better_txt = ""
-
-            place_txt = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
-            line1 = f"**{title}** \u2014 {clan_display}{medal}"
-            stats_parts = [format_points(pts)]
-            if rank_txt:
-                stats_parts.append(rank_txt)
-            if better_txt:
-                stats_parts.append(better_txt)
-            if place_txt:
-                stats_parts.append(f"clan #{int(place)}")
-            line2 = " \u00b7 ".join(stats_parts)
+                place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
+                line1 = f"`{title}` \u2014 {clan_display}{medal}"
+                line2 = f"{format_points(pts)} pts{place_str}"
 
             projected = len("\n".join(table_lines + [line1, line2]))
             if projected > MAX_FIELD_LEN:
@@ -10259,7 +10321,7 @@ def build_checkplayer_embed(data, page=0, per_page=7):
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         shown = len(table_lines) // 2
         embed.add_field(
-            name=f"\U0001f4ca War History ({len(rows)} battles, page {page+1}/{total_pages})",
+            name=f"\U0001f4ca War History \u00b7 {len(rows)} battles \u00b7 Page {page+1}/{total_pages}",
             value="\n".join(table_lines) or "No battle data.",
             inline=False,
         )
@@ -10273,18 +10335,18 @@ def build_checkplayer_embed(data, page=0, per_page=7):
         avg_pct = sum(r["pct"] for r in rank_values) / len(rank_values)
 
         embed.add_field(
-            name="\U0001f3c6 Best",
-            value=f"**{best['pct']:.1f}%**\n#{best['rank']:,}/{best['total']:,}\n_{best['clan']}_",
+            name="\U0001f3c6 Best Finish",
+            value=f"**{best['pct']:.1f}%** better\n#{best['rank']:,}/{best['total']:,}\n_{best['clan']}_",
             inline=True,
         )
         embed.add_field(
             name="\U0001f4ca Average",
-            value=f"**{avg_pct:.1f}%**\nbetter than\nglobal",
+            value=f"**{avg_pct:.1f}%** better\nthan global\n{len(rank_values)} ranked battles",
             inline=True,
         )
         embed.add_field(
-            name="\U0001f53b Worst",
-            value=f"**{worst['pct']:.1f}%**\n#{worst['rank']:,}/{worst['total']:,}",
+            name="\U0001f53b Worst Finish",
+            value=f"**{worst['pct']:.1f}%** better\n#{worst['rank']:,}/{worst['total']:,}",
             inline=True,
         )
 
@@ -10328,7 +10390,13 @@ def build_checkplayer_embed(data, page=0, per_page=7):
         data_sources.append("scrape")
     source_txt = " + ".join(data_sources) if data_sources else "PS99"
     total_pages = max(1, (len(rows) + per_page - 1) // per_page) if rows else 1
-    embed.set_footer(text=f"{source_txt} \u00b7 {len(rows)} battles \u00b7 page {page+1}/{total_pages}")
+
+    # Accuracy note on page 1 only
+    has_participated = any(r.get("participated_only") for r in rows)
+    footer_parts = [source_txt, f"{len(rows)} battles", f"pg {page+1}/{total_pages}"]
+    if page == 0:
+        footer_parts.append("pre-backfill wars may be incomplete")
+    embed.set_footer(text=" \u00b7 ".join(footer_parts))
 
     return embed
 
@@ -15635,11 +15703,13 @@ async def run_initial_presence_check():
         print("Initial sync error:", e)
 
 # ---------------- ROBLOX LOOP (every 2 min — detects transitions) ----------------
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=5)
 async def check_loop():
-    print("🔄 CHECK_LOOP HIT")
-
     if not bot_enabled:
+        return
+
+    # Skip presence checks during peacetime to save Neon compute hours
+    if not ps99_war_active:
         return
 
     users = db_get_all_tracked()
@@ -15747,6 +15817,10 @@ async def reminder_loop():
         if not bot_enabled or not offline_ping_enabled:
             return
 
+        # Skip during peacetime
+        if not ps99_war_active:
+            return
+
         if not offline_since:
             return
 
@@ -15791,7 +15865,7 @@ PS99_CURRENT_WAR_NAME = None
 
 ACTIVE_BATTLE_API = f"{PS99_API}/api/activeClanBattle"
 
-@tasks.loop(minutes=20)
+@tasks.loop(minutes=10)
 async def war_poll_loop():
     global bot_enabled, ps99_war_active, ps99_first_check, PS99_CURRENT_WAR_NAME, session
 
@@ -15879,7 +15953,7 @@ async def war_poll_loop():
     close_db_connection()
         
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=30)
 async def clan_leave_loop():
     try:
         users = db_get_all_tracked()
@@ -16140,7 +16214,7 @@ def db_tickets_needing_screenshot_reminder():
         return []
 
 
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=30)
 async def ticket_screenshot_reminder_loop():
     await bot.wait_until_ready()
     rows = db_tickets_needing_screenshot_reminder()
@@ -18195,7 +18269,7 @@ def set_hourly_stats_channel_id(channel_id):
     db_set_setting("mcwv_hourly_stats_channel_id", int(channel_id))
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=2)
 async def hourly_stats_loop():
     await bot.wait_until_ready()
     try:
@@ -18232,7 +18306,7 @@ async def before_hourly_stats_loop():
     await bot.wait_until_ready()
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=3)
 async def hourly_player_snapshot_loop():
     await bot.wait_until_ready()
     try:
@@ -18335,7 +18409,7 @@ async def process_clan_logs():
     save_clan_log_state(current_state)
 
 
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=180)
 async def clan_log_loop():
     await bot.wait_until_ready()
     if not clan_logs_enabled():
@@ -18658,10 +18732,13 @@ async def send_placement_alert(snapshot, old_rank):
     return True
 
 
-@tasks.loop(seconds=30)
+@tasks.loop(seconds=120)
 async def placement_alert_loop():
     await bot.wait_until_ready()
     if not placement_alerts_enabled():
+        return
+    # Skip during peacetime — no battle to track
+    if not ps99_war_active:
         return
     snapshot = await get_mcwv_placement_snapshot()
     if not snapshot:
@@ -18712,6 +18789,10 @@ async def hub_war_collect_loop():
     global session
 
     if not HUB_BASE_URL:
+        return
+
+    # Skip during peacetime to save Neon compute hours
+    if not ps99_war_active:
         return
 
     try:
