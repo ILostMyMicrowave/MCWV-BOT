@@ -3513,6 +3513,40 @@ def db_get_ticket_by_ticket_id(ticket_id):
         return None
 
 
+def db_get_ticket_by_opener(opener_discord_id, channel_id=None):
+    """Look up a ticket by the opener's Discord ID.
+    If channel_id is provided, prefer the ticket that matches both."""
+    if not db_enabled():
+        return None
+    db_ensure_mcwv_ticket_tables()
+    try:
+        with conn.cursor() as cur:
+            if channel_id:
+                cur.execute("""
+                    SELECT ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username, status, claimed_by
+                    FROM mcwv_tickets
+                    WHERE opener_discord_id = %s
+                    ORDER BY (channel_id = %s) DESC, created_at DESC
+                    LIMIT 1
+                """, (int(opener_discord_id), int(channel_id)))
+            else:
+                cur.execute("""
+                    SELECT ticket_id, channel_id, guild_id, opener_discord_id, roblox_id, roblox_username, status, claimed_by
+                    FROM mcwv_tickets
+                    WHERE opener_discord_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (int(opener_discord_id),))
+            return cur.fetchone()
+    except Exception as e:
+        print("db_get_ticket_by_opener error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
 def db_save_ticket_application(ticket_id, roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept):
     if not db_enabled():
         return False
@@ -8545,14 +8579,44 @@ async def count_ticket_screenshot_attachments(channel, applicant_id, limit=250):
 
 
 def find_ticket_in_channel(channel):
-    """Look up a ticket by channel_id, with fallback to ticket_id from channel topic.
-    Works even if the channel was moved/renamed (channel_id changed)."""
+    """Look up a ticket by channel_id, with fallback to opener from channel topic.
+    The topic format is: mcwv-ticket-owner:DISCORD_ID"""
     row = db_get_ticket_by_channel(channel.id)
-    if not row and channel.topic:
-        ticket_match = re.search(r'app-\d+', channel.topic)
-        if ticket_match:
-            row = db_get_ticket_by_ticket_id(ticket_match.group(0))
-    return row
+    if row:
+        return row
+
+    if not channel.topic:
+        return None
+
+    topic = channel.topic
+
+    # Try app-XXXXX in topic (older format)
+    ticket_match = re.search(r'app-\d+', topic)
+    if ticket_match:
+        row = db_get_ticket_by_ticket_id(ticket_match.group(0))
+        if row:
+            return row
+
+    # Try mcwv-ticket-owner:DISCORD_ID (current format)
+    owner_match = re.search(r'mcwv-ticket-owner:(\d+)', topic)
+    if owner_match:
+        opener_id = int(owner_match.group(1))
+        row = db_get_ticket_by_opener(opener_id, channel.id)
+        if row:
+            return row
+
+    # Last resort: any large number in topic (Discord snowflake ID)
+    id_matches = re.findall(r'(\d{15,20})', topic)
+    for id_str in id_matches:
+        try:
+            opener_id = int(id_str)
+            row = db_get_ticket_by_opener(opener_id)
+            if row:
+                return row
+        except Exception:
+            continue
+
+    return None
 
 class ScreenshotUploadedView(discord.ui.View):
     def __init__(self):
@@ -12426,10 +12490,24 @@ async def reject_application(interaction: discord.Interaction, reason: str = Non
             # Try mcwv-ticket-owner pattern
             owner_match = re.search(r'mcwv-ticket-owner:(\d+)', topic)
             if owner_match:
-                # Channel has ticket owner but no ticket_id — search by opener
-                print(f"[reject] found ticket-owner in topic: {owner_match.group(1)}, but no ticket_id")
+                opener_id = int(owner_match.group(1))
+                print(f"[reject] trying opener_id from topic: {opener_id}")
+                row = db_get_ticket_by_opener(opener_id, channel_id)
+                if row:
+                    print(f"[reject] found by opener_id: {opener_id}")
 
-    # Last resort: search ALL tickets for this channel_id (maybe type mismatch)
+    # Last resort: any large number in topic
+    if not row and topic:
+        id_matches = re.findall(r'(\d{15,20})', topic)
+        for id_str in id_matches:
+            try:
+                opener_id = int(id_str)
+                row = db_get_ticket_by_opener(opener_id)
+                if row:
+                    break
+            except Exception:
+                continue
+
     if not row:
         print(f"[reject] no ticket found for channel_id={channel_id} or in topic={topic!r}")
         return await interaction.response.send_message("❌ Run this command inside an application ticket channel.", ephemeral=True)
