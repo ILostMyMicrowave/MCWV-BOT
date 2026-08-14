@@ -12393,15 +12393,36 @@ async def reject_application(interaction: discord.Interaction, reason: str = Non
     if not has_mcwv_ticket_staff_permission(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
 
-    # Try channel_id first, then fall back to ticket_id from channel topic
-    row = db_get_ticket_by_channel(interaction.channel.id)
-    if not row and interaction.channel.topic:
-        topic = interaction.channel.topic
+    channel = interaction.channel
+    channel_id = channel.id
+    topic = channel.topic or ""
+    
+    print(f"[reject] channel_id={channel_id}, topic={topic!r}, channel_name={channel.name}")
+
+    # Try channel_id first
+    row = db_get_ticket_by_channel(channel_id)
+    if row:
+        print(f"[reject] found by channel_id: ticket_id={row[0]}")
+    
+    # Fall back to ticket_id from channel topic
+    if not row and topic:
         ticket_match = re.search(r'app-\d+', topic)
         if ticket_match:
-            row = db_get_ticket_by_ticket_id(ticket_match.group(0))
+            found_id = ticket_match.group(0)
+            print(f"[reject] trying ticket_id from topic: {found_id}")
+            row = db_get_ticket_by_ticket_id(found_id)
+            if row:
+                print(f"[reject] found by ticket_id: {found_id}")
+        else:
+            # Try mcwv-ticket-owner pattern
+            owner_match = re.search(r'mcwv-ticket-owner:(\d+)', topic)
+            if owner_match:
+                # Channel has ticket owner but no ticket_id — search by opener
+                print(f"[reject] found ticket-owner in topic: {owner_match.group(1)}, but no ticket_id")
 
+    # Last resort: search ALL tickets for this channel_id (maybe type mismatch)
     if not row:
+        print(f"[reject] no ticket found for channel_id={channel_id} or in topic={topic!r}")
         return await interaction.response.send_message("❌ Run this command inside an application ticket channel.", ephemeral=True)
     status = str(row[6] or "").lower()
     if status == "accepted":
@@ -16067,6 +16088,9 @@ class ClanReviewView(discord.ui.View):
             if self.roblox_id not in pending_clan_removals:
                 return await interaction.response.send_message("Already handled.", ephemeral=True)
 
+            # Defer FIRST so Discord doesn't timeout during DB operations
+            await interaction.response.defer()
+
             data = pending_clan_removals.pop(self.roblox_id)
 
             guild = interaction.guild
@@ -16088,7 +16112,7 @@ class ClanReviewView(discord.ui.View):
             except Exception as e:
                 print("DB remove error:", e)
 
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content="✅ Member removed and processed.",
                 embed=interaction.message.embeds[0] if interaction.message.embeds else None,
                 view=None
