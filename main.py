@@ -9906,6 +9906,20 @@ async def gather_player_data(roblox_id, roblox_name):
         if cn.upper() not in clans_in_cache and cn not in clans_from_scrape_only:
             clans_from_scrape_only.append(cn)
 
+    # 6c. Build clan_stats early (needed by AwardUserIDs scan below)
+    clan_stats = {}
+    for row in rows:
+        cn = str(row.get("clan") or "Unknown").strip()
+        if cn not in clan_stats:
+            clan_stats[cn] = {"battles": 0, "total_points": 0, "best_points": 0, "medals": 0}
+        clan_stats[cn]["battles"] += 1
+        pts = _safe_int(row.get("points"))
+        clan_stats[cn]["total_points"] += pts
+        if pts > clan_stats[cn]["best_points"]:
+            clan_stats[cn]["best_points"] = pts
+        if row.get("earnedMedal"):
+            clan_stats[cn]["medals"] += 1
+
     # 6b. Scan AwardUserIDs for clans the player was in but has no battle data for.
     # The API returns AwardUserIDs (full 75-member roster) even for past battles
     # where PointContributions only has top scorers. This captures battles where
@@ -9976,20 +9990,6 @@ async def gather_player_data(roblox_id, roblox_name):
     current_clan_norm = _normalize_clan_name(current_clan_name)
     is_currently_mcwv = current_clan_norm == _normalize_clan_name(CLAN_NAME)
     is_currently_rival = current_clan_name != "Unknown" and current_clan_norm != _normalize_clan_name(CLAN_NAME)
-
-    # Per-clan breakdown
-    clan_stats = {}
-    for row in rows:
-        cn = str(row.get("clan") or "Unknown").strip()
-        if cn not in clan_stats:
-            clan_stats[cn] = {"battles": 0, "total_points": 0, "best_points": 0, "medals": 0}
-        clan_stats[cn]["battles"] += 1
-        pts = _safe_int(row.get("points"))
-        clan_stats[cn]["total_points"] += pts
-        if pts > clan_stats[cn]["best_points"]:
-            clan_stats[cn]["best_points"] = pts
-        if row.get("earnedMedal"):
-            clan_stats[cn]["medals"] += 1
 
     # Rank analysis
     rank_values = []
