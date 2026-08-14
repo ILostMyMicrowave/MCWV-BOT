@@ -8953,7 +8953,7 @@ class AcceptConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Yes, accept applicant", style=discord.ButtonStyle.success)
     async def confirm_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[0]) != str(self.ticket_id):
@@ -9048,7 +9048,7 @@ class CloseConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Continue to close", style=discord.ButtonStyle.danger)
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_ticket_id(self.ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[0]) != self.ticket_id:
@@ -9080,7 +9080,16 @@ class ApplicationReviewView(discord.ui.View):
                 if str(field.name).lower() == "ticket":
                     return str(field.value).replace("`", "").strip()
         except Exception:
-            return self.ticket_id
+            pass
+        # Try channel topic
+        try:
+            topic = interaction.channel.topic or ""
+            import re as _re
+            m = _re.search(r'app-\d+', topic)
+            if m:
+                return m.group(0)
+        except Exception:
+            pass
         return self.ticket_id
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_accept")
@@ -9088,7 +9097,7 @@ class ApplicationReviewView(discord.ui.View):
         if not self.staff_ok(interaction):
             return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         ticket_id = self.resolved_ticket_id(interaction)
-        row = db_get_ticket_by_ticket_id(ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(ticket_id) or find_ticket_in_channel(interaction.channel)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if str(row[6] or "").lower() == "accepted":
@@ -9112,7 +9121,7 @@ class ApplicationReviewView(discord.ui.View):
         if not self.staff_ok(interaction):
             return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         ticket_id = self.resolved_ticket_id(interaction)
-        row = db_get_ticket_by_ticket_id(ticket_id) or db_get_ticket_by_channel(interaction.channel.id)
+        row = db_get_ticket_by_ticket_id(ticket_id) or find_ticket_in_channel(interaction.channel)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
