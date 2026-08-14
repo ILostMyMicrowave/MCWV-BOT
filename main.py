@@ -2397,10 +2397,18 @@ def db_remove_all_links_for_discord(discord_id):
             if db_is_owner_discord(did):
                 return False, "Owner accounts cannot be removed from Roblox Links. Restore or edit the owner manually in the database."
 
+            # Get roblox_ids before deleting for memory cleanup
+            cur.execute("SELECT roblox_id FROM user_alts WHERE discord_id = %s", (did,))
+            alt_rids = [str(row[0]) for row in cur.fetchall()]
+            cur.execute("SELECT roblox_id FROM users WHERE discord_id = %s", (did,))
+            main_rids = [str(row[0]) for row in cur.fetchall()]
             cur.execute("DELETE FROM user_alts WHERE discord_id = %s", (did,))
             cur.execute("DELETE FROM users WHERE discord_id = %s", (did,))
 
         conn.commit()
+        # Clean up in-memory caches
+        for rid in alt_rids + main_rids:
+            cleanup_memory_for_removed_user(rid)
         return True, "Player fully removed (Roblox links + Hub login)."
     except Exception as e:
         conn.rollback()
@@ -3205,11 +3213,17 @@ def db_remove(did):
 
     try:
         with conn.cursor() as cur:
+            # Get roblox_ids before deleting so we can clean up memory
+            cur.execute("SELECT roblox_id FROM users WHERE discord_id = %s", (int(did),))
+            rids = [str(row[0]) for row in cur.fetchall()]
             cur.execute("""
                 DELETE FROM users
                 WHERE discord_id = %s
             """, (int(did),))
         conn.commit()
+        # Clean up in-memory caches
+        for rid in rids:
+            cleanup_memory_for_removed_user(rid)
     except Exception as e:
         print("db_remove error:", e)
         conn.rollback()
@@ -13184,7 +13198,7 @@ def db_get_member_war_career(roblox_id):
 
 
 
-@bot.tree.command(name="warinfo", description="Show current PS99 clan war details", guild=guild_obj)
+@bot.tree.command(name="warinfo", description="Show current war status, MCWV rank, pace, and top contributors", guild=guild_obj)
 async def warinfo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
 
@@ -13300,6 +13314,7 @@ async def warinfo(interaction: discord.Interaction):
 
     embed.add_field(name="🏆 Top Contributors", value=top_block, inline=False)
 
+    embed.timestamp = datetime.now(timezone.utc)
     mcwv_footer(embed, "PS99 live")
     await interaction.followup.send(embed=embed)
 
@@ -15504,7 +15519,7 @@ async def memberedit(
         )
         
 # ---------------- STATUS COMMAND ----------------
-@bot.tree.command(name="status", description="Check a member's Roblox status", guild=guild_obj)
+@bot.tree.command(name="status", description="Check a member's Roblox status and war info", guild=guild_obj)
 async def status(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
@@ -15515,7 +15530,7 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         target = next((u for u in users if int(u[1]) == member.id), None)
 
         if not target:
-            return await interaction.followup.send("❌ Not linked", ephemeral=True)
+            return await interaction.followup.send(f"❌ **{member.display_name}** is not linked to a Roblox account.", ephemeral=True)
 
         roblox_id = int(target[0])
         roblox_name = target[2]
@@ -15523,44 +15538,77 @@ async def status(interaction: discord.Interaction, member: discord.Member):
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
-        async with session.post(
-            "https://presence.roblox.com/v1/presence/users",
-            json={"userIds": [roblox_id]},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-
-            if r.status != 200:
-                return await interaction.followup.send("❌ Roblox API error", ephemeral=True)
-
-            data = await r.json()
-            pres = (data.get("userPresences") or [{}])[0]
+        # Get presence
+        pres = {}
+        try:
+            async with session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": [roblox_id]},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    pres = (data.get("userPresences") or [{}])[0]
+        except Exception:
+            pass
 
         ptype = int(pres.get("userPresenceType", 0) or 0)
         line = mcwv_presence_line(roblox_id, pres)
 
-        color = discord.Color.green() if ptype else discord.Color.dark_gray()
+        # Color based on status
+        if ptype == 2:
+            color = discord.Color.green()
+            status_emoji = "🎮"
+        elif ptype == 1:
+            color = discord.Color(0x3498DB)
+            status_emoji = "🟢"
+        elif ptype == 3:
+            color = discord.Color(0xE67E22)
+            status_emoji = "🔧"
+        else:
+            color = discord.Color.dark_gray()
+            status_emoji = "⚫"
 
         embed = discord.Embed(
-            title=f"🛰 {roblox_name}",
-            description=f"**{line}**",
+            title=f"{status_emoji} {roblox_name}",
+            description=f"{line}\n\n**Discord:** {member.mention}\n**Roblox ID:** `{roblox_id}`\n[Profile](https://www.roblox.com/users/{roblox_id}/profile)",
             color=color,
+            timestamp=datetime.now(timezone.utc),
         )
-        embed.add_field(name="Discord", value=member.mention, inline=True)
-        embed.add_field(name="🆔 Roblox ID", value=f"`{roblox_id}`", inline=True)
 
+        # Avatar
         try:
             avatar_url = await get_roblox_headshot_url(roblox_id)
+            if avatar_url:
+                embed.set_thumbnail(url=avatar_url)
         except Exception:
-            avatar_url = None
-        if avatar_url:
-            embed.set_thumbnail(url=avatar_url)
+            pass
 
-        mcwv_footer(embed, "Roblox presence")
+        # War stats from cache
+        try:
+            cached = get_cached_player_history(str(roblox_id))
+            if cached:
+                battle_count = len(cached)
+                ranked = [r for r in cached if r.get("rank") and r.get("total")]
+                best_pct = 0
+                if ranked:
+                    best_pct = max(float(r.get("betterThan") or ((int(r.get("total")) - int(r.get("rank"))) / int(r.get("total")) * 100)) for r in ranked)
+                clans = list(dict.fromkeys(str(r.get("clan") or "") for r in cached if r.get("clan")))
+                embed.add_field(
+                    name="⚔️ War History",
+                    value=f"{battle_count} battles · best {best_pct:.0f}% better\n{' → '.join(clans[:4])}" if clans else f"{battle_count} battles",
+                    inline=False,
+                )
+        except Exception:
+            pass
+
+        embed.set_footer(text=f"Requested by {interaction.user}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     except Exception as e:
         print("[status error]", e)
-        await interaction.followup.send("❌ Error", ephemeral=True)
+        traceback.print_exc()
+        await interaction.followup.send("❌ Error looking up status.", ephemeral=True)
 
 
 # ---------------- /whois COMMAND ----------------
@@ -16011,12 +16059,14 @@ async def war_poll_loop():
             bot_enabled = currently_active
             print(f"[INIT] War state set to {currently_active}")
             await update_bot_presence()
+            update_check_loop_interval()
             return
 
         if ps99_war_active != currently_active:
             ps99_war_active = currently_active
             bot_enabled = currently_active
             await update_bot_presence()
+            update_check_loop_interval()
 
             channel = await _get_channel(CHANNEL_ID)
             if not channel:
@@ -18973,6 +19023,159 @@ def start_bot_loops():
     # ---------------- GIVEAWAY LOOP ----------------
     if not check_giveaway_event.is_running():
         check_giveaway_event.start()
+
+    # ---------------- HEALTH MONITOR LOOP ----------------
+    if not health_monitor_loop.is_running():
+        health_monitor_loop.start()
+
+
+# ---------------- LOOP HEALTH MONITOR + DB HEALTH ----------------
+
+ALL_LOOPS = [
+    ("Presence", "check_loop"),
+    ("War Poll", "war_poll_loop"),
+    ("Reminder", "reminder_loop"),
+    ("Clan Leave", "clan_leave_loop"),
+    ("Placement", "placement_alert_loop"),
+    ("Clan Logs", "clan_log_loop"),
+    ("Hourly Stats", "hourly_stats_loop"),
+    ("Hourly Snapshot", "hourly_player_snapshot_loop"),
+    ("Hub Collector", "hub_war_collect_loop"),
+    ("Screenshot", "ticket_screenshot_reminder_loop"),
+    ("Broadcast", "broadcast_scheduler_loop"),
+    ("Giveaway", "check_giveaway_event"),
+]
+
+
+@tasks.loop(minutes=5)
+async def health_monitor_loop():
+    """Check all loops are running, restart dead ones. Also check DB connection."""
+    await bot.wait_until_ready()
+
+    # 1. Loop health check
+    restarted = []
+    for label, loop_name in ALL_LOOPS:
+        loop_obj = globals().get(loop_name)
+        if loop_obj is None:
+            continue
+        try:
+            if not loop_obj.is_running():
+                print(f"[health] ⚠️ {label} loop stopped — restarting")
+                loop_obj.start()
+                restarted.append(label)
+        except Exception as exc:
+            print(f"[health] ❌ Failed to restart {label}: {exc}")
+
+    if restarted:
+        print(f"[health] Restarted {len(restarted)} loops: {', '.join(restarted)}")
+
+    # 2. DB connection health check
+    if DATABASE_URL:
+        try:
+            if conn is None or conn.closed:
+                print("[health] ⚠️ DB connection dead — reconnecting")
+                ensure_db_connection()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+        except Exception as exc:
+            print(f"[health] ⚠️ DB health check failed: {exc} — reconnecting")
+            try:
+                ensure_db_connection()
+            except Exception:
+                print("[health] ❌ DB reconnect failed")
+
+
+@health_monitor_loop.before_loop
+async def before_health_monitor_loop():
+    await bot.wait_until_ready()
+
+
+# ---------------- WAR-AWARE PRESENCE INTERVAL ----------------
+
+def update_check_loop_interval():
+    """Adjust check_loop interval based on war state.
+    War: every 2 min. Peacetime: every 10 min."""
+    try:
+        if ps99_war_active:
+            check_loop.change_interval(minutes=2)
+        else:
+            check_loop.change_interval(minutes=10)
+    except Exception:
+        pass
+
+
+# ---------------- MEMORY CLEANUP ----------------
+
+def cleanup_memory_for_removed_user(roblox_id):
+    """Clean up in-memory caches when a user is removed from tracking."""
+    rid = str(roblox_id).strip()
+    status_cache.pop(rid, None)
+    status_cache_time.pop(rid, None)
+    offline_since.pop(rid, None)
+    PROFILE_CACHE.pop(rid, None)
+    try:
+        PROFILE_CACHE.pop(int(rid), None)
+    except Exception:
+        pass
+
+
+# ---------------- /cleanup_tickets COMMAND ----------------
+
+@bot.tree.command(name="cleanup_tickets", description="Mark tickets as closed if their Discord channel no longer exists", guild=guild_obj)
+@require_role()
+async def cleanup_tickets(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not db_enabled():
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ticket_id, channel_id, status
+                FROM mcwv_tickets
+                WHERE status IN ('open', 'pending')
+                ORDER BY created_at DESC
+                LIMIT 100
+            """)
+            rows = cur.fetchall()
+
+        if not rows:
+            return await interaction.followup.send("No open/pending tickets to check.", ephemeral=True)
+
+        closed_count = 0
+        checked = 0
+        for ticket_id, channel_id, status in rows:
+            if not channel_id:
+                continue
+            checked += 1
+            try:
+                channel = bot.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await bot.fetch_channel(int(channel_id))
+            except discord.NotFound:
+                try:
+                    db_update_ticket_status(ticket_id, "closed", interaction.user.id,
+                                            closed_at=datetime.now(timezone.utc),
+                                            closed_by=interaction.user.id,
+                                            close_reason="Channel deleted — auto-cleanup")
+                    closed_count += 1
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        await interaction.followup.send(
+            f"Checked **{checked}** open tickets.\n"
+            f"Closed **{closed_count}** tickets with deleted channels.",
+            ephemeral=True,
+        )
+    except Exception as e:
+        print(f"[cleanup_tickets] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Cleanup failed: `{type(e).__name__}`", ephemeral=True)
 
 
 # ---------------- READY ----------------
