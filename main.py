@@ -2228,13 +2228,199 @@ def db_get_all_tracked():
                     UNION ALL
                     SELECT roblox_id, discord_id, username FROM user_alts
                 ) t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM mcwv_loa_records l
+                    WHERE l.active = TRUE
+                      AND l.roblox_id = TRIM(t.roblox_id)
+                )
                 ORDER BY discord_id, username
             """)
             return cur.fetchall()
     except Exception as e:
         conn.rollback()
+        if "mcwv_loa_records" in str(e):
+            try:
+                init_db_schema()
+                return db_get_all_tracked()
+            except Exception:
+                pass
         print("db_get_all_tracked error:", e)
         return []
+
+
+# ---------------- MCWV LOA RECORDS ----------------
+def db_start_loa(roblox_id, discord_id, roblox_username, ticket_id, ticket_channel_id,
+                 ticket_name_before, ticket_category_before, started_by):
+    """Create an active LOA record. Returns (ok, record_id_or_error)."""
+    if not db_enabled():
+        return False, "Database is not available."
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_loa_records
+                    (roblox_id, discord_id, roblox_username, ticket_id, ticket_channel_id,
+                     ticket_name_before, ticket_category_before, started_by, started_at, active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), TRUE)
+                RETURNING id
+            """, (str(roblox_id).strip(), int(discord_id) if discord_id else None,
+                  str(roblox_username or ""), str(ticket_id) if ticket_id else None,
+                  int(ticket_channel_id) if ticket_channel_id else None,
+                  str(ticket_name_before) if ticket_name_before else None,
+                  int(ticket_category_before) if ticket_category_before else None,
+                  int(started_by) if started_by else None))
+            rec_id = cur.fetchone()[0]
+        conn.commit()
+        return True, rec_id
+    except Exception as e:
+        conn.rollback()
+        print("db_start_loa error:", e)
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_get_active_loa(roblox_id=None, channel_id=None, discord_id=None):
+    """Fetch the active LOA record for a roblox id, ticket channel, or discord id."""
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            if roblox_id:
+                cur.execute("""
+                    SELECT id, roblox_id, roblox_username, discord_id, ticket_id, ticket_channel_id,
+                           ticket_name_before, ticket_category_before, started_by, started_at
+                    FROM mcwv_loa_records
+                    WHERE active = TRUE AND roblox_id = %s
+                    ORDER BY id DESC LIMIT 1
+                """, (str(roblox_id).strip(),))
+            elif channel_id:
+                cur.execute("""
+                    SELECT id, roblox_id, roblox_username, discord_id, ticket_id, ticket_channel_id,
+                           ticket_name_before, ticket_category_before, started_by, started_at
+                    FROM mcwv_loa_records
+                    WHERE active = TRUE AND ticket_channel_id = %s
+                    ORDER BY id DESC LIMIT 1
+                """, (int(channel_id),))
+            elif discord_id:
+                cur.execute("""
+                    SELECT id, roblox_id, roblox_username, discord_id, ticket_id, ticket_channel_id,
+                           ticket_name_before, ticket_category_before, started_by, started_at
+                    FROM mcwv_loa_records
+                    WHERE active = TRUE AND discord_id = %s
+                    ORDER BY id DESC LIMIT 1
+                """, (int(discord_id),))
+            else:
+                return None
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0], "roblox_id": row[1], "roblox_username": row[2],
+                "discord_id": row[3], "ticket_id": row[4], "ticket_channel_id": row[5],
+                "ticket_name_before": row[6], "ticket_category_before": row[7],
+                "started_by": row[8], "started_at": row[9],
+            }
+    except Exception as e:
+        conn.rollback()
+        print("db_get_active_loa error:", e)
+        return None
+
+
+def db_end_loa(record_id, ended_by, end_notes=""):
+    """Close an active LOA record. Returns (ok, message)."""
+    if not db_enabled():
+        return False, "Database is not available."
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE mcwv_loa_records
+                SET active = FALSE, ended_by = %s, ended_at = NOW(), end_notes = %s
+                WHERE id = %s
+            """, (int(ended_by) if ended_by else None, str(end_notes or ""), int(record_id)))
+        conn.commit()
+        return True, "LOA record closed."
+    except Exception as e:
+        conn.rollback()
+        print("db_end_loa error:", e)
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_list_active_loas():
+    """All active LOAs, newest first."""
+    if not db_enabled():
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, roblox_id, roblox_username, discord_id, ticket_channel_id, started_by, started_at
+                FROM mcwv_loa_records
+                WHERE active = TRUE
+                ORDER BY started_at DESC
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        conn.rollback()
+        print("db_list_active_loas error:", e)
+        return []
+
+
+async def perform_loa_revert(guild, record, actor, end_notes=""):
+    """Shared End-LOA logic: restore roles + ticket channel, close the DB record,
+    clear caches. Returns (ok, notes)."""
+    notes = []
+    discord_id = int(record["discord_id"]) if record.get("discord_id") else None
+
+    member = guild.get_member(discord_id) if discord_id else None
+    if member is None and guild and discord_id:
+        try:
+            member = await guild.fetch_member(discord_id)
+        except Exception:
+            member = None
+
+    clan_role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
+    if member and clan_role:
+        if clan_role not in member.roles:
+            try:
+                await member.add_roles(clan_role, reason="MCWV LOA ended — returning member")
+                notes.append("Clan member role restored")
+            except Exception as exc:
+                notes.append(f"Could not re-add clan role: {exc}")
+        else:
+            notes.append("Clan member role already present")
+    else:
+        notes.append("Member not in server — role ops skipped")
+
+    loa_role = guild.get_role(MCWV_LOA_ROLE_ID) if guild else None
+    if member and loa_role and loa_role in member.roles:
+        try:
+            await member.remove_roles(loa_role, reason="MCWV LOA ended")
+            notes.append("LOA role removed")
+        except Exception as exc:
+            notes.append(f"Could not remove LOA role: {exc}")
+
+    channel = None
+    if guild and record.get("ticket_channel_id"):
+        channel = guild.get_channel(int(record["ticket_channel_id"]))
+    if isinstance(channel, discord.TextChannel):
+        try:
+            target_cat = None
+            if record.get("ticket_category_before"):
+                target_cat = guild.get_channel(int(record["ticket_category_before"]))
+            target_name = record.get("ticket_name_before") or channel.name
+            await channel.edit(
+                category=target_cat if isinstance(target_cat, discord.CategoryChannel) else None,
+                name=target_name,
+                reason=f"MCWV LOA ended — by {actor}",
+            )
+            notes.append("Ticket channel restored")
+        except Exception as exc:
+            notes.append(f"Channel restore failed: {exc}")
+    else:
+        notes.append("Ticket channel gone — skipped restore")
+
+    ok, msg = db_end_loa(record["id"], actor.id, end_notes)
+    notes.append("LOA record closed" if ok else f"DB close failed: {msg}")
+
+    cleanup_memory_for_removed_user(str(record["roblox_id"]))
+    return ok, notes
 
 
 def db_find_roblox_link(roblox_id):
@@ -3076,6 +3262,41 @@ def init_db_schema():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS player_presence_events_roblox_created_idx ON player_presence_events (roblox_id, created_at DESC)")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ticket_channel_id BIGINT")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_loa_records (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    roblox_username TEXT,
+                    discord_id BIGINT,
+                    ticket_id TEXT,
+                    ticket_channel_id BIGINT,
+                    ticket_name_before TEXT,
+                    ticket_category_before BIGINT,
+                    started_by BIGINT,
+                    started_at TIMESTAMPTZ DEFAULT NOW(),
+                    ended_by BIGINT,
+                    ended_at TIMESTAMPTZ,
+                    active BOOLEAN DEFAULT TRUE,
+                    end_notes TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_loa_active_roblox ON mcwv_loa_records (active, roblox_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_loa_channel ON mcwv_loa_records (ticket_channel_id) WHERE ticket_channel_id IS NOT NULL")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS battles (
+                    battle_id TEXT PRIMARY KEY,
+                    battle_name TEXT,
+                    start_time TIMESTAMPTZ,
+                    end_time TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    manually_edited BOOLEAN DEFAULT FALSE,
+                    edited_by BIGINT,
+                    edited_at TIMESTAMPTZ
+                )
+            """)
+            cur.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS manually_edited BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS edited_by BIGINT")
+            cur.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS admin_logs (
                     id BIGSERIAL PRIMARY KEY,
@@ -12241,9 +12462,20 @@ async def fix_battle_times_cmd(interaction: discord.Interaction):
         battle_ids = await asyncio.to_thread(_get_battle_ids)
         print(f"[fix_battle_times] {len(battle_ids)} battles to update")
 
+        def _get_manual_battles():
+            with conn.cursor() as cur:
+                cur.execute("SELECT battle_id FROM battles WHERE manually_edited = TRUE")
+                return {str(r[0]) for r in cur.fetchall()}
+
+        manual_battles = await asyncio.to_thread(_get_manual_battles)
+
         updated = 0
         failed = 0
+        skipped = 0
         for bid in battle_ids:
+            if bid in manual_battles:
+                skipped += 1
+                continue
             try:
                 async with scan_session.get(
                     f"{PS99_API}/v1/clans/battles/{bid}",
@@ -12282,7 +12514,7 @@ async def fix_battle_times_cmd(interaction: discord.Interaction):
             except Exception as exc:
                 failed += 1
 
-        summary = f"Battle times updated! **{updated:,}** rows updated, {failed} battles failed (no v1 data)."
+        summary = f"Battle times updated! **{updated:,}** rows updated, {failed} battles failed (no v1 data), {skipped} skipped (manual override)."
         print(f"[fix_battle_times] {summary}")
 
         try:
@@ -15628,6 +15860,15 @@ async def whois(interaction: discord.Interaction, member: discord.Member):
 
         embed = discord.Embed(title=f"\U0001f464 {member.display_name}", description=f"<@{discord_id}>", color=discord.Color(MCWV_BRAND_COLOR), timestamp=datetime.now(timezone.utc))
 
+        loa = db_get_active_loa(discord_id=discord_id)
+        if loa:
+            started = f"<t:{int(loa['started_at'].timestamp())}:R>" if loa.get("started_at") else "unknown"
+            embed.add_field(
+                name="\U0001f3dd\ufe0f Leave of Absence",
+                value=f"**Active** since {started}\nExcused from wars & tracking",
+                inline=False,
+            )
+
         if main_link:
             roblox_id, roblox_name = main_link
             embed.add_field(name="\U0001f3ae Main Roblox", value=f"**{roblox_name}**\n`ID: {roblox_id}`\n[Profile](https://www.roblox.com/users/{roblox_id}/profile)", inline=True)
@@ -16187,6 +16428,65 @@ async def clan_leave_loop():
         print("Clan leave loop error:", e)
     pass  # keep connection alive (Supabase has no compute hour limit)
 
+# ---------------- LOA TICKET VIEW (End LOA / Info) ----------------
+class LoaTicketView(discord.ui.View):
+    def __init__(self, roblox_id, roblox_name, discord_id):
+        super().__init__(timeout=None)
+        self.roblox_id = str(roblox_id).strip()
+        self.roblox_name = roblox_name
+        self.discord_id = discord_id
+
+    @discord.ui.button(label="End LOA", style=discord.ButtonStyle.success, emoji="✅")
+    async def end_loa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_mcwv_ticket_staff_permission(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        await interaction.response.defer()
+
+        record = db_get_active_loa(roblox_id=self.roblox_id) or db_get_active_loa(channel_id=interaction.channel_id)
+        if not record:
+            await interaction.followup.send(
+                "⚠️ No active LOA record found. Use `/endloa` or `/loas` to manage it manually.",
+                ephemeral=True,
+            )
+            return
+
+        notes = []
+        guild = interaction.guild
+        discord_id = int(record["discord_id"]) if record.get("discord_id") else None
+        ok, notes = await perform_loa_revert(guild, record, interaction.user, "LOA ended from ticket button")
+
+        # 5) Replace the LOA card with a completed state.
+        done_embed = discord.Embed(
+            title="✅ LOA Ended",
+            description=f"**{record.get('roblox_username') or self.roblox_name}** is back on active duty.",
+            color=discord.Color.from_rgb(52, 211, 153),
+            timestamp=datetime.now(timezone.utc),
+        )
+        done_embed.add_field(name="Ended by", value=interaction.user.mention, inline=True)
+        done_embed.add_field(name="Changes", value="\n".join(f"• {n}" for n in notes), inline=False)
+        try:
+            await interaction.message.edit(embed=done_embed, view=None)
+        except Exception:
+            pass
+        if discord_id:
+            await interaction.followup.send(f"🏝️ **LOA ended** — welcome back <@{discord_id}>!")
+        else:
+            await interaction.followup.send("🏝️ **LOA ended.**")
+        self.stop()
+
+    @discord.ui.button(label="Info", style=discord.ButtonStyle.secondary, emoji="ℹ️")
+    async def info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "🏝️ **Leave of Absence**\n\n"
+            "This member is excused from wars and point tracking.\n"
+            "• Their Roblox link and Hub login stay intact.\n"
+            "• They won't appear in member lists or receive war pings while on LOA.\n"
+            "• Press **✅ End LOA** (staff only) when they return to restore their role, ticket channel and tracking.\n"
+            "• If the buttons ever stop working after a bot restart, use `/loas` and `/endloa` instead.",
+            ephemeral=True,
+        )
+
+
 # ---------------- CLAN REVIEW VIEW ----------------
 class ClanReviewView(discord.ui.View):
     def __init__(self, roblox_id):
@@ -16315,14 +16615,61 @@ class ClanReviewView(discord.ui.View):
             elif not loa_role:
                 notes.append("LOA role not found in server")
 
-            # 4) Unlink their Roblox account (keeps the Hub login).
-            try:
-                ok, unlink_msg = db_remove_all_links_for_discord(discord_id)
-                notes.append("Roblox links removed" if ok else f"Unlink failed: {unlink_msg}")
-            except Exception as exc:
-                notes.append(f"Unlink error: {type(exc).__name__}: {exc}")
+            # 4) Record the LOA in the database. KEEP the Roblox link + Hub login intact!
+            ticket_row = find_ticket_in_channel(ticket_channel) if isinstance(ticket_channel, discord.TextChannel) else None
+            ticket_id = str(ticket_row[0]) if ticket_row else None
+            channel_id = int(ticket_channel.id) if isinstance(ticket_channel, discord.TextChannel) else None
+            name_before = ticket_channel.name if isinstance(ticket_channel, discord.TextChannel) else None
+            cat_before = ticket_channel.category_id if isinstance(ticket_channel, discord.TextChannel) else None
 
-            # 5) Edit the original embed to show LOA was applied.
+            loa_ok, loa_info = db_start_loa(
+                roblox_id=self.roblox_id,
+                discord_id=discord_id,
+                roblox_username=roblox_name,
+                ticket_id=ticket_id,
+                ticket_channel_id=channel_id,
+                ticket_name_before=name_before,
+                ticket_category_before=cat_before,
+                started_by=interaction.user.id,
+            )
+            if not loa_ok:
+                notes.append(f"⚠️ LOA record failed: {loa_info}")
+            else:
+                notes.append("LOA recorded — links + Hub login preserved")
+
+            # 5) Post the LOA card in the member's ticket (End LOA button lives there).
+            if isinstance(ticket_channel, discord.TextChannel):
+                try:
+                    loa_embed = discord.Embed(
+                        title="🏝️ Leave of Absence — Active",
+                        description=(
+                            f"**{roblox_name}** has been placed on **Leave of Absence** by "
+                            f"{interaction.user.mention}.\n\n"
+                            "They are excused from wars and point tracking until staff press **✅ End LOA** below."
+                        ),
+                        color=discord.Color.from_rgb(96, 165, 250),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    loa_embed.add_field(name="Roblox", value=f"`{roblox_name}`", inline=True)
+                    loa_embed.add_field(name="Started", value=f"<t:{int(time.time())}:F>", inline=True)
+                    loa_embed.add_field(
+                        name="Changes",
+                        value="\n".join(f"• {n}" for n in notes) or "• none",
+                        inline=False,
+                    )
+                    loa_embed.set_footer(text="End LOA restores roles, the ticket channel and tracking automatically.")
+                    await ticket_channel.send(
+                        embed=loa_embed,
+                        view=LoaTicketView(self.roblox_id, roblox_name, discord_id),
+                    )
+                    notes.append("LOA card posted in ticket")
+                except Exception as exc:
+                    print(f"[LOA] ticket card failed: {exc}")
+                    notes.append(f"LOA card failed: {exc}")
+            else:
+                notes.append("No ticket channel — LOA card skipped")
+
+            # 6) Edit the original staff embed to show LOA was applied.
             await interaction.edit_original_response(
                 content=f"\U0001f3dd\ufe0f **LOA applied by {interaction.user.mention}**\n" + "\n".join(notes),
                 embed=interaction.message.embeds[0] if interaction.message.embeds else None,
@@ -19176,6 +19523,128 @@ async def cleanup_tickets(interaction: discord.Interaction):
         print(f"[cleanup_tickets] error: {e}")
         traceback.print_exc()
         await interaction.followup.send(f"Cleanup failed: `{type(e).__name__}`", ephemeral=True)
+
+
+@bot.tree.command(name="loas", description="List all active Leaves of Absence", guild=guild_obj)
+@require_role()
+async def loas_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = db_list_active_loas()
+    if not rows:
+        return await interaction.followup.send("🏝️ No active LOAs.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🏝️ Active Leaves of Absence",
+        color=discord.Color.from_rgb(96, 165, 250),
+        timestamp=datetime.now(timezone.utc),
+    )
+    lines = []
+    for rec_id, rid, uname, did, chid, started_by, started_at in rows:
+        who = f"<@{did}>" if did else "`unknown discord`"
+        start = f"<t:{int(started_at.timestamp())}:R>" if started_at else "`?`"
+        ch = f"<#{chid}>" if chid else "no channel"
+        lines.append(f"• **{uname or rid}** — {who}\n　· since {start} · {ch}")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="End an LOA with /endloa or the ✅ End LOA button in their ticket")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="endloa", description="End a member's Leave of Absence (roles, channel and tracking restored)", guild=guild_obj)
+@require_role()
+@app_commands.describe(member="Discord member to end LOA for", roblox_id="Or: Roblox user ID of the member")
+async def endloa_cmd(interaction: discord.Interaction, member: discord.Member = None, roblox_id: str = None):
+    await interaction.response.defer(ephemeral=True)
+
+    record = None
+    if member:
+        record = db_get_active_loa(discord_id=member.id)
+    elif roblox_id:
+        record = db_get_active_loa(roblox_id=str(roblox_id).strip())
+    if not record:
+        return await interaction.followup.send(
+            "❌ No active LOA found for that member. Use `/loas` to see active LOAs.",
+            ephemeral=True,
+        )
+
+    ok, notes = await perform_loa_revert(interaction.guild, record, interaction.user, "LOA ended from /endloa command")
+
+    channel = None
+    if record.get("ticket_channel_id"):
+        channel = interaction.guild.get_channel(int(record["ticket_channel_id"]))
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.send(
+                f"✅ **LOA ended** by {interaction.user.mention} — welcome back!"
+            )
+        except Exception:
+            pass
+
+    summary = "\n".join(f"• {n}" for n in notes)
+    await interaction.followup.send(
+        f"🏝️ **LOA ended** for **{record.get('roblox_username') or 'unknown'}**\n{summary}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="setwartime", description="Manually set a battle's start/end times (overrides the API)", guild=guild_obj)
+@require_role()
+@app_commands.describe(
+    battle_id="Battle ID (e.g. NinjaBattle2026)",
+    start_time="Start time, UTC (e.g. 2026-08-01 17:00)",
+    end_time="End time, UTC (e.g. 2026-08-15 15:00)",
+)
+async def setwartime_cmd(interaction: discord.Interaction, battle_id: str, start_time: str = None, end_time: str = None):
+    await interaction.response.defer(ephemeral=True)
+    if not db_enabled():
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
+
+    def _parse(value):
+        if not value:
+            return None
+        value = str(value).strip()
+        if re.fullmatch(r"\d{9,11}", value):
+            return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        raise ValueError(f"cannot parse {value!r}")
+
+    try:
+        start = _parse(start_time)
+        end = _parse(end_time)
+    except ValueError as exc:
+        return await interaction.followup.send(f"❌ {exc}. Use `YYYY-MM-DD HH:MM` (UTC).", ephemeral=True)
+    if not start and not end:
+        return await interaction.followup.send("❌ Provide at least one of start_time or end_time.", ephemeral=True)
+    if start and end and start >= end:
+        return await interaction.followup.send("❌ Start must be before end.", ephemeral=True)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO battles (battle_id, battle_name, start_time, end_time, manually_edited, edited_by, edited_at)
+                VALUES (%s, %s, %s, %s, TRUE, %s, NOW())
+                ON CONFLICT (battle_id) DO UPDATE SET
+                    start_time = COALESCE(EXCLUDED.start_time, battles.start_time),
+                    end_time   = COALESCE(EXCLUDED.end_time, battles.end_time),
+                    manually_edited = TRUE,
+                    edited_by = EXCLUDED.edited_by,
+                    edited_at = NOW()
+            """, (battle_id.strip(), battle_id.strip(), start, end, interaction.user.id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return await interaction.followup.send(f"❌ DB error: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ **{battle_id}** times set (manual override):\n"
+        f"• Start: {f'<t:{int(start.timestamp())}:F>' if start else '— (unchanged)'}\n"
+        f"• End: {f'<t:{int(end.timestamp())}:F>' if end else '— (unchanged)'}\n\n"
+        f"ℹ️ The API will no longer overwrite these. Reset from the Hub admin or edit again.",
+        ephemeral=True,
+    )
 
 
 # ---------------- READY ----------------
