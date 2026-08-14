@@ -10292,23 +10292,40 @@ class CheckPlayerView(discord.ui.View):
 # ---------------- CHECKPLAYER IMAGE CARD ----------------
 
 async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
-    """Generate a polished dashboard image for /checkplayer using the galaxy background."""
+    """Generate a polished dashboard image for /checkplayer using the galaxy background.
+    Fixes: consistent colors, aligned columns, compact participated rows, readable footer."""
     S = 2
     rows = data["rows"]
     start = page * per_page
     page_rows = rows[start:start + per_page]
-    num_battles = len(page_rows)
-    
-    # Fixed width, dynamic height
-    W = 1200 * S
-    header_h = 320  # avatar + name + status + clan history
-    battle_h = 56   # per battle row
-    summary_h = 130 # summary section
-    footer_h = 40
-    H = (header_h + max(num_battles * battle_h, 60) + summary_h + footer_h) * S
 
-    def sc(v):
-        return int(round(v * S))
+    # Layout constants
+    W = 1200 * S
+    LEFT_MARGIN = sc = lambda v: int(round(v * S))
+    COL_BATTLE = sc(70)     # battle name x
+    COL_CLAN = sc(70)       # clan tag x (below battle name)
+    COL_PTS = sc(480)       # points column
+    COL_RANK = sc(600)      # rank column
+    COL_BAR = sc(800)       # percentile bar start
+    BAR_W = sc(240)        # bar width
+    COL_PCT = sc(800) + BAR_W + sc(10)  # percentile text
+    RIGHT_EDGE = W - sc(70)
+
+    # Calculate height
+    header_h = 300
+    battle_h_normal = 52
+    battle_h_compact = 36  # participated rows are smaller
+    summary_h = 120
+    footer_h = 35
+
+    list_h = 0
+    for row in page_rows:
+        if row.get("participated_only"):
+            list_h += battle_h_compact
+        else:
+            list_h += battle_h_normal
+
+    H = (header_h + max(list_h, 40) + summary_h + footer_h) * S
 
     def font(size, bold=True):
         path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -10318,24 +10335,26 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
             return ImageFont.load_default()
 
     fonts = {
-        "name": font(32, True),
-        "id": font(18, False),
-        "status": font(20, True),
-        "section": font(22, True),
-        "battle": font(18, True),
-        "stats": font(15, False),
-        "pct": font(15, True),
-        "summary_label": font(14, False),
-        "summary_value": font(26, True),
-        "summary_sub": font(13, False),
-        "clan": font(16, True),
-        "tiny": font(11, False),
-        "page": font(13, False),
+        "name": font(30, True),
+        "id": font(16, False),
+        "status": font(18, True),
+        "section": font(20, True),
+        "battle": font(17, True),
+        "stats": font(14, False),
+        "pct": font(14, True),
+        "summary_label": font(13, False),
+        "summary_value": font(24, True),
+        "summary_sub": font(12, False),
+        "clan": font(15, True),
+        "footer": font(13, False),
     }
 
-    # Background: galaxy image like hourly stats
+    # Accent color (single, consistent)
+    accent = (74, 222, 128) if data["is_currently_mcwv"] else ((255, 84, 96) if data["is_currently_rival"] else (130, 100, 255))
+
+    # Background: galaxy image
     img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
-    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 120)))
+    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 125)))
 
     await asyncio.sleep(0)
 
@@ -10343,9 +10362,9 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
     grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grid)
     for x in range(0, W, sc(54)):
-        gd.line((x, 0, x, H), fill=(125, 145, 205, 14), width=sc(1))
+        gd.line((x, 0, x, H), fill=(125, 145, 205, 12), width=sc(1))
     for y in range(0, H, sc(54)):
-        gd.line((0, y, W, y), fill=(125, 145, 205, 10), width=sc(1))
+        gd.line((0, y, W, y), fill=(125, 145, 205, 8), width=sc(1))
     img.alpha_composite(grid)
 
     # Main panel
@@ -10359,34 +10378,17 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
 
     card_box = (sc(24), sc(24), W - sc(24), H - sc(24))
     alpha_round((card_box[0] + sc(4), card_box[1] + sc(6), card_box[2] + sc(4), card_box[3] + sc(6)), 24, (0, 0, 0, 140), blur=8)
-    alpha_round(card_box, 24, (14, 17, 30, 210), outline=(76, 88, 120, 180), width=2)
-    alpha_round((card_box[0] + sc(2), card_box[1] + sc(2), card_box[2] - sc(2), card_box[3] - sc(2)), 22, (255, 255, 255, 0), outline=(255, 255, 255, 22), width=1)
+    alpha_round(card_box, 24, (14, 17, 30, 215), outline=(*accent, 120), width=2)
+    alpha_round((card_box[0] + sc(2), card_box[1] + sc(2), card_box[2] - sc(2), card_box[3] - sc(2)), 22, (255, 255, 255, 0), outline=(255, 255, 255, 20), width=1)
 
-    d = ImageDraw.Draw(img)
-
-    # Top accent strip
-    accent = (74, 222, 128) if data["is_currently_mcwv"] else ((255, 84, 96) if data["is_currently_rival"] else (130, 100, 255))
-    strip = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(strip)
-    strip_x1, strip_y = sc(52), sc(46)
-    strip_x2 = sc(1148)
-    colours = [accent, (72, 214, 177), (232, 205, 54), (248, 135, 43), (250, 72, 82)]
-    for x in range(strip_x1, strip_x2):
-        t = (x - strip_x1) / max(strip_x2 - strip_x1 - 1, 1)
-        idx = min(int(t * (len(colours) - 1)), len(colours) - 2)
-        local = (t - idx / (len(colours) - 1)) * (len(colours) - 1)
-        c1, c2 = colours[idx], colours[idx + 1]
-        color = tuple(int(c1[i] + (c2[i] - c1[i]) * local) for i in range(3))
-        sd.line((x, strip_y, x, strip_y + sc(4)), fill=(*color, 255), width=sc(1))
-    img.alpha_composite(strip.filter(ImageFilter.GaussianBlur(sc(1))))
-    img.alpha_composite(strip)
     d = ImageDraw.Draw(img)
 
     await asyncio.sleep(0)
 
+    # === HEADER ===
     # Avatar with glow ring
-    avatar_x, avatar_y = sc(70), sc(72)
-    avatar_size = sc(110)
+    avatar_x, avatar_y = sc(70), sc(70)
+    avatar_size = sc(100)
     if avatar_url:
         try:
             global session
@@ -10400,12 +10402,12 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
                     ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
                     ring_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                     rg = ImageDraw.Draw(ring_glow)
-                    rg.ellipse((avatar_x - sc(8), avatar_y - sc(8), avatar_x + avatar_size + sc(8), avatar_y + avatar_size + sc(8)), fill=(*accent, 45))
-                    ring_glow = ring_glow.filter(ImageFilter.GaussianBlur(sc(8)))
+                    rg.ellipse((avatar_x - sc(6), avatar_y - sc(6), avatar_x + avatar_size + sc(6), avatar_y + avatar_size + sc(6)), fill=(*accent, 40))
+                    ring_glow = ring_glow.filter(ImageFilter.GaussianBlur(sc(6)))
                     img.alpha_composite(ring_glow)
                     img.paste(avatar, (avatar_x, avatar_y), mask)
                     d = ImageDraw.Draw(img)
-                    d.ellipse((avatar_x - sc(2), avatar_y - sc(2), avatar_x + avatar_size + sc(2), avatar_y + avatar_size + sc(2)), outline=(*accent, 200), width=sc(2))
+                    d.ellipse((avatar_x - sc(2), avatar_y - sc(2), avatar_x + avatar_size + sc(2), avatar_y + avatar_size + sc(2)), outline=(*accent, 180), width=sc(2))
         except Exception:
             pass
 
@@ -10413,52 +10415,52 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
 
     # Name + ID
     name = data["roblox_name"]
-    draw_text_shadow(d, (sc(200), sc(72)), name, fonts["name"], (255, 255, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
-    draw_text_shadow(d, (sc(200), sc(108)), f"ID: {data['roblox_id']}", fonts["id"], (160, 160, 180, 255), shadow=(0, 0, 0, 100), offset=(sc(1), sc(1)))
+    draw_text_shadow(d, (sc(195), sc(68)), name, fonts["name"], (255, 255, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
+    d.text((sc(195), sc(102)), f"ID: {data['roblox_id']}", font=fonts["id"], fill=(150, 160, 180, 255))
 
-    # Status badges
-    badge_x = sc(200)
-    badge_y = sc(138)
+    # Status badges — all use accent color for consistency
+    badge_x = sc(195)
+    badge_y = sc(128)
     status_parts = []
     if data["is_currently_mcwv"]:
-        status_parts.append(("\U0001f451 MCWV", accent))
+        status_parts.append("MCWV Member")
     elif data["is_currently_rival"]:
-        status_parts.append((f"\U0001f575 {data['current_clan_name']}", (255, 130, 130)))
+        status_parts.append(data["current_clan_name"])
     if data["earned_medals_agg"]:
-        status_parts.append((f"\U0001f3c5 {data['earned_medals_agg']}", (240, 200, 80)))
+        status_parts.append(f"{data['earned_medals_agg']} medals")
     if data["total_battles_agg"]:
-        status_parts.append((f"\U0001f4ca {data['total_battles_agg']}", (100, 180, 255)))
+        status_parts.append(f"{data['total_battles_agg']} battles")
 
-    for text, color in status_parts:
+    for text in status_parts[:4]:
         text_w = d.textbbox((0, 0), text, font=fonts["status"])
         tw = text_w[2] - text_w[0]
-        badge_box = (badge_x, badge_y, badge_x + tw + sc(24), badge_y + sc(32))
-        alpha_round(badge_box, 16, (22, 25, 43, 220), outline=(*color, 120), width=1)
+        badge_box = (badge_x, badge_y, badge_x + tw + sc(20), badge_y + sc(28))
+        alpha_round(badge_box, 14, (22, 25, 43, 220), outline=(*accent, 100), width=1)
         dd = ImageDraw.Draw(img)
-        dd.text((badge_x + sc(12), badge_y + sc(6)), text, font=fonts["status"], fill=(*color, 255))
-        badge_x += tw + sc(24) + sc(8)
+        dd.text((badge_x + sc(10), badge_y + sc(5)), text, font=fonts["status"], fill=(*accent, 255))
+        badge_x += tw + sc(20) + sc(8)
 
     await asyncio.sleep(0)
 
     # Clan history
     clans = data["clans_seen"][:8]
     if clans:
-        clan_text = " \u2192 ".join(clans)
-        clan_text = fit_text(d, clan_text, fonts["clan"], sc(1000))
-        draw_text_shadow(d, (sc(70), sc(190)), f"Clan History", fonts["section"], (180, 190, 220, 200), shadow=(0, 0, 0, 100), offset=(sc(1), sc(1)))
-        draw_text_shadow(d, (sc(70), sc(218)), clan_text, fonts["clan"], (200, 215, 245, 255), shadow=(0, 0, 0, 120), offset=(sc(1), sc(1)))
+        clan_text = "  \u2192  ".join(clans)
+        clan_text = fit_text(d, clan_text, fonts["clan"], RIGHT_EDGE - sc(70))
+        d.text((sc(70), sc(180)), "Clan History", font=fonts["section"], fill=(160, 170, 195, 200))
+        draw_text_shadow(d, (sc(70), sc(208)), clan_text, fonts["clan"], (210, 220, 245, 255), shadow=(0, 0, 0, 110), offset=(sc(1), sc(1)))
 
     # Separator
-    sep_y = sc(265)
-    d.line((sc(70), sep_y, W - sc(70), sep_y), fill=(80, 90, 120, 80), width=sc(1))
+    sep_y = sc(250)
+    d.line((sc(70), sep_y, RIGHT_EDGE, sep_y), fill=(80, 90, 120, 70), width=sc(1))
 
-    # War History section header
+    # War History header
     total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-    header_text = f"War History \u00b7 Page {page+1}/{total_pages}"
-    draw_text_shadow(d, (sc(70), sc(280)), header_text, fonts["section"], (200, 210, 240, 255), shadow=(0, 0, 0, 100), offset=(sc(1), sc(1)))
+    header_text = f"War History  \u00b7  Page {page+1}/{total_pages}"
+    d.text((sc(70), sc(265)), header_text, font=fonts["section"], fill=(200, 210, 240, 240))
 
-    # Battle rows
-    y = sc(318)
+    # === BATTLE ROWS ===
+    y = sc(300)
     for row in page_rows:
         title = _friendly_battle_name(row.get("battleId") or row.get("title") or "?")
         clan = str(row.get("clan") or "?")
@@ -10466,20 +10468,23 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
         rank = _safe_int(row.get("rank"))
         total = _safe_int(row.get("total")) or 0
         place = row.get("clanPlace")
-        medal = "\U0001f949" if row.get("earnedMedal") else ""
         participated = row.get("participated_only")
 
         if participated:
-            # Participated only
-            alpha_round((sc(70), y, W - sc(70), y + sc(48)), 10, (20, 25, 40, 180))
+            # Compact row — half height, no bar
+            alpha_round((sc(70), y, RIGHT_EDGE, y + sc(30)), 8, (18, 22, 35, 160))
             dd = ImageDraw.Draw(img)
-            title_short = fit_text(dd, title, fonts["battle"], sc(500))
-            dd.text((sc(82), y + sc(6)), title_short, font=fonts["battle"], fill=(200, 210, 230, 255))
-            clan_color = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (160, 170, 200, 255)
-            dd.text((sc(82), y + sc(28)), f"[{clan}] \u2713 participated (no score data)", font=fonts["stats"], fill=(140, 150, 170, 255))
+            title_short = fit_text(dd, title, fonts["battle"], sc(380))
+            dd.text((sc(82), y + sc(4)), title_short, font=fonts["battle"], fill=(180, 190, 210, 255))
+            clan_color = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (140, 150, 175, 255)
+            dd.text((sc(480), y + sc(6)), f"[{clan}]", font=fonts["stats"], fill=clan_color)
+            dd.text((sc(600), y + sc(6)), "participated \u2713", font=fonts["stats"], fill=(120, 130, 150, 255))
+            y += sc(battle_h_compact)
         else:
             pct = float(row.get("betterThan") or ((total - rank) / total * 100 if rank > 0 and total > 1 else 0))
-            if pct >= 90:
+
+            # Consistent color: green >=80, yellow >=50, red <50
+            if pct >= 80:
                 bar_color = (74, 222, 128)
             elif pct >= 50:
                 bar_color = (250, 200, 60)
@@ -10487,46 +10492,46 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
                 bar_color = (255, 100, 100)
 
             # Row background
-            alpha_round((sc(70), y, W - sc(70), y + sc(48)), 10, (20, 25, 40, 180))
+            alpha_round((sc(70), y, RIGHT_EDGE, y + sc(44)), 10, (20, 25, 40, 175))
             dd = ImageDraw.Draw(img)
 
-            # Battle name + clan
-            title_short = fit_text(dd, title, fonts["battle"], sc(420))
-            dd.text((sc(82), y + sc(4)), title_short, font=fonts["battle"], fill=(240, 245, 255, 255))
-            clan_color = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (160, 170, 200, 255)
+            # Battle name (left aligned)
+            title_short = fit_text(dd, title, fonts["battle"], sc(390))
+            dd.text((sc(82), y + sc(3)), title_short, font=fonts["battle"], fill=(240, 245, 255, 255))
+
+            # Clan tag (below battle name)
+            clan_color = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (140, 150, 175, 255)
             clan_str = f"[{clan}]"
-            if medal:
-                clan_str += f" {medal}"
-            dd.text((sc(82), y + sc(26)), clan_str, font=fonts["stats"], fill=clan_color)
+            if row.get("earnedMedal"):
+                clan_str += "  \u00b7 medal"
+            dd.text((sc(82), y + sc(24)), clan_str, font=fonts["stats"], fill=clan_color)
 
-            # Points
+            # Points (aligned column)
             pts_text = format_points(pts)
-            dd.text((sc(520), y + sc(4)), pts_text, font=fonts["pct"], fill=(200, 210, 230, 255))
+            dd.text((COL_PTS, y + sc(3)), pts_text, font=fonts["pct"], fill=(200, 210, 230, 255))
 
-            # Rank
+            # Rank (aligned column)
             if rank > 0 and total > 1:
                 rank_text = f"#{rank:,}/{total:,}"
-                dd.text((sc(620), y + sc(4)), rank_text, font=fonts["stats"], fill=(180, 190, 210, 255))
+                dd.text((COL_RANK, y + sc(3)), rank_text, font=fonts["stats"], fill=(170, 180, 205, 255))
 
-            # Place
+            # Clan place (below rank)
             if place and place not in (None, "", 0):
-                dd.text((sc(620), y + sc(26)), f"clan #{int(place)}", font=fonts["stats"], fill=(140, 150, 170, 255))
+                dd.text((COL_RANK, y + sc(24)), f"clan #{int(place)}", font=fonts["stats"], fill=(120, 130, 150, 255))
 
-            # Percentile bar
-            bar_x = sc(820)
-            bar_y = y + sc(18)
-            bar_w = sc(220)
+            # Percentile bar with gradient
+            bar_x = COL_BAR
+            bar_y = y + sc(16)
             bar_h = sc(10)
-            dd.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=sc(4), fill=(40, 45, 60, 255))
-            fill_w = int(bar_w * (pct / 100))
+            dd.rounded_rectangle((bar_x, bar_y, bar_x + BAR_W, bar_y + bar_h), radius=sc(4), fill=(40, 45, 60, 255))
+            fill_w = int(BAR_W * (pct / 100))
             if fill_w > 0:
-                # Gradient fill
                 fill_img = Image.new("RGBA", (fill_w, bar_h), (0, 0, 0, 0))
                 fd2 = ImageDraw.Draw(fill_img)
                 for bx in range(fill_w):
                     t = bx / max(fill_w - 1, 1)
                     shade = 0.82 + 0.18 * t
-                    grad = tuple(min(255, int(bar_color[i] * shade + 18 * (1 - t))) for i in range(3))
+                    grad = tuple(min(255, int(bar_color[i] * shade + 15 * (1 - t))) for i in range(3))
                     fd2.line((bx, 0, bx, bar_h), fill=(*grad, 255))
                 fill_mask = Image.new("L", fill_img.size, 0)
                 ImageDraw.Draw(fill_mask).rounded_rectangle((0, 0, fill_img.size[0] - 1, fill_img.size[1] - 1), radius=sc(4), fill=255)
@@ -10534,13 +10539,13 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
                 dd = ImageDraw.Draw(img)
 
             # Percentile text
-            pct_text = f"{pct:.1f}%"
-            dd.text((bar_x + bar_w + sc(8), y + sc(15)), pct_text, font=fonts["pct"], fill=(*bar_color, 255))
+            dd.text((COL_PCT, y + sc(13)), f"{pct:.1f}%", font=fonts["pct"], fill=(*bar_color, 255))
 
-        y += sc(battle_h)
+            y += sc(battle_h_normal)
+
         await asyncio.sleep(0)
 
-    # Summary section (only on last page)
+    # === SUMMARY (last page only) ===
     if page >= total_pages - 1 and data["rank_values"]:
         rank_values = data["rank_values"]
         sorted_by_perf = sorted(rank_values, key=lambda r: r["pct"], reverse=True)
@@ -10548,11 +10553,11 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
         worst = sorted_by_perf[-1]
         avg_pct = sum(r["pct"] for r in rank_values) / len(rank_values)
 
-        y_sum = y + sc(10)
-        d.line((sc(70), y_sum, W - sc(70), y_sum), fill=(80, 90, 120, 80), width=sc(1))
-        y_sum += sc(16)
+        y_sum = y + sc(8)
+        d.line((sc(70), y_sum, RIGHT_EDGE, y_sum), fill=(80, 90, 120, 70), width=sc(1))
+        y_sum += sc(14)
 
-        col_w = sc(360)
+        col_w = (RIGHT_EDGE - sc(70)) // 3
         summaries = [
             ("BEST", f"{best['pct']:.1f}%", f"#{best['rank']:,}/{best['total']:,}", (74, 222, 128)),
             ("AVERAGE", f"{avg_pct:.1f}%", "better than global", (100, 180, 255)),
@@ -10560,25 +10565,25 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
         ]
         for i, (label, value, sub, color) in enumerate(summaries):
             x = sc(70) + i * col_w
-            # Mini card for each stat
-            alpha_round((x, y_sum, x + col_w - sc(12), y_sum + sc(80)), 12, (22, 25, 43, 200), outline=(*color, 80), width=1)
+            box_w = col_w - sc(10)
+            alpha_round((x, y_sum, x + box_w, y_sum + sc(76)), 12, (22, 25, 43, 200), outline=(*color, 70), width=1)
             dd = ImageDraw.Draw(img)
-            dd.text((x + sc(14), y_sum + sc(8)), label, font=fonts["summary_label"], fill=(140, 150, 170, 255))
-            draw_text_shadow(dd, (x + sc(14), y_sum + sc(26)), value, fonts["summary_value"], (*color, 255), shadow=(0, 0, 0, 120), offset=(sc(2), sc(2)))
-            dd.text((x + sc(14), y_sum + sc(58)), sub, font=fonts["summary_sub"], fill=(160, 170, 190, 255))
+            dd.text((x + sc(14), y_sum + sc(8)), label, font=fonts["summary_label"], fill=(130, 140, 160, 255))
+            draw_text_shadow(dd, (x + sc(14), y_sum + sc(24)), value, fonts["summary_value"], (*color, 255), shadow=(0, 0, 0, 110), offset=(sc(2), sc(2)))
+            dd.text((x + sc(14), y_sum + sc(54)), sub, font=fonts["summary_sub"], fill=(150, 160, 180, 255))
 
-    # Footer
-    foot_y = H - sc(30)
+    # === FOOTER === (readable, larger)
+    foot_y = H - sc(28)
     data_sources = []
     if data.get("cached_rows"):
         data_sources.append("global cache")
     if data.get("scraped_clans"):
         data_sources.append("scrape")
     source_txt = " + ".join(data_sources) if data_sources else "PS99"
-    foot_text = f"{source_txt} \u00b7 {len(rows)} battles"
+    foot_text = f"{source_txt}  \u00b7  {len(rows)} battles"
     if page == 0:
-        foot_text += " \u00b7 pre-backfill wars may be incomplete"
-    d.text((sc(70), foot_y), foot_text, font=fonts["tiny"], fill=(120, 130, 155, 180))
+        foot_text += "  \u00b7  pre-backfill wars may be incomplete"
+    d.text((sc(70), foot_y), foot_text, font=fonts["footer"], fill=(130, 140, 165, 220))
 
     await asyncio.sleep(0)
 
@@ -10590,6 +10595,7 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
     img.save(out, format="PNG")
     out.seek(0)
     return out
+
 
 
 
@@ -16842,26 +16848,19 @@ def points_at_time_for_hourly(rows, target_ms):
 
 def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, battle_start_ts=None):
     """Return PPH exactly like the Hub leaderboard profile cards.
-
-    The profile modal uses player_leaderboard_history only: latest snapshot points
-    minus the snapshot baseline 60 minutes before the latest snapshot. It does not
-    use live current_points. This function mirrors that so the hourly card matches
-    the profile cards instead of drifting when live API points update between snapshots.
-    """
+    Uses a local DB connection to avoid race conditions with other loops."""
     ids = [str(value) for value in user_ids if str(value).strip()]
-    if not ids:
+    if not ids or not DATABASE_URL:
         return {}
 
     result = {rid: {"pph": 0, "ready": False} for rid in ids}
-    if not db_enabled():
-        return result
-
+    local_conn = None
     try:
-        ensure_db_connection()
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
         battle_keys = sorted({str(battle_id), normalize_hourly_battle_key(battle_id)})
         grouped = {rid: [] for rid in ids}
 
-        with conn.cursor() as cur:
+        with local_conn.cursor() as cur:
             cur.execute("""
                 SELECT to_regclass('public.player_leaderboard_history') IS NOT NULL AS exists
             """)
@@ -16894,10 +16893,6 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
             latest_points = int(latest["points"] or 0)
             hourly_cutoff = int(latest["time"] or 0) - 60 * 60 * 1000
 
-            # Exact 60-minute cutoff against the snapshot timeline. If the cutoff
-            # sits between two snapshots, interpolate the baseline at that exact
-            # timestamp instead of using an older/nearer row. If we do not have a
-            # full 60-minute window yet, do not fake a PPH value.
             baseline = points_at_time_for_hourly(rows, hourly_cutoff)
             if baseline is None:
                 result[rid] = {"pph": 0, "ready": False}
@@ -16910,29 +16905,32 @@ def fetch_hourly_points_from_history(battle_id, user_ids, current_points=None, b
 
         return result
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"[hourly stats] history lookup failed: {exc}")
         return result
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 def save_hourly_player_snapshot(payload):
-    if not db_enabled() or not isinstance(payload, dict):
+    if not DATABASE_URL or not isinstance(payload, dict):
         return
 
     entries = payload.get("entries") or []
     if not entries:
         return
 
+    local_conn = None
     try:
-        ensure_db_connection()
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
         battle_key = normalize_hourly_battle_key(payload.get("battleId"))
         if not battle_key:
             return
 
-        with conn.cursor() as cur:
+        with local_conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS player_leaderboard_history (
                     id BIGSERIAL PRIMARY KEY,
@@ -16975,13 +16973,19 @@ def save_hourly_player_snapshot(payload):
                         (battle_id, roblox_id, username, rank, points, pph, change_5m, captured_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 """, values)
-        conn.commit()
+        local_conn.commit()
     except Exception as exc:
         try:
-            conn.rollback()
+            local_conn.rollback()
         except Exception:
             pass
         print(f"[hourly stats] snapshot save failed: {exc}")
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 def draw_gradient_text_on_image(img, xy, text, font, left_color, right_color, shadow=True):
@@ -17038,14 +17042,15 @@ def ensure_hourly_exact_table(cur):
 
 
 def save_hourly_exact_snapshot(battle_id, scheduled_at, entries):
-    if not db_enabled() or not entries:
+    if not DATABASE_URL or not entries:
         return False
+    local_conn = None
     try:
-        ensure_db_connection()
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
         battle_key = normalize_hourly_battle_key(battle_id)
         scheduled_dt = scheduled_at if isinstance(scheduled_at, datetime) else datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
         scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
-        with conn.cursor() as cur:
+        with local_conn.cursor() as cur:
             ensure_hourly_exact_table(cur)
             values = []
             for entry in entries:
@@ -17068,27 +17073,34 @@ def save_hourly_exact_snapshot(battle_id, scheduled_at, entries):
                     points = EXCLUDED.points,
                     captured_at = NOW()
             """, values)
-        conn.commit()
+        local_conn.commit()
         return True
     except Exception as exc:
         try:
-            conn.rollback()
+            local_conn.rollback()
         except Exception:
             pass
         print(f"[hourly stats] exact snapshot save failed: {exc}")
         return False
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 def load_hourly_exact_entries(battle_id, scheduled_at):
-    if not db_enabled():
+    if not DATABASE_URL:
         return None
+    local_conn = None
     try:
-        ensure_db_connection()
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
         battle_key = normalize_hourly_battle_key(battle_id)
         scheduled_dt = scheduled_at if isinstance(scheduled_at, datetime) else datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
         scheduled_dt = scheduled_dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
         previous_dt = scheduled_dt - timedelta(minutes=max(1, int(MCWV_HOURLY_STATS_INTERVAL_MINUTES or 60)))
-        with conn.cursor() as cur:
+        with local_conn.cursor() as cur:
             ensure_hourly_exact_table(cur)
             cur.execute("""
                 SELECT
@@ -17124,20 +17136,23 @@ def load_hourly_exact_entries(battle_id, scheduled_at):
             })
         return entries
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"[hourly stats] exact snapshot load failed: {exc}")
         return None
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 def get_latest_hourly_exact_slot(battle_id=None):
-    if not db_enabled():
+    if not DATABASE_URL:
         return None
+    local_conn = None
     try:
-        ensure_db_connection()
-        with conn.cursor() as cur:
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        with local_conn.cursor() as cur:
             ensure_hourly_exact_table(cur)
             if battle_id:
                 cur.execute("""
@@ -17150,10 +17165,13 @@ def get_latest_hourly_exact_slot(battle_id=None):
             row = cur.fetchone()
         return row[0] if row and row[0] else None
     except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        return None
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
         return None
 
 
@@ -17622,7 +17640,7 @@ async def generate_hourly_stats_card(payload):
     return out
 
 def fetch_hourly_ping_targets(entries, threshold):
-    if not db_enabled() or threshold <= 0:
+    if not DATABASE_URL or threshold <= 0:
         return []
 
     low_entries = [
@@ -17637,10 +17655,10 @@ def fetch_hourly_ping_targets(entries, threshold):
         return []
 
     linked = {}
-
+    local_conn = None
     try:
-        ensure_db_connection()
-        with conn.cursor() as cur:
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        with local_conn.cursor() as cur:
             cur.execute("""
                 SELECT roblox_id::text, discord_id::text, username
                 FROM users
@@ -17659,17 +17677,16 @@ def fetch_hourly_ping_targets(entries, threshold):
                 for roblox_id, discord_id, username in cur.fetchall():
                     linked.setdefault(str(roblox_id), {"discordId": str(discord_id), "username": str(username or roblox_id)})
             except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+                pass
     except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         print(f"[hourly stats] ping target lookup failed: {exc}")
         return []
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
     targets = []
     seen_discord = set()
@@ -17693,11 +17710,12 @@ def fetch_hourly_ping_targets(entries, threshold):
 
 
 def record_hourly_ping_targets(targets, threshold):
-    if not db_enabled() or not targets:
+    if not DATABASE_URL or not targets:
         return
+    local_conn = None
     try:
-        ensure_db_connection()
-        with conn.cursor() as cur:
+        local_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+        with local_conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS hourly_stats_ping_records (
                     id BIGSERIAL PRIMARY KEY,
@@ -17720,13 +17738,19 @@ def record_hourly_ping_targets(targets, threshold):
                 )
                 for target in targets
             ])
-        conn.commit()
+        local_conn.commit()
     except Exception:
         try:
-            conn.rollback()
+            local_conn.rollback()
         except Exception:
             pass
         raise
+    finally:
+        if local_conn:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
 
 async def send_hourly_ping_followup(channel, entries, threshold, message=None):
