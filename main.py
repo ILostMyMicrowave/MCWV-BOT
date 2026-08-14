@@ -10239,12 +10239,10 @@ def build_checkplayer_embed(data, page=0, per_page=7):
 
 
 class CheckPlayerView(discord.ui.View):
-    """Pagination view for /checkplayer results.
-    Regenerates the image card for each page so it always matches."""
-    def __init__(self, data, user_name, avatar_url=None, per_page=7):
+    """Pagination view for /checkplayer — regenerates image per page."""
+    def __init__(self, data, avatar_url=None, per_page=7):
         super().__init__(timeout=300)
         self.data = data
-        self.user_name = user_name
         self.avatar_url = avatar_url
         self.page = 0
         self.per_page = per_page
@@ -10253,80 +10251,76 @@ class CheckPlayerView(discord.ui.View):
         rows = self.data["rows"]
         return max(1, (len(rows) + self.per_page - 1) // self.per_page)
 
-    def build_embed(self):
-        return build_checkplayer_embed(self.data, page=self.page, per_page=self.per_page)
-
     async def _move(self, interaction, delta):
         self.page = (self.page + delta) % self.total_pages()
-        await interaction.response.defer()
-        
-        # Regenerate image for this page
-        file = None
+        embed = build_checkplayer_embed(self.data, page=self.page, per_page=self.per_page)
+        if self.avatar_url:
+            embed.set_thumbnail(url=self.avatar_url)
         try:
             image = await generate_checkplayer_card(self.data, self.avatar_url, page=self.page, per_page=self.per_page)
             file = discord.File(image, filename="checkplayer-card.png")
-        except Exception as exc:
-            print(f"[checkplayer] page image failed: {exc}")
-        
-        embed = self.build_embed()
-        if self.avatar_url:
-            embed.set_thumbnail(url=self.avatar_url)
-        if file:
             embed.set_image(url="attachment://checkplayer-card.png")
-        
-        # Edit with new file + embed
-        if file:
-            await interaction.edit_original_response(embed=embed, attachments=[file], view=self)
-        else:
-            await interaction.edit_original_response(embed=embed, view=self)
+            await interaction.response.edit_message(embed=embed, attachments=[file], view=self)
+        except Exception as exc:
+            print(f"[checkplayer] page {self.page} image failed: {exc}")
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                try:
+                    await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+                except Exception:
+                    pass
 
-    @discord.ui.button(label="\u25c0 Prev", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="\u25c0", style=discord.ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._move(interaction, -1)
 
-    @discord.ui.button(label="Next \u25b6", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="\u25b6", style=discord.ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._move(interaction, 1)
 
 
-# ---------------- CHECKPLAYER IMAGE CARD ----------------
-
 async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
-    """Generate a polished dashboard image for /checkplayer using the galaxy background.
-    Fixes: consistent colors, aligned columns, compact participated rows, readable footer."""
+    """Generate a polished dashboard image for /checkplayer.
+    Clean card UI: galaxy bg, avatar, header section, battle rows, summary."""
     S = 2
     rows = data["rows"]
-    start = page * per_page
-    page_rows = rows[start:start + per_page]
+    page_rows = rows[page * per_page : page * per_page + per_page]
 
-    # Layout constants
+    def sc(v):
+        return int(round(v * S))
+
+    # ---- Layout ----
     W = 1200 * S
-    LEFT_MARGIN = sc = lambda v: int(round(v * S))
-    COL_BATTLE = sc(70)     # battle name x
-    COL_CLAN = sc(70)       # clan tag x (below battle name)
-    COL_PTS = sc(480)       # points column
-    COL_RANK = sc(600)      # rank column
-    COL_BAR = sc(800)       # percentile bar start
-    BAR_W = sc(240)        # bar width
-    COL_PCT = sc(800) + BAR_W + sc(10)  # percentile text
-    RIGHT_EDGE = W - sc(70)
+    MARGIN = sc(60)
+    RIGHT = W - sc(60)
+    CONTENT_W = RIGHT - MARGIN
 
-    # Calculate height
-    header_h = 300
-    battle_h_normal = 52
-    battle_h_compact = 36  # participated rows are smaller
-    summary_h = 120
-    footer_h = 35
+    # Column positions (aligned grid)
+    C_NAME = MARGIN + sc(12)       # battle name
+    C_CLAN = MARGIN + sc(12)       # clan tag (below name)
+    C_PTS = MARGIN + sc(430)       # points column
+    C_RANK = MARGIN + sc(560)      # rank column
+    C_BAR = MARGIN + sc(770)       # percentile bar
+    BAR_W = sc(260)
+    C_PCT = C_BAR + BAR_W + sc(10) # percentile text
 
+    # Row heights
+    RH_NORMAL = sc(50)
+    RH_COMPACT = sc(34)
+    HEADER_H = sc(280)
+    FOOTER_H = sc(35)
+    SUMMARY_H = sc(95)
+
+    # Calculate total height
     list_h = 0
     for row in page_rows:
-        if row.get("participated_only"):
-            list_h += battle_h_compact
-        else:
-            list_h += battle_h_normal
+        list_h += RH_COMPACT if row.get("participated_only") else RH_NORMAL
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    has_summary = page >= total_pages - 1 and data.get("rank_values")
+    H = HEADER_H + max(list_h, sc(40)) + (SUMMARY_H if has_summary else 0) + FOOTER_H + sc(20)
 
-    H = (header_h + max(list_h, 40) + summary_h + footer_h) * S
-
+    # ---- Fonts ----
     def font(size, bold=True):
         path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
         try:
@@ -10334,268 +10328,257 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
         except Exception:
             return ImageFont.load_default()
 
-    fonts = {
-        "name": font(30, True),
-        "id": font(16, False),
-        "status": font(18, True),
-        "section": font(20, True),
-        "battle": font(17, True),
-        "stats": font(14, False),
+    F = {
+        "name": font(28, True),
+        "sub": font(15, False),
+        "badge": font(16, True),
+        "section": font(18, True),
+        "battle": font(16, True),
+        "stats": font(13, False),
         "pct": font(14, True),
-        "summary_label": font(13, False),
-        "summary_value": font(24, True),
-        "summary_sub": font(12, False),
-        "clan": font(15, True),
-        "footer": font(13, False),
+        "sum_lbl": font(12, False),
+        "sum_val": font(22, True),
+        "sum_sub": font(11, False),
+        "footer": font(12, False),
     }
 
-    # Accent color (single, consistent)
-    accent = (74, 222, 128) if data["is_currently_mcwv"] else ((255, 84, 96) if data["is_currently_rival"] else (130, 100, 255))
+    # ---- Accent ----
+    if data["is_currently_mcwv"]:
+        accent = (74, 222, 128)
+    elif data["is_currently_rival"]:
+        accent = (255, 84, 96)
+    else:
+        accent = (130, 100, 255)
 
-    # Background: galaxy image
+    # ---- Background ----
     img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
-    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 125)))
-
-    await asyncio.sleep(0)
+    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 130)))
 
     # Faint grid
     grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grid)
-    for x in range(0, W, sc(54)):
-        gd.line((x, 0, x, H), fill=(125, 145, 205, 12), width=sc(1))
-    for y in range(0, H, sc(54)):
-        gd.line((0, y, W, y), fill=(125, 145, 205, 8), width=sc(1))
+    for x in range(0, W, sc(50)):
+        gd.line((x, 0, x, H), fill=(120, 140, 200, 10), width=sc(1))
+    for y in range(0, H, sc(50)):
+        gd.line((0, y, W, y), fill=(120, 140, 200, 7), width=sc(1))
     img.alpha_composite(grid)
+    await asyncio.sleep(0)
 
-    # Main panel
-    def alpha_round(box, radius, fill, outline=None, width=1, blur=0):
+    # ---- Helpers ----
+    def panel(box, radius, fill, outline=None, width=1, blur=0):
         layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
-        ld.rounded_rectangle(box, radius=sc(radius), fill=fill, outline=outline, width=sc(width) if outline else 1)
+        ld.rounded_rectangle(box, radius=sc(radius), fill=fill,
+                              outline=outline, width=sc(width) if outline else 1)
         if blur:
             layer = layer.filter(ImageFilter.GaussianBlur(sc(blur)))
         img.alpha_composite(layer)
 
-    card_box = (sc(24), sc(24), W - sc(24), H - sc(24))
-    alpha_round((card_box[0] + sc(4), card_box[1] + sc(6), card_box[2] + sc(4), card_box[3] + sc(6)), 24, (0, 0, 0, 140), blur=8)
-    alpha_round(card_box, 24, (14, 17, 30, 215), outline=(*accent, 120), width=2)
-    alpha_round((card_box[0] + sc(2), card_box[1] + sc(2), card_box[2] - sc(2), card_box[3] - sc(2)), 22, (255, 255, 255, 0), outline=(255, 255, 255, 20), width=1)
+    def txt(xy, text, f, fill, shadow=True):
+        d = ImageDraw.Draw(img)
+        if shadow:
+            d.text((xy[0] + sc(1), xy[1] + sc(1)), text, font=f, fill=(0, 0, 0, 110))
+        d.text(xy, text, font=f, fill=fill)
 
-    d = ImageDraw.Draw(img)
-
+    # ---- Card panel ----
+    card = (sc(20), sc(20), W - sc(20), H - sc(20))
+    panel((card[0]+sc(4), card[1]+sc(6), card[2]+sc(4), card[3]+sc(6)), 22, (0,0,0,130), blur=6)
+    panel(card, 22, (12, 15, 28, 218), outline=(*accent, 100), width=2)
+    panel((card[0]+sc(2), card[1]+sc(2), card[2]-sc(2), card[3]-sc(2)), 20, (255,255,255,0), outline=(255,255,255,18), width=1)
     await asyncio.sleep(0)
 
-    # === HEADER ===
-    # Avatar with glow ring
-    avatar_x, avatar_y = sc(70), sc(70)
-    avatar_size = sc(100)
+    # ---- Avatar ----
+    AV_SIZE = sc(90)
+    AV_X, AV_Y = MARGIN, sc(55)
     if avatar_url:
         try:
             global session
             if session is None or session.closed:
                 session = aiohttp.ClientSession()
-            async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=10)) as res:
+            async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=8)) as res:
                 if res.status == 200:
-                    avatar_bytes = await res.read()
-                    avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
-                    mask = Image.new("L", (avatar_size, avatar_size), 0)
-                    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
-                    ring_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                    rg = ImageDraw.Draw(ring_glow)
-                    rg.ellipse((avatar_x - sc(6), avatar_y - sc(6), avatar_x + avatar_size + sc(6), avatar_y + avatar_size + sc(6)), fill=(*accent, 40))
-                    ring_glow = ring_glow.filter(ImageFilter.GaussianBlur(sc(6)))
-                    img.alpha_composite(ring_glow)
-                    img.paste(avatar, (avatar_x, avatar_y), mask)
+                    ab = await res.read()
+                    av = Image.open(BytesIO(ab)).convert("RGBA").resize((AV_SIZE, AV_SIZE), Image.Resampling.LANCZOS)
+                    mask = Image.new("L", (AV_SIZE, AV_SIZE), 0)
+                    ImageDraw.Draw(mask).ellipse((0, 0, AV_SIZE-1, AV_SIZE-1), fill=255)
+                    glow = Image.new("RGBA", (W, H), (0,0,0,0))
+                    rg = ImageDraw.Draw(glow)
+                    rg.ellipse((AV_X-sc(6), AV_Y-sc(6), AV_X+AV_SIZE+sc(6), AV_Y+AV_SIZE+sc(6)), fill=(*accent, 35))
+                    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(sc(6))))
+                    img.paste(av, (AV_X, AV_Y), mask)
                     d = ImageDraw.Draw(img)
-                    d.ellipse((avatar_x - sc(2), avatar_y - sc(2), avatar_x + avatar_size + sc(2), avatar_y + avatar_size + sc(2)), outline=(*accent, 180), width=sc(2))
+                    d.ellipse((AV_X-sc(2), AV_Y-sc(2), AV_X+AV_SIZE+sc(2), AV_Y+AV_SIZE+sc(2)), outline=(*accent, 170), width=sc(2))
         except Exception:
             pass
-
     await asyncio.sleep(0)
 
-    # Name + ID
-    name = data["roblox_name"]
-    draw_text_shadow(d, (sc(195), sc(68)), name, fonts["name"], (255, 255, 255, 255), shadow=(0, 0, 0, 130), offset=(sc(2), sc(2)))
-    d.text((sc(195), sc(102)), f"ID: {data['roblox_id']}", font=fonts["id"], fill=(150, 160, 180, 255))
+    # ---- Name + ID ----
+    NAME_X = AV_X + AV_SIZE + sc(20)
+    txt((NAME_X, sc(55)), data["roblox_name"], F["name"], (255, 255, 255, 255))
+    txt((NAME_X, sc(90)), f"ID: {data['roblox_id']}", F["sub"], (150, 160, 180, 255), shadow=False)
 
-    # Status badges — all use accent color for consistency
-    badge_x = sc(195)
-    badge_y = sc(128)
-    status_parts = []
+    # ---- Status badges ----
+    bx = NAME_X
+    by = sc(115)
+    badges = []
     if data["is_currently_mcwv"]:
-        status_parts.append("MCWV Member")
+        badges.append("MCWV")
     elif data["is_currently_rival"]:
-        status_parts.append(data["current_clan_name"])
-    if data["earned_medals_agg"]:
-        status_parts.append(f"{data['earned_medals_agg']} medals")
-    if data["total_battles_agg"]:
-        status_parts.append(f"{data['total_battles_agg']} battles")
+        badges.append(data["current_clan_name"])
+    if data.get("earned_medals_agg"):
+        badges.append(f"{data['earned_medals_agg']} medals")
+    if data.get("total_battles_agg"):
+        badges.append(f"{data['total_battles_agg']} battles")
 
-    for text in status_parts[:4]:
-        text_w = d.textbbox((0, 0), text, font=fonts["status"])
-        tw = text_w[2] - text_w[0]
-        badge_box = (badge_x, badge_y, badge_x + tw + sc(20), badge_y + sc(28))
-        alpha_round(badge_box, 14, (22, 25, 43, 220), outline=(*accent, 100), width=1)
-        dd = ImageDraw.Draw(img)
-        dd.text((badge_x + sc(10), badge_y + sc(5)), text, font=fonts["status"], fill=(*accent, 255))
-        badge_x += tw + sc(20) + sc(8)
-
+    for btext in badges[:4]:
+        d = ImageDraw.Draw(img)
+        tw = d.textbbox((0, 0), btext, font=F["badge"])
+        bw = tw[2] - tw[0]
+        panel((bx, by, bx + bw + sc(18), by + sc(26)), 13, (20, 24, 38, 220), outline=(*accent, 80), width=1)
+        d.text((bx + sc(9), by + sc(4)), btext, font=F["badge"], fill=(*accent, 255))
+        bx += bw + sc(18) + sc(7)
     await asyncio.sleep(0)
 
-    # Clan history
-    clans = data["clans_seen"][:8]
+    # ---- Clan history ----
+    clans = data.get("clans_seen", [])[:8]
     if clans:
+        d = ImageDraw.Draw(img)
         clan_text = "  \u2192  ".join(clans)
-        clan_text = fit_text(d, clan_text, fonts["clan"], RIGHT_EDGE - sc(70))
-        d.text((sc(70), sc(180)), "Clan History", font=fonts["section"], fill=(160, 170, 195, 200))
-        draw_text_shadow(d, (sc(70), sc(208)), clan_text, fonts["clan"], (210, 220, 245, 255), shadow=(0, 0, 0, 110), offset=(sc(1), sc(1)))
+        clan_text = fit_text(d, clan_text, F["sub"], CONTENT_W)
+        txt((MARGIN, sc(165)), "Clan History", F["section"], (160, 170, 195, 190), shadow=False)
+        txt((MARGIN, sc(190)), clan_text, F["sub"], (210, 220, 245, 255))
 
-    # Separator
-    sep_y = sc(250)
-    d.line((sc(70), sep_y, RIGHT_EDGE, sep_y), fill=(80, 90, 120, 70), width=sc(1))
+    # ---- Separator ----
+    d = ImageDraw.Draw(img)
+    d.line((MARGIN, sc(230), RIGHT, sc(230)), fill=(70, 80, 110, 60), width=sc(1))
 
-    # War History header
-    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-    header_text = f"War History  \u00b7  Page {page+1}/{total_pages}"
-    d.text((sc(70), sc(265)), header_text, font=fonts["section"], fill=(200, 210, 240, 240))
+    # ---- War History header ----
+    txt((MARGIN, sc(248)), f"War History  \u00b7  Page {page+1}/{total_pages}", F["section"], (195, 205, 235, 230))
 
-    # === BATTLE ROWS ===
-    y = sc(300)
+    # ---- Battle rows ----
+    y = sc(278)
     for row in page_rows:
         title = _friendly_battle_name(row.get("battleId") or row.get("title") or "?")
         clan = str(row.get("clan") or "?")
         pts = _safe_int(row.get("points"))
         rank = _safe_int(row.get("rank"))
-        total = _safe_int(row.get("total")) or 0
+        total_c = _safe_int(row.get("total")) or 0
         place = row.get("clanPlace")
         participated = row.get("participated_only")
+        rh = RH_COMPACT if participated else RH_NORMAL
+
+        # Row card
+        panel((MARGIN, y, RIGHT, y + rh - sc(4)), 8, (18, 22, 36, 165))
+        d = ImageDraw.Draw(img)
 
         if participated:
-            # Compact row — half height, no bar
-            alpha_round((sc(70), y, RIGHT_EDGE, y + sc(30)), 8, (18, 22, 35, 160))
-            dd = ImageDraw.Draw(img)
-            title_short = fit_text(dd, title, fonts["battle"], sc(380))
-            dd.text((sc(82), y + sc(4)), title_short, font=fonts["battle"], fill=(180, 190, 210, 255))
-            clan_color = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (140, 150, 175, 255)
-            dd.text((sc(480), y + sc(6)), f"[{clan}]", font=fonts["stats"], fill=clan_color)
-            dd.text((sc(600), y + sc(6)), "participated \u2713", font=fonts["stats"], fill=(120, 130, 150, 255))
-            y += sc(battle_h_compact)
+            t_short = fit_text(d, title, F["battle"], sc(390))
+            d.text((C_NAME, y + sc(3)), t_short, font=F["battle"], fill=(170, 180, 205, 255))
+            cc = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (130, 140, 165, 255)
+            d.text((C_PTS, y + sc(5)), f"[{clan}]", font=F["stats"], fill=cc)
+            d.text((C_RANK, y + sc(5)), "participated \u2713", font=F["stats"], fill=(110, 120, 140, 255))
         else:
-            pct = float(row.get("betterThan") or ((total - rank) / total * 100 if rank > 0 and total > 1 else 0))
-
-            # Consistent color: green >=80, yellow >=50, red <50
+            pct = float(row.get("betterThan") or ((total_c - rank) / total_c * 100 if rank > 0 and total_c > 1 else 0))
             if pct >= 80:
-                bar_color = (74, 222, 128)
+                bc = (74, 222, 128)
             elif pct >= 50:
-                bar_color = (250, 200, 60)
+                bc = (250, 200, 60)
             else:
-                bar_color = (255, 100, 100)
+                bc = (255, 100, 100)
 
-            # Row background
-            alpha_round((sc(70), y, RIGHT_EDGE, y + sc(44)), 10, (20, 25, 40, 175))
-            dd = ImageDraw.Draw(img)
+            # Battle name
+            t_short = fit_text(d, title, F["battle"], sc(400))
+            d.text((C_NAME, y + sc(2)), t_short, font=F["battle"], fill=(235, 240, 255, 255))
 
-            # Battle name (left aligned)
-            title_short = fit_text(dd, title, fonts["battle"], sc(390))
-            dd.text((sc(82), y + sc(3)), title_short, font=fonts["battle"], fill=(240, 245, 255, 255))
-
-            # Clan tag (below battle name)
-            clan_color = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (140, 150, 175, 255)
+            # Clan tag
+            cc = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (130, 140, 165, 255)
             clan_str = f"[{clan}]"
             if row.get("earnedMedal"):
                 clan_str += "  \u00b7 medal"
-            dd.text((sc(82), y + sc(24)), clan_str, font=fonts["stats"], fill=clan_color)
+            d.text((C_NAME, y + sc(22)), clan_str, font=F["stats"], fill=cc)
 
-            # Points (aligned column)
-            pts_text = format_points(pts)
-            dd.text((COL_PTS, y + sc(3)), pts_text, font=fonts["pct"], fill=(200, 210, 230, 255))
+            # Points (aligned)
+            d.text((C_PTS, y + sc(2)), format_points(pts), font=F["pct"], fill=(200, 210, 230, 255))
 
-            # Rank (aligned column)
-            if rank > 0 and total > 1:
-                rank_text = f"#{rank:,}/{total:,}"
-                dd.text((COL_RANK, y + sc(3)), rank_text, font=fonts["stats"], fill=(170, 180, 205, 255))
-
-            # Clan place (below rank)
+            # Rank (aligned)
+            if rank > 0 and total_c > 1:
+                d.text((C_RANK, y + sc(2)), f"#{rank:,}/{total_c:,}", font=F["stats"], fill=(170, 180, 205, 255))
             if place and place not in (None, "", 0):
-                dd.text((COL_RANK, y + sc(24)), f"clan #{int(place)}", font=fonts["stats"], fill=(120, 130, 150, 255))
+                d.text((C_RANK, y + sc(22)), f"clan #{int(place)}", font=F["stats"], fill=(115, 125, 145, 255))
 
-            # Percentile bar with gradient
-            bar_x = COL_BAR
-            bar_y = y + sc(16)
-            bar_h = sc(10)
-            dd.rounded_rectangle((bar_x, bar_y, bar_x + BAR_W, bar_y + bar_h), radius=sc(4), fill=(40, 45, 60, 255))
-            fill_w = int(BAR_W * (pct / 100))
-            if fill_w > 0:
-                fill_img = Image.new("RGBA", (fill_w, bar_h), (0, 0, 0, 0))
-                fd2 = ImageDraw.Draw(fill_img)
-                for bx in range(fill_w):
-                    t = bx / max(fill_w - 1, 1)
-                    shade = 0.82 + 0.18 * t
-                    grad = tuple(min(255, int(bar_color[i] * shade + 15 * (1 - t))) for i in range(3))
-                    fd2.line((bx, 0, bx, bar_h), fill=(*grad, 255))
-                fill_mask = Image.new("L", fill_img.size, 0)
-                ImageDraw.Draw(fill_mask).rounded_rectangle((0, 0, fill_img.size[0] - 1, fill_img.size[1] - 1), radius=sc(4), fill=255)
-                img.paste(fill_img, (bar_x, bar_y), fill_mask)
-                dd = ImageDraw.Draw(img)
+            # Percentile bar
+            bar_y = y + sc(14)
+            bar_h = sc(8)
+            d.rounded_rectangle((C_BAR, bar_y, C_BAR + BAR_W, bar_y + bar_h), radius=sc(3), fill=(38, 42, 56, 255))
+            fw = int(BAR_W * (pct / 100))
+            if fw > 0:
+                fi = Image.new("RGBA", (fw, bar_h), (0,0,0,0))
+                fd2 = ImageDraw.Draw(fi)
+                for bx2 in range(fw):
+                    t2 = bx2 / max(fw - 1, 1)
+                    s2 = 0.80 + 0.20 * t2
+                    g2 = tuple(min(255, int(bc[i] * s2 + 12 * (1 - t2))) for i in range(3))
+                    fd2.line((bx2, 0, bx2, bar_h), fill=(*g2, 255))
+                fm = Image.new("L", fi.size, 0)
+                ImageDraw.Draw(fm).rounded_rectangle((0, 0, fi.size[0]-1, fi.size[1]-1), radius=sc(3), fill=255)
+                img.paste(fi, (C_BAR, bar_y), fm)
+                d = ImageDraw.Draw(img)
 
             # Percentile text
-            dd.text((COL_PCT, y + sc(13)), f"{pct:.1f}%", font=fonts["pct"], fill=(*bar_color, 255))
+            d.text((C_PCT, y + sc(11)), f"{pct:.1f}%", font=F["pct"], fill=(*bc, 255))
 
-            y += sc(battle_h_normal)
-
+        y += rh
         await asyncio.sleep(0)
 
-    # === SUMMARY (last page only) ===
-    if page >= total_pages - 1 and data["rank_values"]:
-        rank_values = data["rank_values"]
-        sorted_by_perf = sorted(rank_values, key=lambda r: r["pct"], reverse=True)
-        best = sorted_by_perf[0]
-        worst = sorted_by_perf[-1]
-        avg_pct = sum(r["pct"] for r in rank_values) / len(rank_values)
+    # ---- Summary (last page only) ----
+    if has_summary:
+        rv = data["rank_values"]
+        sp = sorted(rv, key=lambda r: r["pct"], reverse=True)
+        best, worst = sp[0], sp[-1]
+        avg = sum(r["pct"] for r in rv) / len(rv)
 
-        y_sum = y + sc(8)
-        d.line((sc(70), y_sum, RIGHT_EDGE, y_sum), fill=(80, 90, 120, 70), width=sc(1))
-        y_sum += sc(14)
+        d = ImageDraw.Draw(img)
+        d.line((MARGIN, y, RIGHT, y), fill=(70, 80, 110, 60), width=sc(1))
+        y += sc(10)
 
-        col_w = (RIGHT_EDGE - sc(70)) // 3
-        summaries = [
+        col_w = CONTENT_W // 3
+        items = [
             ("BEST", f"{best['pct']:.1f}%", f"#{best['rank']:,}/{best['total']:,}", (74, 222, 128)),
-            ("AVERAGE", f"{avg_pct:.1f}%", "better than global", (100, 180, 255)),
+            ("AVERAGE", f"{avg:.1f}%", "better than global", (100, 180, 255)),
             ("WORST", f"{worst['pct']:.1f}%", f"#{worst['rank']:,}/{worst['total']:,}", (255, 100, 100)),
         ]
-        for i, (label, value, sub, color) in enumerate(summaries):
-            x = sc(70) + i * col_w
-            box_w = col_w - sc(10)
-            alpha_round((x, y_sum, x + box_w, y_sum + sc(76)), 12, (22, 25, 43, 200), outline=(*color, 70), width=1)
-            dd = ImageDraw.Draw(img)
-            dd.text((x + sc(14), y_sum + sc(8)), label, font=fonts["summary_label"], fill=(130, 140, 160, 255))
-            draw_text_shadow(dd, (x + sc(14), y_sum + sc(24)), value, fonts["summary_value"], (*color, 255), shadow=(0, 0, 0, 110), offset=(sc(2), sc(2)))
-            dd.text((x + sc(14), y_sum + sc(54)), sub, font=fonts["summary_sub"], fill=(150, 160, 180, 255))
+        for i, (lbl, val, sub, col) in enumerate(items):
+            x = MARGIN + i * col_w
+            bw = col_w - sc(8)
+            panel((x, y, x + bw, y + sc(72)), 10, (20, 24, 38, 195), outline=(*col, 60), width=1)
+            d = ImageDraw.Draw(img)
+            d.text((x + sc(12), y + sc(6)), lbl, font=F["sum_lbl"], fill=(125, 135, 155, 255))
+            txt((x + sc(12), y + sc(22)), val, F["sum_val"], (*col, 255))
+            d.text((x + sc(12), y + sc(52)), sub, font=F["sum_sub"], fill=(145, 155, 175, 255))
 
-    # === FOOTER === (readable, larger)
-    foot_y = H - sc(28)
-    data_sources = []
+    # ---- Footer ----
+    d = ImageDraw.Draw(img)
+    sources = []
     if data.get("cached_rows"):
-        data_sources.append("global cache")
+        sources.append("cache")
     if data.get("scraped_clans"):
-        data_sources.append("scrape")
-    source_txt = " + ".join(data_sources) if data_sources else "PS99"
-    foot_text = f"{source_txt}  \u00b7  {len(rows)} battles"
+        sources.append("scrape")
+    src = " + ".join(sources) if sources else "PS99"
+    ft = f"{src}  \u00b7  {len(rows)} battles"
     if page == 0:
-        foot_text += "  \u00b7  pre-backfill wars may be incomplete"
-    d.text((sc(70), foot_y), foot_text, font=fonts["footer"], fill=(130, 140, 165, 220))
+        ft += "  \u00b7  older wars may be partial"
+    d.text((MARGIN, H - sc(25)), ft, font=F["footer"], fill=(135, 145, 170, 210))
 
     await asyncio.sleep(0)
 
-    # Resize down
-    out_w = W // S if S > 1 else W
-    out_h = H // S if S > 1 else H
+    # ---- Output ----
+    out_w = W // S
+    out_h = H // S
     img = img.resize((out_w, out_h), Image.Resampling.LANCZOS)
     out = BytesIO()
     img.save(out, format="PNG")
     out.seek(0)
     return out
-
 
 
 
@@ -10691,7 +10674,7 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         rows = data["rows"]
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         if total_pages > 1:
-            view = CheckPlayerView(data, interaction.user.name, avatar_url=avatar_url, per_page=per_page)
+            view = CheckPlayerView(data, avatar_url=avatar_url, per_page=per_page)
             if file:
                 await interaction.followup.send(embed=embed, file=file, view=view)
             else:
