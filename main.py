@@ -3471,6 +3471,7 @@ def db_create_mcwv_ticket(ticket_id, channel_id, guild_id, opener_id):
 
 def db_get_ticket_by_channel(channel_id):
     if not db_enabled():
+        print(f"[ticket] db_get_ticket_by_channel: db not enabled")
         return None
     db_ensure_mcwv_ticket_tables()
     try:
@@ -3481,9 +3482,16 @@ def db_get_ticket_by_channel(channel_id):
                 WHERE channel_id = %s
                 LIMIT 1
             """, (int(channel_id),))
-            return cur.fetchone()
+            row = cur.fetchone()
+            if not row:
+                print(f"[ticket] db_get_ticket_by_channel: no ticket found for channel_id={channel_id}")
+            return row
     except Exception as e:
-        print("db_get_ticket_by_channel error:", e)
+        print(f"db_get_ticket_by_channel error for channel_id={channel_id}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return None
 
 
@@ -8534,13 +8542,25 @@ async def count_ticket_screenshot_attachments(channel, applicant_id, limit=250):
     return count
 
 
+
+
+def find_ticket_in_channel(channel):
+    """Look up a ticket by channel_id, with fallback to ticket_id from channel topic.
+    Works even if the channel was moved/renamed (channel_id changed)."""
+    row = db_get_ticket_by_channel(channel.id)
+    if not row and channel.topic:
+        ticket_match = re.search(r'app-\d+', channel.topic)
+        if ticket_match:
+            row = db_get_ticket_by_ticket_id(ticket_match.group(0))
+    return row
+
 class ScreenshotUploadedView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Screenshots uploaded", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_screenshots_uploaded")
     async def uploaded_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        row = find_ticket_in_channel(interaction.channel)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if interaction.user.id != int(row[3]):
@@ -8779,7 +8799,7 @@ class TicketWelcomeView(discord.ui.View):
 
     @discord.ui.button(label="Submit Application", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_submit_application")
     async def submit_application(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_channel(interaction.channel.id)
+        row = find_ticket_in_channel(interaction.channel)
         if not row:
             return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
         if interaction.user.id != int(row[3]):
@@ -12372,7 +12392,15 @@ async def reject_application(interaction: discord.Interaction, reason: str = Non
         return await interaction.response.send_message("❌ This can only be used in the server.", ephemeral=True)
     if not has_mcwv_ticket_staff_permission(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+
+    # Try channel_id first, then fall back to ticket_id from channel topic
     row = db_get_ticket_by_channel(interaction.channel.id)
+    if not row and interaction.channel.topic:
+        topic = interaction.channel.topic
+        ticket_match = re.search(r'app-\d+', topic)
+        if ticket_match:
+            row = db_get_ticket_by_ticket_id(ticket_match.group(0))
+
     if not row:
         return await interaction.response.send_message("❌ Run this command inside an application ticket channel.", ephemeral=True)
     status = str(row[6] or "").lower()
