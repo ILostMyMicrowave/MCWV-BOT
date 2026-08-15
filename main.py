@@ -11632,6 +11632,507 @@ async def checkplayer(interaction: discord.Interaction, roblox_username: str):
         await interaction.followup.send(f"Lookup failed: `{type(e).__name__}`")
 
 
+# ---------------- GLOBAL SEARCH (CW-STYLE) ----------------
+
+def fmt_search_points(value):
+    """CW-style compact numbers: 6.84m / 75.80k / 1,234."""
+    try:
+        v = float(value or 0)
+    except Exception:
+        return "0"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.2f}m"
+    if v >= 1_000:
+        return f"{v / 1_000:.2f}k"
+    return f"{int(v):,}"
+
+
+async def gather_search_data(roblox_id, roblox_name):
+    """Everything /search needs: current clan, battle stats, global rank from
+    the cross-clan cache, in-clan rank, and the last 24 hourly point samples
+    for the activity chart."""
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    data = {
+        "roblox_id": str(roblox_id),
+        "roblox_name": roblox_name,
+        "clan_name": None,
+        "battle_id": None,
+        "battle_name": None,
+        "stars": None,          # points in the current battle
+        "clan_rank": None,      # rank within clan contributors
+        "clan_size": None,
+        "global_rank": None,
+        "global_total": None,
+        "better_pct": None,
+        "clan_place": None,
+        "earned_medal": False,
+        "hourly": [],           # [(ts_ms, points)] last 24 samples
+        "avatar_url": None,
+    }
+
+    # 1) v1 player summary (current clan + active points)
+    try:
+        payload = await _ps99_json(f"{PS99_API}/v1/clans/players/{roblox_id}")
+        if isinstance(payload, dict) and payload.get("status") == "ok":
+            player = payload.get("data", {}).get("player", {})
+            if isinstance(player, dict):
+                clan = player.get("Clan", {}) if isinstance(player.get("Clan"), dict) else {}
+                data["clan_name"] = clan.get("Name") or None
+                active_pts = _safe_int(player.get("ActiveBattlePoints"))
+                if active_pts:
+                    data["stars"] = active_pts
+    except Exception as exc:
+        print(f"[search] v1 summary failed: {exc}")
+
+    # 1b) The v1 summary's clan can be stale — if the player is in MCWV's live
+    # roster, MCWV wins (same logic as /checkplayer).
+    try:
+        mcwv_data = await _fetch_clan_data(CLAN_NAME)
+        if mcwv_data:
+            mcwv_members = mcwv_data.get("Members", [])
+            if isinstance(mcwv_members, list) and any(
+                str(m.get("UserID")) == str(roblox_id)
+                for m in mcwv_members if isinstance(m, dict)
+            ):
+                data["clan_name"] = CLAN_NAME
+    except Exception as exc:
+        print(f"[search] MCWV membership check failed: {exc}")
+
+    # 2) Battle id: active battle first, then the latest scheduled battle.
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        st = get_battles_war_state()
+        if st and st.get("battle_id"):
+            battle_id = str(st["battle_id"])
+    if battle_id:
+        data["battle_id"] = battle_id
+        data["battle_name"] = _friendly_battle_name(str(battle_id))
+
+    # 3) Cross-clan cache row → stars, global rank/total, clan place/medal.
+    if data["battle_id"]:
+        try:
+            if db_enabled():
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT battle_id, clan_name, points, rank, total_contributors, clan_place, earned_medal
+                        FROM cross_clan_player_history
+                        WHERE roblox_id = %s AND battle_id = %s
+                        ORDER BY points DESC LIMIT 1
+                    """, (str(roblox_id), str(data["battle_id"])))
+                    row = cur.fetchone()
+                    if not row:
+                        # The player may not have played the current battle —
+                        # fall back to their most recent cached battle.
+                        cur.execute("""
+                            SELECT battle_id, clan_name, points, rank, total_contributors, clan_place, earned_medal
+                            FROM cross_clan_player_history
+                            WHERE roblox_id = %s
+                            ORDER BY COALESCE(start_time, 0) DESC, cached_at DESC
+                            LIMIT 1
+                        """, (str(roblox_id),))
+                        row = cur.fetchone()
+                        if row:
+                            data["battle_id"] = str(row[0])
+                            data["battle_name"] = _friendly_battle_name(str(row[0]))
+                    if row:
+                        data["clan_name"] = data["clan_name"] or str(row[1])
+                        data["stars"] = _safe_int(row[2]) or data["stars"]
+                        data["global_rank"] = _safe_int(row[3]) or None
+                        data["global_total"] = _safe_int(row[4]) or None
+                        data["clan_place"] = _safe_int(row[5]) or None
+                        data["earned_medal"] = bool(row[6])
+        except Exception as exc:
+            print(f"[search] cross-clan lookup failed: {exc}")
+
+        # In-clan contributor rank: position among the clan's scorers.
+        try:
+            if db_enabled() and data["clan_name"]:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT roblox_id, points FROM cross_clan_player_history
+                        WHERE battle_id = %s AND clan_name = %s AND points > 0
+                        ORDER BY points DESC
+                    """, (str(data["battle_id"]), str(data["clan_name"])))
+                    clan_rows = cur.fetchall()
+                    if clan_rows:
+                        data["clan_size"] = len(clan_rows)
+                        for idx, (rid, pts) in enumerate(clan_rows, start=1):
+                            if str(rid).strip() == str(roblox_id):
+                                data["clan_rank"] = idx
+                                data["stars"] = _safe_int(pts) or data["stars"]
+                                break
+        except Exception as exc:
+            print(f"[search] in-clan rank failed: {exc}")
+
+    if data["global_rank"] and data["global_total"] and data["global_total"] > 1:
+        data["better_pct"] = (data["global_total"] - data["global_rank"]) / data["global_total"] * 100
+
+    # 4) Hourly snapshots — the last 24 samples for the activity chart.
+    if data["battle_id"]:
+        try:
+            if db_enabled():
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT points, captured_at FROM hourly_stats_player_snapshots
+                        WHERE roblox_id = %s AND lower(battle_id) = lower(%s)
+                        ORDER BY scheduled_at ASC
+                    """, (str(roblox_id), str(data["battle_id"])))
+                    rows = cur.fetchall()
+                    for pts, captured in rows[-24:]:
+                        ts = to_ms_for_hourly(captured)
+                        if ts:
+                            data["hourly"].append((ts, int(pts or 0)))
+        except Exception as exc:
+            print(f"[search] hourly snapshots failed: {exc}")
+
+    # 5) Avatar
+    try:
+        data["avatar_url"] = await get_roblox_headshot_url(roblox_id)
+    except Exception:
+        pass
+
+    return data
+
+
+def build_search_embed(data):
+    embed = discord.Embed(
+        title="🔍 Global Search Results",
+        color=discord.Color.from_rgb(108, 34, 245),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="👤 Name", value=str(data.get("roblox_name") or "?"), inline=True)
+    embed.add_field(name="🏰 Clan", value=str(data.get("clan_name") or "—"), inline=True)
+    clan_rank = data.get("clan_rank")
+    clan_size = data.get("clan_size")
+    embed.add_field(
+        name="🔰 Clan Rank",
+        value=f"{clan_rank}/{clan_size}" if clan_rank and clan_size else "—",
+        inline=True,
+    )
+    embed.add_field(name="🎉 Event", value=str(data.get("battle_name") or data.get("battle_id") or "—"), inline=True)
+    stars = data.get("stars")
+    embed.add_field(name="🌟 Stars", value=(f"{fmt_search_points(stars)} ⭐" if stars is not None else "—"), inline=True)
+    placement_parts = []
+    if data.get("clan_place"):
+        placement_parts.append(f"Clan #{data['clan_place']}")
+    if data.get("earned_medal"):
+        placement_parts.append("🏅 medal")
+    embed.add_field(name="🎖 Placement", value=" · ".join(placement_parts) if placement_parts else "—", inline=True)
+
+    if data.get("global_rank") and data.get("global_total"):
+        embed.add_field(
+            name="🏆 Global Rank",
+            value=f"#{data['global_rank']:,} of {fmt_search_points(data['global_total'])}",
+            inline=True,
+        )
+        if data.get("better_pct") is not None:
+            better = data["better_pct"]
+            embed.add_field(
+                name="💠 Percentile",
+                value=f"Better than {better:.2f}% of players; {100 - better:.2f}% are better",
+                inline=True,
+            )
+
+    if data.get("avatar_url"):
+        embed.set_thumbnail(url=data["avatar_url"])
+    return embed
+
+
+def _search_axis_max(values):
+    top = max(values) if values else 0
+    if top <= 0:
+        return 1
+    target = top * 1.12
+    steps = (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10)
+    for power in (1, 10, 100, 1000, 10_000, 100_000, 1_000_000, 10_000_000):
+        for nice in steps:
+            step = nice * power
+            if step >= target:
+                return int(step)
+    return int(target) + 1
+
+
+async def build_search_card(data):
+    """CW-style analytics card, 10x edition: the MCWV galaxy background with
+    frosty glass panels on top, glowing neon-purple chart line, and the four
+    headline metrics. Dark, premium, glassmorphism look."""
+    S = 2
+    W, H = 800, 460
+    base_bg = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W * S, H * S))
+    img = base_bg.copy()
+    img.alpha_composite(Image.new("RGBA", (W * S, H * S), (3, 5, 16, 155)))
+    dark_bg = img.copy()  # what glass panels blur from (keeps the theme dark)
+    sc = lambda v: v * S
+
+    # ---- Faint grid over the galaxy ----
+    grid = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grid)
+    for x in range(0, W * S, sc(44)):
+        gd.line((x, 0, x, H * S), fill=(120, 140, 200, 8), width=sc(1))
+    for y in range(0, H * S, sc(44)):
+        gd.line((0, y, W * S, y), fill=(120, 140, 200, 6), width=sc(1))
+    img.alpha_composite(grid)
+    d = ImageDraw.Draw(img)
+
+    def font(size, bold=True):
+        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        try:
+            return ImageFont.truetype(path, sc(size))
+        except Exception:
+            return ImageFont.load_default()
+
+    F = {
+        "user": font(26, True),
+        "sub": font(13, False),
+        "label": font(9, True),
+        "metric": font(24, True),
+        "chip": font(10, True),
+        "chart_title": font(13, True),
+        "muted": font(10, False),
+        "axis": font(9, False),
+        "footer": font(8, False),
+        "placeholder": font(12, False),
+    }
+
+    PURPLE = (108, 34, 245, 255)
+    BLUE = (63, 131, 248, 255)
+    WHITE = (240, 242, 248, 255)
+    GRAY = (168, 174, 190, 255)
+    SLATE = (122, 130, 148, 255)
+    AMBER = (245, 200, 120, 255)
+
+    def glass(box, radius=16, fill_a=20, border_a=60, blur=10):
+        """Frosty glass panel: real backdrop blur of the galaxy background,
+        translucent white frost, crisp border and a top highlight line."""
+        x1, y1, x2, y2 = box
+        # soft drop shadow
+        sh = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        ImageDraw.Draw(sh).rounded_rectangle(
+            (x1 + sc(3), y1 + sc(5), x2 + sc(3), y2 + sc(5)),
+            radius=sc(radius), fill=(0, 0, 0, 70),
+        )
+        img.alpha_composite(sh)
+        # backdrop blur: crop the panel area from the raw galaxy bg and blur it
+        try:
+            bx1, by1 = max(x1 - sc(6), 0), max(y1 - sc(6), 0)
+            bx2, by2 = min(x2 + sc(6), W * S), min(y2 + sc(6), H * S)
+            crop = dark_bg.crop((bx1, by1, bx2, by2)).filter(ImageFilter.GaussianBlur(sc(blur)))
+            pmask = Image.new("L", crop.size, 0)
+            ImageDraw.Draw(pmask).rounded_rectangle(
+                (x1 - bx1, y1 - by1, x2 - bx1, y2 - by1), radius=sc(radius), fill=255
+            )
+            img.paste(crop, (bx1, by1), pmask)
+        except Exception:
+            pass
+        # translucent frost fill + border (layer-composited so alpha blends)
+        frost = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        fd = ImageDraw.Draw(frost)
+        fd.rounded_rectangle(box, radius=sc(16), fill=(255, 255, 255, fill_a))
+        fd.rounded_rectangle(box, radius=sc(16), outline=(255, 255, 255, border_a), width=sc(1))
+        fd.line((x1 + sc(20), y1 + sc(1), x2 - sc(20), y1 + sc(1)), fill=(255, 255, 255, 80), width=sc(1))
+        img.alpha_composite(frost)
+
+    def chip(text, color, x, y, pad=10):
+        """Small rounded label chip, right-aligned text inside."""
+        tw = d.textlength(text, font=F["chip"])
+        w = tw + sc(pad) * 2
+        h = sc(22)
+        layer = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle(
+            (x - w, y, x, y + h), radius=sc(11),
+            fill=(*color[:3], 26), outline=(*color[:3], 90), width=sc(1),
+        )
+        img.alpha_composite(layer)
+        d.text((x - w + sc(pad), y + sc(3)), text, font=F["chip"], fill=(*color[:3], 255))
+
+    M = sc(30)  # page margin
+    CONTENT = W * S - M * 2
+
+    # ================= HEADER PANEL =================
+    header_h = sc(96)
+    glass((M, sc(24), M + CONTENT, sc(24) + header_h), radius=20)
+
+    # Avatar with ring
+    avatar = None
+    try:
+        url = data.get("avatar_url")
+        if url:
+            async with session.get(url, headers={"User-Agent": "MCWV-Bot/1.0"}, timeout=aiohttp.ClientTimeout(total=15)) as res:
+                if res.status == 200:
+                    raw = Image.open(BytesIO(await res.read())).convert("RGBA")
+                    size = sc(64)
+                    raw = raw.resize((size, size), Image.Resampling.LANCZOS)
+                    mask = Image.new("L", (size, size), 0)
+                    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size, size), radius=sc(14), fill=255)
+                    avatar = raw
+                    img.paste(avatar, (M + sc(16), sc(40)), avatar)
+    except Exception as exc:
+        print(f"[search] avatar failed: {exc}")
+    av_x = M + sc(16)
+    if avatar:
+        ring_w = sc(3)
+        ImageDraw.Draw(img).rounded_rectangle(
+            (av_x - ring_w, sc(40) - ring_w, av_x + sc(64) + ring_w, sc(40) + sc(64) + ring_w),
+            radius=sc(15), outline=(168, 130, 255, 200), width=ring_w,
+        )
+
+    name_x = av_x + sc(64) + sc(16)
+    d.text((name_x, sc(44)), str(data.get("roblox_name") or "?")[:32], font=F["user"], fill=WHITE)
+    subtitle = f"Clan {data.get('clan_name') or '—'}"
+    if data.get("battle_name"):
+        subtitle += f"  •  {data['battle_name']}"
+    d.text((name_x, sc(82)), subtitle[:50], font=F["sub"], fill=GRAY)
+
+    # Right-side chips: clan placement + medal
+    chip_x = M + CONTENT - sc(16)
+    chip_y = sc(42)
+    if data.get("clan_place"):
+        chip(f"CLAN #{data['clan_place']}", BLUE, chip_x, chip_y)
+        chip_x -= d.textlength(f"CLAN #{data['clan_place']}", font=F["chip"]) + sc(30)
+    if data.get("earned_medal"):
+        chip("MEDAL", AMBER, chip_x, chip_y)
+
+    # ================= METRIC CARDS =================
+    hourly = data.get("hourly") or []
+    deltas = []
+    if len(hourly) >= 2:
+        deltas = [max(0, hourly[i + 1][1] - hourly[i][1]) for i in range(len(hourly) - 1)]
+    total24 = sum(deltas)
+    avg_h = total24 / len(deltas) if deltas else 0
+    best_h = max(deltas) if deltas else 0
+    latest_h = deltas[-1] if deltas else 0
+    metrics = [
+        ("TOTAL", fmt_search_points(total24), BLUE),
+        ("AVG / H", fmt_search_points(avg_h), PURPLE),
+        ("BEST / H", fmt_search_points(best_h), PURPLE),
+        ("LATEST / H", fmt_search_points(latest_h), PURPLE),
+    ]
+    gap = sc(12)
+    card_w = (CONTENT - gap * 3) // 4
+    card_h = sc(76)
+    card_y = sc(132)
+    for i, (label, value, color) in enumerate(metrics):
+        x = M + i * (card_w + gap)
+        glass((x, card_y, x + card_w, card_y + card_h), radius=16, fill_a=16, border_a=50)
+        d.text((x + sc(14), card_y + sc(12)), label, font=F["label"], fill=SLATE)
+        d.text((x + sc(14), card_y + sc(30)), value, font=F["metric"], fill=color)
+        # small colored tick on the card's left edge
+        d.line((x + sc(14), card_y + sc(58), x + sc(14) + sc(20), card_y + sc(58)), fill=(*color[:3], 140), width=sc(3))
+
+    # ================= CHART PANEL =================
+    chart_y = card_y + card_h + sc(14)
+    chart_h = sc(214)
+    glass((M, chart_y, M + CONTENT, chart_y + chart_h), radius=20, fill_a=14, border_a=50)
+
+    cx1 = M + sc(20)
+    cy1 = chart_y + sc(46)
+    cx2 = M + CONTENT - sc(20)
+    cy2 = chart_y + chart_h - sc(34)
+
+    d.text((cx1, chart_y + sc(14)), "POINTS / HOUR", font=F["chart_title"], fill=PURPLE)
+    d.text((cx2, chart_y + sc(16)), "LAST 24 HOURS", font=F["muted"], fill=SLATE, anchor="ra")
+
+    if len(hourly) >= 2:
+        axis_max = _search_axis_max(deltas)
+        # horizontal grid + y labels
+        grid_layer = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        gld = ImageDraw.Draw(grid_layer)
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            y = cy2 - int(frac * (cy2 - cy1))
+            gld.line((cx1, y, cx2, y), fill=(255, 255, 255, 14), width=sc(1))
+        img.alpha_composite(grid_layer)
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            y = cy2 - int(frac * (cy2 - cy1))
+            label = fmt_search_points(axis_max * frac) if frac > 0 else "0"
+            d.text((cx1 - sc(8), y), label, font=F["axis"], fill=SLATE, anchor="rm")
+
+        n = len(hourly)
+        pts = [(cx1 + int(i * (cx2 - cx1) / max(n - 1, 1)),
+                cy2 - int(min(max(deltas[min(i, len(deltas) - 1)], 0) / axis_max, 1.0) * (cy2 - cy1)))
+               for i in range(n)]
+
+        # subtle area fill under the line
+        if n > 2:
+            poly = [(cx1, cy2)] + pts + [(cx2, cy2)]
+            overlay = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+            ImageDraw.Draw(overlay).polygon(poly, fill=(108, 34, 245, 20))
+            img.alpha_composite(overlay)
+
+        # glow pass (wide, faint) then the crisp line
+        if n > 1:
+            glow_layer = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+            gld2 = ImageDraw.Draw(glow_layer)
+            gld2.line(pts, fill=(108, 34, 245, 26), width=sc(10), joint="curve")
+            gld2.line(pts, fill=(108, 34, 245, 70), width=sc(5), joint="curve")
+            img.alpha_composite(glow_layer)
+            ImageDraw.Draw(img).line(pts, fill=PURPLE, width=sc(3), joint="curve")
+
+        # endpoint: outer glow, purple ring, white core
+        ex, ey = pts[-1]
+        r_glow = sc(13)
+        glow = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).ellipse((ex - r_glow, ey - r_glow, ex + r_glow, ey + r_glow), fill=(108, 34, 245, 40))
+        img.alpha_composite(glow)
+        r = sc(6)
+        ImageDraw.Draw(img).ellipse((ex - r, ey - r, ex + r, ey + r), outline=PURPLE, width=sc(3))
+        r2 = sc(2.5)
+        ImageDraw.Draw(img).ellipse((ex - r2, ey - r2, ex + r2, ey + r2), fill=WHITE)
+
+        # x labels
+        last_ts = hourly[-1][0]
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            idx = min(int(frac * (n - 1)), n - 1)
+            hours_ago = max(0, round((last_ts - hourly[idx][0]) / 3_600_000))
+            label = "NOW" if hours_ago == 0 else f"{hours_ago}H AGO"
+            x = cx1 + int(frac * (cx2 - cx1))
+            anchor = "mm" if 0 < frac < 1 else ("lm" if frac == 0 else "rm")
+            d.text((x, cy2 + sc(10)), label, font=F["axis"], fill=SLATE, anchor=anchor)
+    else:
+        d.text((cx1 + sc(16), cy1 + sc(14)), "No hourly samples for this battle", font=F["placeholder"], fill=SLATE)
+
+    # ================= FOOTER =================
+    updated = datetime.fromtimestamp(hourly[-1][0] / 1000, tz=timezone.utc).strftime("%H:%M") if hourly else datetime.now(timezone.utc).strftime("%H:%M")
+    footer = f"60 MIN CACHE  •  {len(deltas)} RATE SAMPLES  •  UPDATED {updated} UTC"
+    d.text((M + sc(4), H * S - sc(22)), footer, font=F["footer"], fill=GRAY)
+    d.text((M + CONTENT - sc(4), H * S - sc(22)), "MCWV  •  GLOBAL SEARCH", font=F["footer"], fill=(168, 130, 255, 200), anchor="ra")
+
+    await asyncio.sleep(0)
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return discord.File(buf, filename="search.png")
+
+
+@bot.tree.command(name="search", description="Global search: any player's clan, war stats, global rank and 24h chart", guild=guild_obj)
+@app_commands.describe(roblox_username="Roblox username to search")
+@app_commands.autocomplete(roblox_username=checkplayer_autocomplete)
+@require_role()
+async def search(interaction: discord.Interaction, roblox_username: str):
+    await interaction.response.defer()
+
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    resolved = await resolve_roblox_username_basic(roblox_username)
+    if not resolved:
+        return await interaction.followup.send("❌ Roblox username not found. Please check spelling and try again.", ephemeral=True)
+
+    try:
+        data = await gather_search_data(resolved["id"], resolved["name"])
+        embed = build_search_embed(data)
+        card = await build_search_card(data)
+        await interaction.followup.send(embed=embed, file=card)
+    except Exception as e:
+        print(f"[search] error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"Search failed: `{type(e).__name__}`")
+
+
 # ---------------- COMPARE PLAYER COMMAND ----------------
 
 @bot.tree.command(name="compareplayer", description="Compare two players' war history side-by-side", guild=guild_obj)
