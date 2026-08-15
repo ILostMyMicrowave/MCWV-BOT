@@ -5,6 +5,8 @@ import sqlite3
 import platform
 import resource
 import secrets
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from functools import wraps
 import discord
 import aiohttp
@@ -32,6 +34,12 @@ session = None
 status_cooldown = {}
 
 app = Flask(__name__)
+
+
+@app.teardown_request
+def _close_event_conn_after_request(exc=None):
+    close_event_conn()
+
 
 @app.route("/")
 def home():
@@ -1572,7 +1580,7 @@ async def _create_giveaway_from_admin(body):
             id, active, prize, winners, invites_per_entry,
             start_time, end_time, channel_id, message_id,
             thumbnail, created_by
-        ) VALUES (1, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0)
+        ) VALUES (1, 1, %s, %s, %s, %s, %s, %s, 0, %s, 0)
         ON CONFLICT(id) DO UPDATE SET
             active = excluded.active,
             prize = excluded.prize,
@@ -1589,7 +1597,7 @@ async def _create_giveaway_from_admin(body):
     giveaway = get_active_giveaway()
     message = await channel.send(embed=build_giveaway_embed(giveaway), view=GiveawayView())
     message_id = int(message.id)
-    db_exec("UPDATE giveaway_events SET message_id = ? WHERE id = 1", (message_id,))
+    db_exec("UPDATE giveaway_events SET message_id = %s WHERE id = 1", (message_id,))
 
     return {"message_id": message_id, "channel_id": str(channel.id), "end_time": end_time}
 
@@ -1621,7 +1629,7 @@ async def _start_invite_from_admin(body):
     db_exec("DELETE FROM invite_cache")
     db_exec("""
         INSERT INTO invite_events (id, active, start_time, end_time, channel_id)
-        VALUES (1, 1, ?, ?, ?)
+        VALUES (1, 1, %s, %s, %s)
         ON CONFLICT(id) DO UPDATE SET
             active = excluded.active,
             start_time = excluded.start_time,
@@ -1865,38 +1873,118 @@ def get_available_category(guild):
 INVITE_SNAPSHOTS = {}
 INVITE_SYSTEM_READY = False
 
-DB_PATH = "bot.db"
+DB_PATH = "bot.db"  # legacy name kept for reference only — event data lives in Postgres now
+
+# ---- Event tables (invites/giveaways) live in Postgres (Supabase), NOT SQLite. ----
+# Render's disk is ephemeral: the old bot.db was wiped on every deploy, so invite
+# counts / giveaways / invite-cache kept vanishing. These helpers are thread-safe:
+# the bot loop uses the single global `conn`; Flask request threads get their own
+# per-thread connection so psycopg2 never crosses threads.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+conn = None  # single persistent bot-loop connection (created lazily by ensure_db_connection)
+
+import threading as _threading
+
+_event_local = _threading.local()
 
 
-def sqlite_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _event_conn():
+    """Connection for event-table queries (invites/giveaways)."""
+    if not DATABASE_URL:
+        return None
+    try:
+        if _threading.current_thread() is _threading.main_thread():
+            # Bot loop thread — reuse the global connection.
+            ensure_db_connection()
+            return conn if (conn is not None and conn.closed == 0) else None
+        c = getattr(_event_local, "conn", None)
+        if c is None or c.closed != 0:
+            c = psycopg2.connect(
+                DATABASE_URL,
+                sslmode="require",
+                connect_timeout=5,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+            c.autocommit = True
+            _event_local.conn = c
+        return c
+    except Exception as exc:
+        print("_event_conn error:", exc)
+        return None
+
+
+def close_event_conn():
+    """Close the current thread's event-table connection (Flask request teardown)."""
+    if _threading.current_thread() is _threading.main_thread():
+        return  # never close the bot loop's global connection
+    c = getattr(_event_local, "conn", None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+        _event_local.conn = None
 
 
 def db_exec(query, params=()):
-    with sqlite_connect() as conn:
-        conn.execute(query, params)
-        conn.commit()
+    c = _event_conn()
+    if c is None:
+        return
+    try:
+        with c.cursor() as cur:
+            cur.execute(query, params)
+    except Exception as exc:
+        print("db_exec error:", exc)
+        try:
+            c.rollback()
+        except Exception:
+            pass
+
 
 def db_fetchone(query, params=()):
-    with sqlite_connect() as conn:
-        cur = conn.execute(query, params)
-        return cur.fetchone()
+    c = _event_conn()
+    if c is None:
+        return None
+    try:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    except Exception as exc:
+        print("db_fetchone error:", exc)
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        return None
+
 
 def db_fetchall(query, params=()):
-    with sqlite_connect() as conn:
-        cur = conn.execute(query, params)
-        return cur.fetchall()
+    c = _event_conn()
+    if c is None:
+        return []
+    try:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+    except Exception as exc:
+        print("db_fetchall error:", exc)
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        return []
 
 
 def init_invite_tables():
     db_exec("""
     CREATE TABLE IF NOT EXISTS invite_events (
-        id INTEGER PRIMARY KEY DEFAULT 1,
+        id BIGINT PRIMARY KEY,
         active INTEGER DEFAULT 0,
-        start_time INTEGER DEFAULT 0,
-        end_time INTEGER DEFAULT 0,
+        start_time BIGINT DEFAULT 0,
+        end_time BIGINT DEFAULT 0,
         channel_id BIGINT
     )
     """)
@@ -1922,12 +2010,10 @@ def init_invite_tables():
     """)
 
     db_exec("""
-    INSERT OR IGNORE INTO invite_events (id, active, start_time, end_time, channel_id)
+    INSERT INTO invite_events (id, active, start_time, end_time, channel_id)
     VALUES (1, 0, 0, 0, 0)
+    ON CONFLICT (id) DO NOTHING
     """)
-
-
-init_invite_tables()
 
 
 def get_giveaway_row():
@@ -1948,9 +2034,9 @@ def get_active_event():
 def increment_invite_count(user_id: int, amount: int = 1):
     db_exec("""
         INSERT INTO invite_counts (user_id, invites)
-        VALUES (?, ?)
+        VALUES (%s, %s)
         ON CONFLICT(user_id)
-        DO UPDATE SET invites = invites + ?
+        DO UPDATE SET invites = invite_counts.invites + %s
     """, (user_id, amount, amount))
 
 
@@ -2141,26 +2227,56 @@ async def get_profile_bundle(session, user_id, force=False):
 
     return bundle
     
+def _running_loop_present():
+    """True when the current thread hosts a running asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
 def ensure_db_connection():
+    """Open/reopen the shared DB connection.
+
+    NEVER blocks the Discord event loop: when called on the bot's loop thread
+    with a dead connection, it schedules a background heal instead of doing a
+    (potentially multi-second) synchronous connect. Blocking connects are only
+    performed on worker threads (asyncio.to_thread / Flask request threads)."""
     global conn
 
+    if conn is not None and conn.closed == 0:
+        return conn
+
+    if _running_loop_present():
+        _schedule_db_heal()
+        return None
+
     try:
-        if conn is None or conn.closed != 0:
-            print("🔄 Reconnecting to database...")
-            conn = psycopg2.connect(
-                DATABASE_URL,
-                sslmode="require",
-                connect_timeout=10,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
-            )
-            conn.autocommit = True
-            print("✅ Database connected")
+        print("🔄 Reconnecting to database...")
+        conn = psycopg2.connect(
+            DATABASE_URL,
+            sslmode="require",
+            connect_timeout=5,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+        )
+        conn.autocommit = True
+        print("✅ Database connected")
+        return conn
     except Exception as e:
         print("DB reconnect failed:", repr(e))
         conn = None
+        return None
+
+
+async def ensure_db_connection_async():
+    """Reconnect from an async context without blocking the event loop."""
+    if conn is not None and conn.closed == 0:
+        return conn
+    return await asyncio.to_thread(ensure_db_connection)
 
 def db_get_all_alts():
     if not db_enabled():
@@ -3202,12 +3318,51 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 conn = None
 
+
+def _schedule_db_heal():
+    """Ask a background task to reconnect. Never blocks the event loop."""
+    global _db_heal_scheduled
+    if _db_heal_scheduled:
+        return
+    _db_heal_scheduled = True
+    try:
+        asyncio.get_running_loop().create_task(_db_heal_task())
+    except RuntimeError:
+        _db_heal_scheduled = False  # no running loop — a later call will retry
+
+
+async def _db_heal_task():
+    global conn, _db_heal_scheduled
+    try:
+        def _reconnect():
+            ensure_db_connection()
+            return conn is not None and conn.closed == 0
+        ok = await asyncio.to_thread(_reconnect)
+        if ok:
+            print("✅ Database healed in background")
+    except Exception as exc:
+        print("DB heal failed:", exc)
+    finally:
+        _db_heal_scheduled = False
+
+
+_db_heal_scheduled = False
+
+
 def db_enabled():
-    """Auto-connect: opens a connection on demand
-    between loops instead of staying awake 24/7 from a persistent connection."""
-    if conn is None and DATABASE_URL:
-        ensure_db_connection()
-    return conn is not None
+    """True when the shared connection is usable. NEVER blocks the loop on a
+    reconnect — if the connection is dead we schedule a background heal and
+    return False so commands fail fast with a friendly message instead of
+    freezing the whole bot for 10 seconds ("application did not respond")."""
+    global conn
+    if conn is not None:
+        if conn.closed == 0:
+            return True
+        _schedule_db_heal()
+        return False
+    if DATABASE_URL:
+        _schedule_db_heal()
+    return False
 
 # DB connection is opened on demand by db_enabled()/ensure_db_connection().
 # We do NOT connect at import time — connect on demand instead.
@@ -3374,6 +3529,13 @@ def init_db_schema():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+        # Event tables (invites / giveaways) now live in Postgres too —
+        # the old SQLite bot.db was wiped on every Render deploy.
+        try:
+            init_invite_tables()
+            init_giveaway_tables()
+        except Exception as exc:
+            print("Event table init failed:", exc)
         print("DB tables ready")
     except Exception as e:
         print("DB schema init failed:", e)
@@ -3594,9 +3756,17 @@ def get_ticket_embed_color(key, default=0x34D399):
         return int(default)
 
 
+_ticket_tables_ready = False
+
+
 def db_ensure_mcwv_ticket_tables():
+    """Create ticket tables if needed. Cached after the first success so ticket
+    commands/buttons never pay for 6 DDL round-trips on every call."""
+    global _ticket_tables_ready
+    if _ticket_tables_ready:
+        return True
     if not db_enabled():
-        return
+        return False
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -3663,9 +3833,13 @@ def db_ensure_mcwv_ticket_tables():
                 )
             """)
         conn.commit()
+        _ticket_tables_ready = True
     except Exception as e:
         print("db_ensure_mcwv_ticket_tables error:", e)
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 def db_ticket_log(ticket_id, actor_id, action, message="", metadata=None):
@@ -4350,6 +4524,40 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except Exception:
             pass
 
+
+@bot.event
+async def on_error(event_method: str, *args, **kwargs):
+    """Global safety net. If a button/modal callback crashes, Discord never gets
+    its response and shows 'the application did not respond'. Answer the
+    interaction here whenever we still can, then log the traceback."""
+    try:
+        traceback.print_exc()
+    except Exception:
+        pass
+
+    interaction = next((a for a in args if isinstance(a, discord.Interaction)), None)
+    if interaction is None or not isinstance(interaction, discord.Interaction):
+        return
+
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "⚠️ Something went wrong handling that. Please try again.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "⚠️ Something went wrong handling that. Please try again.",
+                ephemeral=True,
+            )
+    except Exception:
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+
 # ---------------- SLASH COMMANDS ----------------
 import random
 import secrets
@@ -4362,13 +4570,13 @@ GIVEAWAY_LOG_CHANNEL_ID = 1502001938705682622
 def init_giveaway_tables():
     db_exec("""
     CREATE TABLE IF NOT EXISTS giveaway_events (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
+        id BIGINT PRIMARY KEY,
         active INTEGER DEFAULT 0,
         prize TEXT,
         winners INTEGER DEFAULT 1,
         invites_per_entry INTEGER DEFAULT 2,
-        start_time INTEGER DEFAULT 0,
-        end_time INTEGER DEFAULT 0,
+        start_time BIGINT DEFAULT 0,
+        end_time BIGINT DEFAULT 0,
         channel_id BIGINT,
         message_id BIGINT,
         thumbnail TEXT,
@@ -4384,15 +4592,13 @@ def init_giveaway_tables():
     """)
 
     db_exec("""
-    INSERT OR IGNORE INTO giveaway_events (
+    INSERT INTO giveaway_events (
         id, active, prize, winners, invites_per_entry,
         start_time, end_time, channel_id, message_id,
         thumbnail, created_by
     ) VALUES (1, 0, '', 1, 2, 0, 0, 0, 0, '', 0)
+    ON CONFLICT (id) DO NOTHING
     """)
-
-
-init_giveaway_tables()
 
 
 def has_edit_role(member: discord.Member) -> bool:
@@ -4408,7 +4614,7 @@ def get_active_giveaway():
 
 def get_valid_invites(user_id: int) -> int:
     row = db_fetchone(
-        "SELECT invites FROM invite_counts WHERE user_id = ?",
+        "SELECT invites FROM invite_counts WHERE user_id = %s",
         (user_id,)
     )
     return int(row["invites"]) if row else 0
@@ -4748,7 +4954,7 @@ async def giveaway_start(
                 id, active, prize, winners, invites_per_entry,
                 start_time, end_time, channel_id, message_id, thumbnail, created_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT(id) DO UPDATE SET
                 active = excluded.active,
                 prize = excluded.prize,
@@ -4772,7 +4978,7 @@ async def giveaway_start(
         message = await interaction.channel.send(embed=embed, view=GiveawayView())
 
         db_exec(
-            "UPDATE giveaway_events SET message_id = ? WHERE id = 1",
+            "UPDATE giveaway_events SET message_id = %s WHERE id = 1",
             (message.id,)
         )
 
@@ -4834,7 +5040,7 @@ async def giveaway_edit(
 
         db_exec("""
             UPDATE giveaway_events
-            SET prize = ?, winners = ?, invites_per_entry = ?, thumbnail = ?
+            SET prize = %s, winners = %s, invites_per_entry = %s, thumbnail = %s
             WHERE id = 1
         """, (new_prize, new_winners, new_invites_per_entry, new_thumbnail))
 
@@ -4948,7 +5154,8 @@ class InviteView(discord.ui.View):
             )
 
         db_exec(
-            "INSERT OR REPLACE INTO invite_cache (invite_code, inviter_id) VALUES (?, ?)",
+            "INSERT INTO invite_cache (invite_code, inviter_id) VALUES (%s, %s) "
+            "ON CONFLICT (invite_code) DO UPDATE SET inviter_id = EXCLUDED.inviter_id",
             (invite.code, interaction.user.id)
         )
 
@@ -4963,9 +5170,14 @@ class InviteView(discord.ui.View):
         custom_id="invite_event_my_invites"
     )
     async def my_invites_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
 
         row = db_fetchone(
-            "SELECT invites FROM invite_counts WHERE user_id = ?",
+            "SELECT invites FROM invite_counts WHERE user_id = %s",
             (interaction.user.id,)
         )
 
@@ -4981,7 +5193,7 @@ class InviteView(discord.ui.View):
             inline=False
         )
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ---------------- INVITE DEBUG TOOLKIT ----------------
 
@@ -5052,7 +5264,7 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
         db_exec("""
             INSERT INTO invite_events
             (id, active, start_time, end_time, channel_id)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT(id)
             DO UPDATE SET
                 active = excluded.active,
@@ -5130,10 +5342,10 @@ async def on_member_join(member: discord.Member):
         return
 
     # first join only
-    if db_fetchone("SELECT 1 FROM invite_used_users WHERE user_id = ?", (member.id,)):
+    if db_fetchone("SELECT 1 FROM invite_used_users WHERE user_id = %s", (member.id,)):
         return
 
-    db_exec("INSERT INTO invite_used_users (user_id) VALUES (?)", (member.id,))
+    db_exec("INSERT INTO invite_used_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (member.id,))
 
     try:
         after = await member.guild.invites()
@@ -5160,7 +5372,7 @@ async def on_member_join(member: discord.Member):
         return
 
     row = db_fetchone(
-        "SELECT inviter_id FROM invite_cache WHERE invite_code = ?",
+        "SELECT inviter_id FROM invite_cache WHERE invite_code = %s",
         (used,)
     )
 
@@ -5172,7 +5384,8 @@ async def on_member_join(member: discord.Member):
     increment_invite(inviter_id)
 
     db_exec(
-        "INSERT OR REPLACE INTO invite_member_links (member_id, inviter_id) VALUES (?, ?)",
+        "INSERT INTO invite_member_links (member_id, inviter_id) VALUES (%s, %s) "
+        "ON CONFLICT (member_id) DO UPDATE SET inviter_id = EXCLUDED.inviter_id",
         (member.id, inviter_id)
     )
 
@@ -5182,7 +5395,7 @@ async def on_member_remove(member: discord.Member):
         return
 
     row = db_fetchone(
-        "SELECT inviter_id FROM invite_member_links WHERE member_id = ?",
+        "SELECT inviter_id FROM invite_member_links WHERE member_id = %s",
         (member.id,)
     )
 
@@ -5193,7 +5406,7 @@ async def on_member_remove(member: discord.Member):
 
     # remove mapping
     db_exec(
-        "DELETE FROM invite_member_links WHERE member_id = ?",
+        "DELETE FROM invite_member_links WHERE member_id = %s",
         (member.id,)
     )
 
@@ -5201,7 +5414,7 @@ async def on_member_remove(member: discord.Member):
     db_exec("""
         UPDATE invite_counts
         SET invites = CASE WHEN invites > 0 THEN invites - 1 ELSE 0 END
-        WHERE user_id = ?
+        WHERE user_id = %s
     """, (inviter_id,))
 
 @bot.tree.command(name="inviteleaderboard", description="Show the MCWV invite leaderboard", guild=guild_obj)
@@ -8854,63 +9067,74 @@ class ScreenshotUploadedView(discord.ui.View):
 
     @discord.ui.button(label="Screenshots uploaded", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_screenshots_uploaded")
     async def uploaded_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = find_ticket_in_channel(interaction.channel)
-        if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        if interaction.user.id != int(row[3]):
-            return await interaction.response.send_message("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
-
-        screenshot_count = await count_ticket_screenshot_attachments(interaction.channel, interaction.user.id)
-        if screenshot_count < MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS:
-            db_ticket_log(
-                row[0],
-                interaction.user.id,
-                "screenshots/missing",
-                f"Applicant tried to confirm screenshots before uploading enough image attachments ({screenshot_count}/{MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS})",
-            )
-            return await interaction.response.send_message(
-                "❌ Please upload your screenshot images in this ticket before pressing this button. "
-                f"I found **{screenshot_count}** image attachment(s); required: **{MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS}**.",
-                ephemeral=True,
-            )
-
-        staff_mentions = " ".join(
-            f"<@&{role_id}>"
-            for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS)
-            if role_id != 1502339420207059066
-        )
-        db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
-
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.edit_message(content="✅ Screenshots confirmed. Staff have been notified.", view=self)
-        await interaction.channel.send(
-            f"✅ Thanks {interaction.user.mention}! {staff_mentions} will review your application soon.",
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
-        )
-
-        # Screenshots are confirmed, so the application is now ready for staff
-        # review — post the staff review card (Accept / Staff Info / Close) into
-        # the ticket channel. It lives here only (no review-channel fallback).
+        # Defer FIRST: attachment counting + DB work can exceed Discord's 3s
+        # interaction window, which caused "application did not respond".
+        await interaction.response.defer(ephemeral=True)
         try:
-            app_row = await asyncio.to_thread(db_get_ticket_application, row[0])
-            applicant = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-            if applicant is None:
-                applicant = interaction.user
-            posted = await send_application_review_card(
-                interaction.guild,
-                interaction.channel,
-                row[0],
-                applicant,
-                app_row,
-            )
-            if not posted:
-                await interaction.channel.send(
-                    "⚠️ Could not post the staff review card here. Staff can still review this application via the Hub dashboard."
+            row = find_ticket_in_channel(interaction.channel)
+            if not row:
+                return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
+            if interaction.user.id != int(row[3]):
+                return await interaction.followup.send("Only the applicant can confirm screenshots for this ticket.", ephemeral=True)
+
+            screenshot_count = await count_ticket_screenshot_attachments(interaction.channel, interaction.user.id)
+            if screenshot_count < MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS:
+                db_ticket_log(
+                    row[0],
+                    interaction.user.id,
+                    "screenshots/missing",
+                    f"Applicant tried to confirm screenshots before uploading enough image attachments ({screenshot_count}/{MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS})",
                 )
-        except Exception as review_error:
-            print(f"[ticket] review card post after screenshots failed for {row[0]}: {review_error}")
+                return await interaction.followup.send(
+                    "❌ Please upload your screenshot images in this ticket before pressing this button. "
+                    f"I found **{screenshot_count}** image attachment(s); required: **{MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS}**.",
+                    ephemeral=True,
+                )
+
+            staff_mentions = " ".join(
+                f"<@&{role_id}>"
+                for role_id in sorted(MCWV_TICKET_STAFF_ROLE_IDS)
+                if role_id != 1502339420207059066
+            )
+            db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
+
+            for child in self.children:
+                child.disabled = True
+
+            await interaction.edit_original_response(content="✅ Screenshots confirmed. Staff have been notified.", view=self)
+            await interaction.channel.send(
+                f"✅ Thanks {interaction.user.mention}! {staff_mentions} will review your application soon.",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False),
+            )
+
+            # Screenshots are confirmed, so the application is now ready for staff
+            # review — post the staff review card (Accept / Staff Info / Close) into
+            # the ticket channel. It lives here only (no review-channel fallback).
+            try:
+                app_row = await asyncio.to_thread(db_get_ticket_application, row[0])
+                applicant = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+                if applicant is None:
+                    applicant = interaction.user
+                posted = await send_application_review_card(
+                    interaction.guild,
+                    interaction.channel,
+                    row[0],
+                    applicant,
+                    app_row,
+                )
+                if not posted:
+                    await interaction.channel.send(
+                        "⚠️ Could not post the staff review card here. Staff can still review this application via the Hub dashboard."
+                    )
+            except Exception as review_error:
+                print(f"[ticket] review card post after screenshots failed for {row[0]}: {review_error}")
+        except Exception as exc:
+            print(f"[ticket] uploaded_btn error: {exc}")
+            traceback.print_exc()
+            try:
+                await interaction.followup.send("⚠️ Something went wrong confirming your screenshots. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
 
 class ApplicationModal(discord.ui.Modal):
@@ -8938,6 +9162,20 @@ class ApplicationModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        try:
+            await self._do_submit(interaction)
+        except Exception as exc:
+            print(f"[ticket] application submit error: {exc}")
+            traceback.print_exc()
+            try:
+                await interaction.followup.send(
+                    "❌ Something went wrong while creating your ticket. Please try again — if it keeps happening, ping staff.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+    async def _do_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
             return await interaction.followup.send("❌ This must be used in the server.", ephemeral=True)
@@ -9093,12 +9331,30 @@ class TicketWelcomeView(discord.ui.View):
 
     @discord.ui.button(label="Submit Application", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_submit_application")
     async def submit_application(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = find_ticket_in_channel(interaction.channel)
-        if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        if interaction.user.id != int(row[3]):
-            return await interaction.response.send_message("Only the ticket opener can submit this application.", ephemeral=True)
-        await interaction.response.send_modal(ApplicationModal(interaction.user))
+        try:
+            row = find_ticket_in_channel(interaction.channel)
+            if not row:
+                return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+            if interaction.user.id != int(row[3]):
+                return await interaction.response.send_message("Only the ticket opener can submit this application.", ephemeral=True)
+            await interaction.response.send_modal(ApplicationModal(interaction.user))
+        except discord.HTTPException as http_exc:
+            print(f"[ticket] submit_application modal failed: {http_exc}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Could not open the application form. Please try again.", ephemeral=True)
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[ticket] submit_application error: {exc}")
+            traceback.print_exc()
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Something went wrong. Please try again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
 
 def transcript_file(transcript_text, ticket_id):
@@ -9247,28 +9503,42 @@ class AcceptConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Yes, accept applicant", style=discord.ButtonStyle.success)
     async def confirm_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
-        if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        if str(row[0]) != str(self.ticket_id):
-            return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
-
-        for child in self.children:
-            child.disabled = True
+        # Defer first: DB lookups + full accept pipeline can exceed 3 seconds.
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
         try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
+            row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
+            if not row:
+                return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
+            if str(row[0]) != str(self.ticket_id):
+                return await interaction.followup.send("❌ This confirmation does not match this ticket.", ephemeral=True)
 
-        accepted = await accept_application_ticket(interaction, row)
-        if accepted:
-            await delete_ticket_control_message(
-                interaction.guild,
-                ticket_id=self.ticket_id,
-                channel_id=self.control_channel_id,
-                message_id=self.control_message_id,
-            )
-        self.stop()
+            for child in self.children:
+                child.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+
+            accepted = await accept_application_ticket(interaction, row)
+            if accepted:
+                await delete_ticket_control_message(
+                    interaction.guild,
+                    ticket_id=self.ticket_id,
+                    channel_id=self.control_channel_id,
+                    message_id=self.control_message_id,
+                )
+            self.stop()
+        except Exception as exc:
+            print(f"[ticket] confirm_accept error: {exc}")
+            traceback.print_exc()
+            try:
+                await interaction.followup.send("⚠️ Something went wrong while accepting. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -9342,13 +9612,31 @@ class CloseConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Continue to close", style=discord.ButtonStyle.danger)
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
-        if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        if str(row[0]) != self.ticket_id:
-            return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
-        await interaction.response.send_modal(CloseTicketModal(self.ticket_id, self.control_channel_id, self.control_message_id))
-        self.stop()
+        try:
+            row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
+            if not row:
+                return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+            if str(row[0]) != self.ticket_id:
+                return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
+            await interaction.response.send_modal(CloseTicketModal(self.ticket_id, self.control_channel_id, self.control_message_id))
+            self.stop()
+        except discord.HTTPException as http_exc:
+            print(f"[ticket] confirm_close modal failed: {http_exc}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Could not open the close form. Please try again.", ephemeral=True)
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[ticket] confirm_close error: {exc}")
+            traceback.print_exc()
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Something went wrong. Please try again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_close(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -9455,19 +9743,39 @@ class MCWVTicketPanelView(discord.ui.View):
 
     @discord.ui.button(label="Open Application", style=discord.ButtonStyle.success, custom_id="mcwv_open_application_ticket")
     async def open_application(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if not guild:
-            return await interaction.response.send_message("This must be used in the server.", ephemeral=True)
-        blacklist_role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
-        if blacklist_role and isinstance(interaction.user, discord.Member) and blacklist_role in interaction.user.roles:
-            return await interaction.response.send_message("❌ You are currently blocked from opening MCWV application tickets.", ephemeral=True)
-        # Keep this interaction fast: Discord requires modal responses within a
-        # few seconds. The database-backed blacklist is checked after modal submit
-        # (where we can defer), while the role blacklist is checked immediately.
-        existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
-        if existing:
-            return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
-        await interaction.response.send_modal(ApplicationModal(interaction.user))
+        # Everything here must finish within Discord's 3-second interaction
+        # window — no DB calls, and any failure still answers the interaction.
+        try:
+            guild = interaction.guild
+            if not guild:
+                return await interaction.response.send_message("This must be used in the server.", ephemeral=True)
+            blacklist_role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
+            if blacklist_role and isinstance(interaction.user, discord.Member) and blacklist_role in interaction.user.roles:
+                return await interaction.response.send_message("❌ You are currently blocked from opening MCWV application tickets.", ephemeral=True)
+            # Keep this interaction fast: Discord requires modal responses within a
+            # few seconds. The database-backed blacklist is checked after modal submit
+            # (where we can defer), while the role blacklist is checked immediately.
+            existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
+            if existing:
+                return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
+            await interaction.response.send_modal(ApplicationModal(interaction.user))
+        except discord.HTTPException as http_exc:
+            print(f"[ticket] open_application modal failed: {http_exc}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Could not open the application form. Please try again.", ephemeral=True)
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[ticket] open_application error: {exc}")
+            traceback.print_exc()
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Something went wrong. Please try again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
 
 @bot.tree.command(name="setup", description="Set up MCWV bot systems in a channel", guild=guild_obj)
@@ -15142,13 +15450,27 @@ class CleanupConfirmView(discord.ui.View):
             inline=False
         )
 
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.edit_original_response(embed=embed, view=None)
 
     # ---------------- BUTTONS (MUST BE OUTSIDE run_cleanup) ----------------
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.run_cleanup(interaction)
+        # Defer first — the cleanup does heavy DB/Discord work before responding.
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+        try:
+            await self.run_cleanup(interaction)
+        except Exception as exc:
+            print(f"[cleanup] confirm error: {exc}")
+            traceback.print_exc()
+            try:
+                await interaction.followup.send("⚠️ Something went wrong during cleanup. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -19375,8 +19697,43 @@ def start_bot_loops():
     if not health_monitor_loop.is_running():
         health_monitor_loop.start()
 
+    # ---------------- DB KEEPER LOOP ----------------
+    if not db_keeper_loop.is_running():
+        db_keeper_loop.start()
+
 
 # ---------------- LOOP HEALTH MONITOR + DB HEALTH ----------------
+
+
+@tasks.loop(minutes=1)
+async def db_keeper_loop():
+    """Ping the shared DB connection every minute. If it's dead, schedule a
+    threaded heal instead of blocking the event loop on a reconnect."""
+    try:
+        if not DATABASE_URL:
+            return
+        if conn is None or conn.closed != 0:
+            _schedule_db_heal()
+            return
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except Exception:
+        try:
+            if conn is not None and conn.closed == 0:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _schedule_db_heal()
+
+
+@db_keeper_loop.before_loop
+async def before_db_keeper_loop():
+    await bot.wait_until_ready()
+
 
 ALL_LOOPS = [
     ("Presence", "check_loop"),
@@ -19391,6 +19748,7 @@ ALL_LOOPS = [
     ("Screenshot", "ticket_screenshot_reminder_loop"),
     ("Broadcast", "broadcast_scheduler_loop"),
     ("Giveaway", "check_giveaway_event"),
+    ("DB Keeper", "db_keeper_loop"),
 ]
 
 
@@ -19671,6 +20029,8 @@ async def on_ready():
 
     # ---------------- DB SCHEMA INIT ----------------
     try:
+        if DATABASE_URL:
+            await ensure_db_connection_async()  # connect in a worker thread, never blocks the loop
         init_db_schema()
         print("✅ DB schema initialized")
     except Exception as e:
