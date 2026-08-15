@@ -2478,6 +2478,90 @@ def db_list_active_loas():
         return []
 
 
+def get_battles_war_state():
+    """Latest battle from the `battles` table (War Schedule editor, /setwartime,
+    auto backfill). Returns dict(battle_id, battle_name, start, finish,
+    manually_edited) or None. This is the single source of truth for manually
+    scheduled war dates."""
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT battle_id, battle_name,
+                       EXTRACT(EPOCH FROM start_time)::bigint,
+                       EXTRACT(EPOCH FROM end_time)::bigint,
+                       COALESCE(manually_edited, FALSE)
+                FROM battles
+                WHERE start_time IS NOT NULL OR end_time IS NOT NULL
+                ORDER BY COALESCE(end_time, start_time) DESC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "battle_id": row[0],
+                "battle_name": row[1],
+                "start": int(row[2]) if row[2] is not None else None,
+                "finish": int(row[3]) if row[3] is not None else None,
+                "manually_edited": bool(row[4]),
+            }
+    except Exception as e:
+        print("get_battles_war_state error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def battles_match(battle_id_a, battle_id_b):
+    """Compare two battle identifiers with the same normalization used by the
+    Hub, so 'Ninja Battle 2026' and 'NinjaBattle2026' count as equal."""
+    key_a = normalize_hourly_battle_key(str(battle_id_a or ""))
+    key_b = normalize_hourly_battle_key(str(battle_id_b or ""))
+    return bool(key_a) and key_a == key_b
+
+
+def get_battles_row_for(battle_id):
+    """The battles-table row matching battle_id (by normalized key), regardless
+    of whether a newer row exists. Used for war-state overrides so a
+    pre-announced next war can never shadow the current one."""
+    if not db_enabled():
+        return None
+    target = normalize_hourly_battle_key(str(battle_id or ""))
+    if not target:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT battle_id, battle_name,
+                       EXTRACT(EPOCH FROM start_time)::bigint,
+                       EXTRACT(EPOCH FROM end_time)::bigint,
+                       COALESCE(manually_edited, FALSE)
+                FROM battles
+                WHERE start_time IS NOT NULL OR end_time IS NOT NULL
+            """)
+            for row in cur.fetchall():
+                if normalize_hourly_battle_key(str(row[0] or "")) == target:
+                    return {
+                        "battle_id": row[0],
+                        "battle_name": row[1],
+                        "start": int(row[2]) if row[2] is not None else None,
+                        "finish": int(row[3]) if row[3] is not None else None,
+                        "manually_edited": bool(row[4]),
+                    }
+            return None
+    except Exception as e:
+        print("get_battles_row_for error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
 async def perform_loa_revert(guild, record, actor, end_notes=""):
     """Shared End-LOA logic: restore roles + ticket channel, close the DB record,
     clear caches. Returns (ok, notes)."""
@@ -6598,6 +6682,14 @@ async def get_broadcast_war_context(force=False):
         context["start"] = start
         context["finish"] = finish
 
+        # War Schedule override: edited dates win for broadcast triggers
+        # (war_midpoint / war_final_hours) when they match the active battle.
+        st = get_battles_row_for(context["battle_id"]) if context["battle_id"] else None
+        if st and st.get("start") and st.get("finish"):
+            context["start"] = float(st["start"])
+            context["finish"] = float(st["finish"])
+            print(f"[broadcast] war schedule override applied: {st['battle_id']} {st['start']}->{st['finish']}")
+
         snapshot = await get_mcwv_placement_snapshot()
         if isinstance(snapshot, dict):
             context["clan_rank"] = snapshot.get("rank")
@@ -8087,8 +8179,53 @@ def _friendly_battle_name(battle_id):
     return re.sub(r'(\d+)', r' \1', re.sub(r'([a-z])([A-Z])', r'\1 \2', text)).strip()
 
 
+_battles_order_cache = {"ts": 0.0, "order": {}}
+
+
+def get_battles_order_map():
+    """Normalized battle key -> start epoch from the `battles` table (the War
+    Schedule — includes your manual edits). Cached for 10 minutes. Used to
+    order war history chronologically instead of alphabetically."""
+    now = time.time()
+    if _battles_order_cache["order"] and now - _battles_order_cache["ts"] < 600:
+        return _battles_order_cache["order"]
+    try:
+        order = {}
+        if db_enabled():
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT battle_id, EXTRACT(EPOCH FROM start_time)::bigint AS ts
+                    FROM battles
+                    WHERE start_time IS NOT NULL
+                """)
+                for row in cur.fetchall():
+                    key = normalize_hourly_battle_key(str(row[0] or ""))
+                    if key:
+                        order[key] = int(row[1] or 0)
+        _battles_order_cache["order"] = order
+        _battles_order_cache["ts"] = now
+    except Exception as exc:
+        print("get_battles_order_map error:", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    return _battles_order_cache["order"]
+
+
+def invalidate_battles_order_cache():
+    _battles_order_cache["ts"] = 0.0
+    _battles_order_cache["order"] = {}
+
+
 def _battle_sort_key(item):
-    return int(item.get("startTime") or 0), int(item.get("battleOrder") or 0), str(item.get("battleId") or "")
+    """Chronological war sort: War Schedule start wins (so your date edits
+    reorder wars too), then the row's own startTime, then battle id."""
+    bid = str(item.get("battleId") or "")
+    key = normalize_hourly_battle_key(bid)
+    sched_ts = int(get_battles_order_map().get(key, 0) or 0)
+    own_ts = int(item.get("startTime") or 0)
+    return (sched_ts or own_ts), own_ts, bid
 
 
 async def _ps99_json(url, timeout_seconds=15):
@@ -13768,6 +13905,18 @@ async def warinfo(interaction: discord.Interaction):
 
     battle_id, battle = get_current_war(war_data, clan_data)
     if not battle:
+        # No live battle in the API — show the latest scheduled war instead.
+        st = get_battles_war_state()
+        if st and st.get("finish"):
+            end_dt = datetime.fromtimestamp(float(st["finish"]), tz=timezone.utc)
+            embed = discord.Embed(
+                title="🏝️ No Active War",
+                description=f"Last battle: **{st.get('battle_name') or st.get('battle_id')}** ended {discord.utils.format_dt(end_dt, 'R')}.",
+                color=discord.Color.dark_gray(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            mcwv_footer(embed, "War schedule")
+            return await interaction.followup.send(embed=embed)
         return await interaction.followup.send("❌ Could not determine current war.", ephemeral=True)
 
     war_config = war_data.get("data", {}).get("configData", {})
@@ -13775,6 +13924,15 @@ async def warinfo(interaction: discord.Interaction):
     finish_ts = battle.get("FinishTime") or war_config.get("FinishTime")
     if not start_ts or not finish_ts:
         return await interaction.followup.send("❌ War timing data missing.", ephemeral=True)
+
+    # War Schedule override: dates edited on the website (or via /setwartime)
+    # win for the timer, progress bar and status line.
+    schedule_note = None
+    st = get_battles_row_for(battle_id)
+    if st and st.get("start") and st.get("finish"):
+        start_ts = float(st["start"])
+        finish_ts = float(st["finish"])
+        schedule_note = "✋ manual override" if st.get("manually_edited") else "📅 war schedule"
 
     now = datetime.now(timezone.utc).timestamp()
     total_duration = max(finish_ts - start_ts, 1)
@@ -13848,6 +14006,8 @@ async def warinfo(interaction: discord.Interaction):
 
     embed.add_field(name="🕐 Start", value=discord.utils.format_dt(start_dt, "f"), inline=True)
     embed.add_field(name="🏁 End", value=discord.utils.format_dt(finish_dt, "f"), inline=True)
+    if schedule_note:
+        embed.add_field(name="📅 Schedule", value=schedule_note, inline=True)
     embed.add_field(name="⏱ Time", value=time_field, inline=True)
     if member_count:
         embed.add_field(name="👥 Contributors", value=f"**{len(contributions)}**/{member_count}", inline=True)
@@ -13855,7 +14015,7 @@ async def warinfo(interaction: discord.Interaction):
     embed.add_field(name="🏆 Top Contributors", value=top_block, inline=False)
 
     embed.timestamp = datetime.now(timezone.utc)
-    mcwv_footer(embed, "PS99 live")
+    mcwv_footer(embed, "PS99 live + war schedule" if schedule_note else "PS99 live")
     await interaction.followup.send(embed=embed)
 
 
@@ -16616,6 +16776,19 @@ async def war_poll_loop():
             start <= now <= finish
         )
 
+        # War Schedule overrides: the website editor (/setwartime) is the truth.
+        # PS99 creates battles early and its windows run long, so honor BOTH the
+        # real start (no war mode during the API staging period) and the real
+        # end (peacetime even while the API still reports the battle as live).
+        st = get_battles_row_for(PS99_CURRENT_WAR_NAME)
+        if currently_active and st:
+            if st.get("finish") and float(st["finish"]) <= now:
+                currently_active = False
+                print(f"[war poll] war schedule override: {st['battle_id']} end_time passed — forcing peacetime")
+            elif st.get("start") and float(st["start"]) > now:
+                currently_active = False
+                print(f"[war poll] war schedule override: {st['battle_id']} start_time not reached — holding peacetime")
+
         if ps99_first_check:
             ps99_first_check = False
             ps99_war_active = currently_active
@@ -17301,6 +17474,19 @@ async def get_mcwv_placement_snapshot():
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         return None
+
+    # War Schedule gate: the website editor (/setwartime) is the truth for when
+    # a battle really starts/ends — no placement cards during the API staging
+    # period (start_time future) or after the real end (end_time passed).
+    st = get_battles_row_for(battle_id)
+    if st:
+        now = time.time()
+        if st.get("finish") and float(st["finish"]) <= now:
+            print(f"[placement] war schedule: {st['battle_id']} ended — snapshot skipped")
+            return None
+        if st.get("start") and float(st["start"]) > now:
+            print(f"[placement] war schedule: {st['battle_id']} not started — snapshot skipped")
+            return None
 
     # Same primary source as the website: db.biggames.io overview.
     index_overview = await get_big_games_index_clan_overview()
@@ -18883,6 +19069,29 @@ async def hourly_stats_war_is_active():
         return hourly_stats_war_state.get("active")
 
     battle_id = await get_active_battle_id_for_placement()
+
+    # War Schedule overrides: the website editor (/setwartime) is the truth for
+    # when a battle really starts and ends. PS99 creates battles early and its
+    # windows run long, so:
+    #   - end_time passed  -> war is over NOW (even if the API still says live)
+    #   - start_time future -> war has NOT started yet (API staging period)
+    hourly_stats_war_state["override_ended"] = False
+    hourly_stats_war_state["override_pending"] = False
+    st = get_battles_row_for(battle_id)
+    if battle_id and st:
+        if st.get("finish") and float(st["finish"]) <= now:
+            hourly_stats_war_state["checked_at"] = now
+            hourly_stats_war_state["active"] = False
+            hourly_stats_war_state["override_ended"] = True
+            print(f"[hourly stats] war schedule override: {st['battle_id']} end_time passed — pausing")
+            return False
+        if st.get("start") and float(st["start"]) > now:
+            hourly_stats_war_state["checked_at"] = now
+            hourly_stats_war_state["active"] = False
+            hourly_stats_war_state["override_pending"] = True
+            print(f"[hourly stats] war schedule override: {st['battle_id']} start_time not reached — waiting")
+            return False
+
     hourly_stats_war_state["checked_at"] = now
     hourly_stats_war_state["active"] = bool(battle_id)
     return hourly_stats_war_state["active"]
@@ -18912,6 +19121,20 @@ async def sync_hourly_stats_with_war_state():
     if await hourly_stats_war_is_active():
         hourly_stats_war_misses = 0
         return True
+
+    # War Schedule overrides: pause immediately instead of waiting for the
+    # API-hiccup debounce, whether the battle ended or hasn't started yet.
+    if hourly_stats_war_state.get("override_ended"):
+        hourly_stats_war_misses = 0
+        set_hourly_stats_enabled(False, auto_disabled=True)
+        admin_log("Hourly Stats Auto-Disabled", "War schedule says the battle ended; hourly stats paused until the next war.", "warning")
+        return False
+
+    if hourly_stats_war_state.get("override_pending"):
+        hourly_stats_war_misses = 0
+        set_hourly_stats_enabled(False, auto_disabled=True)
+        admin_log("Hourly Stats Auto-Disabled", "War schedule says the battle hasn't started yet; hourly stats waiting for the real start.", "warning")
+        return False
 
     # Debounce: one API hiccup must not pause the hourly cards mid-war.
     hourly_stats_war_misses += 1
@@ -19992,6 +20215,7 @@ async def setwartime_cmd(interaction: discord.Interaction, battle_id: str, start
                     edited_at = NOW()
             """, (battle_id.strip(), battle_id.strip(), start, end, interaction.user.id))
         conn.commit()
+        invalidate_battles_order_cache()
     except Exception as e:
         conn.rollback()
         return await interaction.followup.send(f"❌ DB error: `{type(e).__name__}: {e}`", ephemeral=True)
