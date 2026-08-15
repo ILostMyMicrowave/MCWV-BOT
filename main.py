@@ -3537,6 +3537,17 @@ def init_db_schema():
             cur.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS edited_by BIGINT")
             cur.execute("ALTER TABLE battles ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ")
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_participants (
+                    battle_id TEXT NOT NULL,
+                    clan_name TEXT NOT NULL,
+                    roblox_id TEXT NOT NULL,
+                    place INTEGER,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (battle_id, clan_name, roblox_id)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_participants_roblox_idx ON cross_clan_participants (roblox_id)")
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS admin_logs (
                     id BIGSERIAL PRIMARY KEY,
                     level TEXT NOT NULL DEFAULT 'info',
@@ -10867,6 +10878,44 @@ async def gather_player_data(roblox_id, roblox_name):
         rows.extend(award_battles)
         rows.sort(key=_battle_sort_key, reverse=True)
 
+    # 6d. Durable participants: cross_clan_participants holds every participant
+    # captured at war end (CW-Bot style), including players whose points are
+    # unknown. This survives long after the API prunes battles.
+    try:
+        if db_enabled():
+            order_map = get_battles_order_map()
+            db_participants = []
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT battle_id, clan_name, place
+                    FROM cross_clan_participants
+                    WHERE roblox_id = %s
+                """, (str(roblox_id),))
+                for bid, clan_name, place in cur.fetchall():
+                    bid = str(bid)
+                    bid_lower = normalize_hourly_battle_key(bid)
+                    if not bid_lower or bid_lower in existing_battle_ids:
+                        continue
+                    db_participants.append({
+                        "battleId": bid,
+                        "title": _friendly_battle_name(bid),
+                        "clan": str(clan_name or "Unknown"),
+                        "points": 0,
+                        "rank": None,
+                        "total": None,
+                        "clanPlace": place,
+                        "earnedMedal": False,
+                        "startTime": order_map.get(bid_lower, 0),
+                        "participated_only": True,
+                    })
+                    existing_battle_ids.add(bid_lower)
+            if db_participants:
+                print(f"[checkplayer] {roblox_name} — {len(db_participants)} durable participated-only battles from war-end capture")
+                rows.extend(db_participants)
+                rows.sort(key=_battle_sort_key, reverse=True)
+    except Exception as exc:
+        print(f"[checkplayer] participants lookup failed: {exc}")
+
     # 7. Analyze
     clans_seen = []
     for row in rows:
@@ -12260,6 +12309,25 @@ async def backfill_cross_clan_history(interaction=None, battle_filter=None):
     return battles_cached, total_rows
 
 
+# ---------------- WAR-END CAPTURE (CW-BOT PARITY) ----------------
+# CW Bot wins because it snapshots every clan's full contributor list WHILE the
+# battle is live (all 75 members), before the API prunes contributors after the
+# war ends. This pipeline does the same:
+#   1. PRE-SCAN: a full 50k-clan scan starts WAR_CACHE_PRE_SCAN_HOURS before the
+#      real finish time (user's War Schedule wins) — captures everyone while the
+#      API still lists all 75 per clan.
+#   2. END-SCAN: another full scan when the war ends (auto_cache_war_end) —
+#      GREATEST upserts keep the best of both passes.
+#   3. PRIORITY RE-SCANS: 1h and 10min before the end, MCWV + all clans of
+#      tracked users get re-scanned on a dedicated connection so their final
+#      pushes are captured exactly.
+#   4. PARTICIPANTS: AwardUserIDs (participated, incl. 0-pointers) are stored in
+#      cross_clan_participants for top clans + MCWV + tracked users' clans.
+WAR_CACHE_PRE_SCAN_HOURS = max(1.0, float(os.environ.get("MCWV_WAR_PRE_SCAN_HOURS", "4") or "4"))
+WAR_CACHE_SCAN_CONCURRENCY = max(4, int(os.environ.get("MCWV_WAR_SCAN_CONCURRENCY", "40") or "40"))
+WAR_CACHE_PARTICIPANT_MAX_PLACE = max(0, int(os.environ.get("MCWV_WAR_PARTICIPANT_MAX_PLACE", "2500") or "2500"))
+
+
 async def auto_cache_war_end(battle_id):
     """Auto-cache a war's data when it ends. Called from war_poll_loop.
     
@@ -12274,31 +12342,38 @@ async def auto_cache_war_end(battle_id):
     if GLOBAL_BACKFILL_RUNNING:
         print(f"[cross-clan cache] auto-cache skipped for {battle_id}: global backfill already running")
         return
-    # Run the full scan in the background
-    asyncio.create_task(_auto_cache_full_scan(battle_id))
+    # Run the full scan in the background (participants included — CW Bot parity)
+    asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
     print(f"[cross-clan cache] auto-cache full scan queued for {battle_id}")
 
 
-async def _auto_cache_full_scan(battle_id):
-    """Background task: scan all 50k clans for one specific battle."""
+async def _auto_cache_full_scan(battle_id, include_participants=False, only_clans=None):
+    """Background task: scan all 50k clans (or a priority subset) for one battle.
+
+    include_participants=True also captures AwardUserIDs into
+    cross_clan_participants (CW-Bot parity: everyone who participated, even
+    0-point members) for clans with a real placement or that matter to us."""
     global GLOBAL_BACKFILL_RUNNING
 
     battle_id = str(battle_id)
     GLOBAL_BACKFILL_RUNNING = True
     scan_session = aiohttp.ClientSession()
-    pass
     started = time.time()
 
     try:
-        clan_names = await fetch_all_clan_names_from_sitemap(scan_session)
+        if only_clans:
+            clan_names = [str(n) for n in only_clans if n]
+            print(f"[auto-cache] priority scan: {len(clan_names)} clans for {battle_id}")
+        else:
+            clan_names = await fetch_all_clan_names_from_sitemap(scan_session)
         if not clan_names:
-            print(f"[auto-cache] no clans from sitemap for {battle_id}")
+            print(f"[auto-cache] no clans for {battle_id}")
             return
 
         ensure_db_connection()
         conn.autocommit = False
 
-        # Ensure table exists
+        # Ensure tables exist
         def _ensure():
             try:
                 with conn.cursor() as cur:
@@ -12311,17 +12386,46 @@ async def _auto_cache_full_scan(battle_id):
                         UNIQUE (roblox_id, battle_id, clan_name))""")
                     cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_roblox_idx ON cross_clan_player_history (roblox_id)")
                     cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_history_battle_idx ON cross_clan_player_history (battle_id)")
+                    cur.execute("""CREATE TABLE IF NOT EXISTS cross_clan_participants (
+                        battle_id TEXT NOT NULL,
+                        clan_name TEXT NOT NULL,
+                        roblox_id TEXT NOT NULL,
+                        place INTEGER,
+                        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (battle_id, clan_name, roblox_id))""")
+                    cur.execute("CREATE INDEX IF NOT EXISTS cross_clan_participants_roblox_idx ON cross_clan_participants (roblox_id)")
                 conn.commit()
             except Exception:
                 conn.rollback()
         await asyncio.to_thread(_ensure)
 
-        CONCURRENCY = 8
+        # Clans whose participants we ALWAYS keep: MCWV + clans of tracked users.
+        def _priority_clans():
+            priority = {_normalize_clan_name(CLAN_NAME)}
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT DISTINCT clan_name FROM cross_clan_player_history
+                        WHERE roblox_id IN (SELECT TRIM(roblox_id) FROM users WHERE roblox_id IS NOT NULL)
+                    """)
+                    for (cn,) in cur.fetchall():
+                        norm = _normalize_clan_name(str(cn))
+                        if norm:
+                            priority.add(norm)
+            except Exception as exc:
+                print(f"[auto-cache] priority clans query failed: {exc}")
+            return priority
+
+        priority_clans = await asyncio.to_thread(_priority_clans) if include_participants else set()
+
+        CONCURRENCY = WAR_CACHE_SCAN_CONCURRENCY
         clans_with_data = 0
         total_contribs = 0
+        total_participants = 0
         pending_rows = []
+        pending_participants = []
 
-        print(f"[auto-cache] scanning {len(clan_names)} clans for {battle_id}")
+        print(f"[auto-cache] scanning {len(clan_names)} clans for {battle_id} (concurrency={CONCURRENCY}, participants={include_participants})")
 
         for batch_start in range(0, len(clan_names), CONCURRENCY):
             batch = clan_names[batch_start:batch_start + CONCURRENCY]
@@ -12330,9 +12434,10 @@ async def _auto_cache_full_scan(battle_id):
                 return_exceptions=True,
             )
 
-            for rows in results:
-                if isinstance(rows, Exception) or not rows:
+            for name, result in zip(batch, results):
+                if isinstance(result, Exception) or not result:
                     continue
+                rows, participants_by_battle, places_by_battle = result
                 # Filter to only this battle's contributions
                 battle_rows = [r for r in rows if r[1] == battle_id]
                 if battle_rows:
@@ -12340,18 +12445,34 @@ async def _auto_cache_full_scan(battle_id):
                     total_contribs += len(battle_rows)
                     pending_rows.extend(battle_rows)
 
+                if include_participants:
+                    parts = participants_by_battle.get(battle_id) or participants_by_battle.get(str(battle_id)) or []
+                    if parts:
+                        place = places_by_battle.get(battle_id) or places_by_battle.get(str(battle_id)) or 0
+                        norm = _normalize_clan_name(str(name))
+                        keep = (norm in priority_clans) or (0 < int(place or 0) <= WAR_CACHE_PARTICIPANT_MAX_PLACE)
+                        if keep:
+                            total_participants += len(parts)
+                            pending_participants.extend((str(battle_id), str(name), uid, int(place) or None) for uid in parts)
+
             if len(pending_rows) >= 5000:
                 await asyncio.to_thread(_insert_raw_contributions, conn, pending_rows)
                 pending_rows.clear()
+            if len(pending_participants) >= 5000:
+                await asyncio.to_thread(_insert_participants, conn, pending_participants)
+                pending_participants.clear()
 
             if (batch_start // CONCURRENCY + 1) % 100 == 0:
                 elapsed = time.time() - started
-                print(f"[auto-cache] {batch_start+CONCURRENCY}/{len(clan_names)} clans, {total_contribs:,} contribs, {elapsed:.0f}s")
+                print(f"[auto-cache] {batch_start+CONCURRENCY}/{len(clan_names)} clans, {total_contribs:,} contribs, {total_participants:,} participants, {elapsed:.0f}s")
                 await asyncio.sleep(0)
 
         if pending_rows:
             await asyncio.to_thread(_insert_raw_contributions, conn, pending_rows)
             pending_rows.clear()
+        if pending_participants:
+            await asyncio.to_thread(_insert_participants, conn, pending_participants)
+            pending_participants.clear()
 
         # Recompute ranks for this battle only
         def _rank_battle():
@@ -12379,7 +12500,7 @@ async def _auto_cache_full_scan(battle_id):
 
         ranked = await asyncio.to_thread(_rank_battle)
         elapsed = time.time() - started
-        print(f"[auto-cache] {battle_id}: {clans_with_data} clans, {total_contribs:,} contribs, {ranked:,} ranked, {elapsed:.0f}s")
+        print(f"[auto-cache] {battle_id}: {clans_with_data} clans, {total_contribs:,} contribs, {total_participants:,} participants, {ranked:,} ranked, {elapsed:.0f}s")
 
     except Exception as e:
         print(f"[auto-cache] FATAL: {e}")
@@ -12648,6 +12769,62 @@ async def scrape_members_cmd(interaction: discord.Interaction):
 GLOBAL_BACKFILL_RUNNING = False
 
 
+async def _fetch_clan_contributions(scan_session, clan_name):
+    """Fetch ONE clan's contribution data for every battle it has.
+
+    Returns (rows, participants_by_battle, places_by_battle) or [] on failure:
+      rows: list of (roblox_id, battle_id, battle_name, clan_name, points,
+             clan_place, earned_medal, start_time) — scorers only (points > 0).
+      participants_by_battle: {battle_id: [roblox_id, ...]} — AwardUserIDs,
+             everyone who participated including 0-point members.
+      places_by_battle: {battle_id: place}
+    """
+    if not scan_session or getattr(scan_session, "closed", True):
+        return []
+    url = f"{PS99_API}/api/clan/{str(clan_name)}"
+    try:
+        async with scan_session.get(
+            url,
+            headers={"User-Agent": "MCWV-Bot/1.0", "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as res:
+            if res.status != 200:
+                return []
+            payload = await res.json(content_type=None)
+    except Exception:
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data", {})
+    battles = data.get("Battles") or data.get("battles") or {}
+    if not isinstance(battles, dict):
+        return []
+
+    rows = []
+    participants_by_battle = {}
+    places_by_battle = {}
+    for battle_id, battle in battles.items():
+        if not isinstance(battle, dict):
+            continue
+        contribs = battle.get("PointContributions") or battle.get("pointContributions") or []
+        place = _safe_int(battle.get("Place") or battle.get("place"))
+        medal = bool(battle.get("EarnedMedal") or battle.get("earnedMedal"))
+        places_by_battle[str(battle_id)] = place
+        for c in contribs if isinstance(contribs, list) else []:
+            if not isinstance(c, dict):
+                continue
+            uid = str(c.get("UserID") or c.get("userId") or "").strip()
+            pts = _safe_int(c.get("Points") or c.get("points"))
+            if not uid or pts <= 0:
+                continue
+            rows.append((uid, str(battle_id), str(battle_id), str(clan_name), pts, place, medal, None))
+        award_ids = battle.get("AwardUserIDs") or battle.get("awardUserIDs") or []
+        if isinstance(award_ids, list) and award_ids:
+            participants_by_battle[str(battle_id)] = [str(uid) for uid in award_ids]
+    return rows, participants_by_battle, places_by_battle
+
+
 async def fetch_all_clan_names_from_sitemap(scan_session=None):
     """Fetch every clan name from the db.biggames.io sitemap.
     Uses the provided scan_session (dedicated to the backfill) to avoid
@@ -12714,6 +12891,185 @@ def _insert_raw_contributions(conn, rows):
             pass
         print(f"[global backfill] insert failed: {exc}")
         return 0
+
+
+def _insert_participants(conn, rows):
+    """Batch-insert participant rows (AwardUserIDs) into cross_clan_participants.
+    Rows: (battle_id, clan_name, roblox_id, place)."""
+    if not rows:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO cross_clan_participants (battle_id, clan_name, roblox_id, place)
+                VALUES %s
+                ON CONFLICT (battle_id, clan_name, roblox_id) DO NOTHING
+            """, rows, page_size=1000)
+        conn.commit()
+        return len(rows)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[auto-cache] participants insert failed: {exc}")
+        return 0
+
+
+async def _auto_cache_priority_scan(battle_id, clan_names):
+    """Re-scan a small set of clans (MCWV + tracked users' clans) near war end
+    so their final pushes are captured exactly, like CW Bot. Uses a DEDICATED
+    DB connection so it can run safely alongside the full 50k scan."""
+    if not clan_names or not DATABASE_URL:
+        return
+    battle_id = str(battle_id)
+    scan_session = aiohttp.ClientSession()
+    local_conn = None
+    started = time.time()
+    try:
+        def _open():
+            c = psycopg2.connect(
+                DATABASE_URL,
+                sslmode="require",
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+            c.autocommit = False
+            return c
+
+        local_conn = await asyncio.to_thread(_open)
+
+        pending_rows = []
+        pending_participants = []
+        for name in clan_names:
+            result = await _fetch_clan_contributions(scan_session, name)
+            if not result:
+                continue
+            rows, participants_by_battle, places_by_battle = result
+            battle_rows = [r for r in rows if r[1] == battle_id]
+            pending_rows.extend(battle_rows)
+            parts = participants_by_battle.get(battle_id) or participants_by_battle.get(str(battle_id)) or []
+            if parts:
+                place = places_by_battle.get(battle_id) or places_by_battle.get(str(battle_id)) or 0
+                pending_participants.extend((str(battle_id), str(name), uid, int(place) or None) for uid in parts)
+
+        if pending_rows:
+            await asyncio.to_thread(_insert_raw_contributions, local_conn, pending_rows)
+        if pending_participants:
+            await asyncio.to_thread(_insert_participants, local_conn, pending_participants)
+
+        def _rank():
+            total = 0
+            with local_conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM cross_clan_player_history WHERE battle_id = %s", (battle_id,))
+                total = int(cur.fetchone()[0] or 0)
+                if total:
+                    cur.execute("""
+                        WITH ranked AS (
+                            SELECT id, ROW_NUMBER() OVER (ORDER BY points DESC, roblox_id ASC) AS gr, %s AS gt
+                            FROM cross_clan_player_history WHERE battle_id = %s
+                        )
+                        UPDATE cross_clan_player_history h SET rank = r.gr, total_contributors = r.gt
+                        FROM ranked r WHERE h.id = r.id
+                    """, (total, battle_id))
+            local_conn.commit()
+            return total
+
+        ranked_total = await asyncio.to_thread(_rank)
+        print(f"[auto-cache] priority scan {battle_id}: {len(pending_rows)} contrib rows, {len(pending_participants)} participants, ranked over {ranked_total} in {time.time()-started:.0f}s")
+    except Exception as exc:
+        print(f"[auto-cache] priority scan FATAL: {exc}")
+        traceback.print_exc()
+    finally:
+        if local_conn is not None:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
+        await scan_session.close()
+
+
+async def get_priority_clan_names():
+    """MCWV + every clan that any tracked user has history in (small set)."""
+    clans = {str(CLAN_NAME)}
+    if db_enabled():
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT clan_name FROM cross_clan_player_history
+                    WHERE roblox_id IN (SELECT TRIM(roblox_id) FROM users WHERE roblox_id IS NOT NULL)
+                """)
+                for (cn,) in cur.fetchall():
+                    if cn:
+                        clans.add(str(cn))
+        except Exception as exc:
+            print(f"[war-cache] priority clans query failed: {exc}")
+    return sorted(clans)
+
+
+@tasks.loop(minutes=10)
+async def war_cache_window_loop():
+    """CW-Bot-parity scheduler: run the full capture scan in the final hours of
+    a war (while the API still lists all 75 members per clan) and priority
+    re-scans of MCWV + tracked users' clans right before the end. The user's
+    War Schedule finish time wins over the API config."""
+    if not DATABASE_URL or not db_enabled():
+        return
+    try:
+        battle_id = await get_active_battle_id_for_placement()
+        if not battle_id:
+            return
+        key = normalize_hourly_battle_key(str(battle_id))
+
+        # Finish time: user's War Schedule first, then the API config.
+        st = get_battles_row_for(battle_id)
+        finish = float(st["finish"]) if (st and st.get("finish")) else None
+        if not finish:
+            payload = await fetch_json_for_placement(ACTIVE_BATTLE_API)
+            cfg = {}
+            if isinstance(payload, dict):
+                data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+                cfg = data.get("configData", {}) if isinstance(data.get("configData"), dict) else {}
+            finish = pick_first_int(cfg, ("FinishTime", "finishTime", "finish_time"))
+            if finish and finish > 10_000_000_000:
+                finish //= 1000
+        if not finish:
+            return
+
+        now = time.time()
+        hours_left = (finish - now) / 3600.0
+        if hours_left <= 0:
+            return
+
+        # 1) Full pre-end scan once per battle (captures all clans while the
+        #    API still lists every participant).
+        if hours_left <= WAR_CACHE_PRE_SCAN_HOURS and not db_get_setting(f"mcwv_war_cache_pre_{key}"):
+            db_set_setting(f"mcwv_war_cache_pre_{key}", str(int(now)))
+            if GLOBAL_BACKFILL_RUNNING:
+                print(f"[war-cache] pre-scan deferred for {battle_id}: scan already running")
+            else:
+                admin_log("War Cache Pre-Scan", f"{battle_id}: final-hours full capture queued (T-{hours_left:.1f}h).")
+                asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
+            return
+
+        # 2) Priority re-scans of MCWV + tracked users' clans near the end.
+        for phase, cutoff in (("prio_1h", 1.0), ("prio_10m", 1.0 / 6)):
+            if hours_left <= cutoff and not db_get_setting(f"mcwv_war_cache_{phase}_{key}"):
+                db_set_setting(f"mcwv_war_cache_{phase}_{key}", str(int(now)))
+                clans = await get_priority_clan_names()
+                admin_log("War Cache Priority Scan", f"{battle_id}: re-scanning {len(clans)} priority clans at T-{hours_left:.1f}h.")
+                asyncio.create_task(_auto_cache_priority_scan(battle_id, clans))
+                return
+    except Exception as exc:
+        print(f"[war-cache] window check failed: {exc}")
+
+
+@war_cache_window_loop.before_loop
+async def before_war_cache_window_loop():
+    await bot.wait_until_ready()
 
 
 def _compute_global_ranks_sql(conn):
@@ -19924,6 +20280,10 @@ def start_bot_loops():
     if not db_keeper_loop.is_running():
         db_keeper_loop.start()
 
+    # ---------------- WAR CACHE WINDOW LOOP ----------------
+    if not war_cache_window_loop.is_running():
+        war_cache_window_loop.start()
+
 
 # ---------------- LOOP HEALTH MONITOR + DB HEALTH ----------------
 
@@ -19972,6 +20332,7 @@ ALL_LOOPS = [
     ("Broadcast", "broadcast_scheduler_loop"),
     ("Giveaway", "check_giveaway_event"),
     ("DB Keeper", "db_keeper_loop"),
+    ("War Cache", "war_cache_window_loop"),
 ]
 
 
