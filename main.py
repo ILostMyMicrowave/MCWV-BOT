@@ -646,6 +646,20 @@ async def _admin_ticket_detail_payload(ticket_id):
     ticket = db_admin_get_mcwv_ticket(ticket_id)
     if not ticket:
         return None
+    try:
+        checks = db_get_image_checks(ticket_id)
+        if checks:
+            ticket["imageChecks"] = [
+                {
+                    "filename": str(f),
+                    "label": str(l or ""),
+                    "score": round(float(s or 0), 4),
+                    "checkedAt": (t.isoformat() if hasattr(t, "isoformat") else str(t)),
+                }
+                for f, l, s, t in checks
+            ]
+    except Exception as exc:
+        print(f"[tickets api] image checks lookup failed for {ticket_id}: {exc}")
     return await enrich_ticket_last_message(ticket)
 
 
@@ -3624,6 +3638,17 @@ def init_db_schema():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_image_checks (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT,
+                    filename TEXT,
+                    ai_label TEXT,
+                    ai_score NUMERIC,
+                    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS mcwv_ticket_image_checks_ticket_idx ON mcwv_ticket_image_checks (ticket_id)")
         # Event tables (invites / giveaways) now live in Postgres too —
         # the old SQLite bot.db was wiped on every Render deploy.
         try:
@@ -3927,6 +3952,17 @@ def db_ensure_mcwv_ticket_tables():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ticket_image_checks (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id TEXT,
+                    filename TEXT,
+                    ai_label TEXT,
+                    ai_score NUMERIC,
+                    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS mcwv_ticket_image_checks_ticket_idx ON mcwv_ticket_image_checks (ticket_id)")
         conn.commit()
         _ticket_tables_ready = True
     except Exception as e:
@@ -5606,6 +5642,15 @@ MCWV_TICKET_STAFF_ROLE_IDS.add(ALLOWED_ROLE_ID)
 MCWV_TICKET_STAFF_ROLE_IDS.add(1502339420207059066)
 MCWV_TICKET_DELETE_DELAY_SECONDS = max(5, int(os.environ.get("MCWV_TICKET_DELETE_DELAY_SECONDS", "20") or "20"))
 MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS = max(1, int(os.environ.get("MCWV_TICKET_MIN_SCREENSHOT_ATTACHMENTS", "1") or "1"))
+# AI screenshot detection (Hive Moderation). Two supported setups:
+#   V3 (self-serve — what the dashboard shows): set MCWV_AI_CHECK_ACCESS_KEY_ID
+#       + MCWV_AI_CHECK_SECRET_KEY. Uses the OpenAI-compatible /api/v3 endpoint.
+#   V2 (legacy/enterprise): set MCWV_AI_CHECK_API_KEY alone. Uses /api/v2/task/sync.
+# When unset everything degrades gracefully (checks simply skipped).
+MCWV_AI_CHECK_API_KEY = os.environ.get("MCWV_AI_CHECK_API_KEY", "").strip()
+MCWV_AI_CHECK_ACCESS_KEY_ID = os.environ.get("MCWV_AI_CHECK_ACCESS_KEY_ID", "").strip()
+MCWV_AI_CHECK_SECRET_KEY = os.environ.get("MCWV_AI_CHECK_SECRET_KEY", "").strip()
+MCWV_AI_CHECK_ENABLED = os.environ.get("MCWV_AI_CHECK_ENABLED", "1") != "0"
 MCWV_HUB_LINKS_ENABLED = os.environ.get("MCWV_HUB_LINKS_ENABLED", "0") == "1"
 MCWV_TICKET_BANNER_PATH = os.environ.get(
     "MCWV_TICKET_BANNER_PATH",
@@ -8032,7 +8077,325 @@ async def get_roblox_headshot_url(roblox_id):
     return None
 
 
-def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None, avatar_url=None):
+# ---------------- AI SCREENSHOT DETECTION (HIVE MODERATION) ----------------
+def ai_check_enabled():
+    return MCWV_AI_CHECK_ENABLED and (
+        bool(MCWV_AI_CHECK_API_KEY)
+        or (bool(MCWV_AI_CHECK_ACCESS_KEY_ID) and bool(MCWV_AI_CHECK_SECRET_KEY))
+    )
+
+
+def ai_check_uses_v3():
+    return bool(MCWV_AI_CHECK_ACCESS_KEY_ID) and bool(MCWV_AI_CHECK_SECRET_KEY)
+
+
+def parse_hive_ai_response(payload):
+    """Extract (label, score) from a Hive Moderation sync response.
+    Hive returns classes like 'ai_generated' / 'not_ai_generated' — we report
+    the ai_generated score. Pure function so it can be tested offline."""
+    try:
+        status = payload["status"][0]["response"]["output"][0]
+        classes = {
+            str(c.get("class")): float(c.get("score") or 0)
+            for c in status.get("classes", [])
+        }
+    except Exception:
+        return None
+    if "ai_generated" in classes:
+        return "ai_generated", classes["ai_generated"]
+    ai_like = {
+        k: v for k, v in classes.items()
+        if "ai" in k.lower() and "not_ai" not in k.lower()
+    }
+    if ai_like:
+        label = max(ai_like, key=ai_like.get)
+        return label, ai_like[label]
+    return None
+
+
+async def check_image_ai_hive(image_bytes, filename="image.png", content_type="image/png"):
+    """Run one image through Hive's AI-generated detection.
+    Returns (label, score) or None on any failure / when not configured."""
+    global session
+    if not ai_check_enabled() or not image_bytes:
+        return None
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    form = aiohttp.FormData()
+    form.add_field(
+        "media",
+        image_bytes,
+        filename=(str(filename or "image.png")[:100] or "image.png"),
+        content_type=str(content_type or "image/png"),
+    )
+    try:
+        async with session.post(
+            "https://api.thehive.ai/api/v2/task/sync",
+            headers={
+                # Current Hive docs: the project API Key goes in the
+                # Authorization header (Token scheme), not a URL param.
+                "Authorization": f"Token {MCWV_AI_CHECK_API_KEY}",
+                "Accept": "application/json",
+            },
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=45),
+        ) as res:
+            if res.status != 200:
+                print(f"[ai-check] Hive HTTP {res.status}")
+                return None
+            payload = await res.json(content_type=None)
+    except Exception as exc:
+        print(f"[ai-check] Hive request failed: {exc}")
+        return None
+    return parse_hive_ai_response(payload)
+
+
+_AI_V3_AUTH_MODE = {"mode": None}  # None = auto-detect, "secret" or "pair"
+
+
+async def check_image_ai_v3(image_bytes, filename="image.png", content_type="image/png"):
+    """Run one image through Hive's V3 AI detection (OpenAI-compatible chat
+    completions with the moderation VLM). Uses the Access Key ID + Secret Key
+    pair from the dashboard Service API Keys section.
+
+    Returns (label, score) or None on any failure / when not configured.
+    """
+    global session
+    if not ai_check_enabled() or not ai_check_uses_v3() or not image_bytes:
+        return None
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{content_type or 'image/png'};base64,{b64}"
+    prompt = (
+        "Is this image AI-generated (e.g. by Midjourney, DALL-E, Stable Diffusion)? "
+        "Reply with JSON only, exactly: {\"ai_generated\": true or false, \"score\": 0 to 100}"
+    )
+    payload = {
+        "model": "hive/moderation-11b-vision-language-model",
+        "max_tokens": 60,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+    }
+
+    # Bearer token candidates — Hive's V3 dashboards vary between exposing just
+    # the Secret Key and the Access:Secret pair; auto-detect and remember.
+    candidates = []
+    cached = _AI_V3_AUTH_MODE.get("mode")
+    if cached == "secret":
+        candidates = [MCWV_AI_CHECK_SECRET_KEY]
+    elif cached == "pair":
+        candidates = [f"{MCWV_AI_CHECK_ACCESS_KEY_ID}:{MCWV_AI_CHECK_SECRET_KEY}"]
+    else:
+        candidates = [
+            MCWV_AI_CHECK_SECRET_KEY,
+            f"{MCWV_AI_CHECK_ACCESS_KEY_ID}:{MCWV_AI_CHECK_SECRET_KEY}",
+        ]
+
+    last_status = 0
+    for token in candidates:
+        try:
+            async with session.post(
+                "https://api.thehive.ai/api/v3/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as res:
+                last_status = res.status
+                if res.status == 401:
+                    continue  # try the next auth format
+                if res.status != 200:
+                    print(f"[ai-check] Hive V3 HTTP {res.status}")
+                    return None
+                data = await res.json(content_type=None)
+                break
+        except Exception as exc:
+            print(f"[ai-check] Hive V3 request failed: {exc}")
+            return None
+    else:
+        print(f"[ai-check] Hive V3 auth failed (last status {last_status}) — check ACCESS_KEY_ID/SECRET_KEY")
+        return None
+
+    # Remember which auth format worked.
+    if cached is None:
+        _AI_V3_AUTH_MODE["mode"] = "secret" if candidates.index(token) == 0 else "pair"
+        print(f"[ai-check] Hive V3 auth mode detected: {_AI_V3_AUTH_MODE['mode']}")
+
+    # Parse the VLM's JSON reply.
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        print(f"[ai-check] Hive V3 unexpected response: {str(data)[:300]}")
+        return None
+    return parse_ai_vlm_reply(content)
+
+
+def parse_ai_vlm_reply(content):
+    """Extract (label, score 0..1) from the VLM's JSON text reply. Pure
+    function — tolerates code fences and loose JSON."""
+    if not isinstance(content, str):
+        return None
+    text = content.strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.S | re.I)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        obj = json.loads(text)
+    except Exception:
+        # loose fallback: find numbers / true-false
+        m = re.search(r'"score"\s*:\s*(\d+(?:\.\d+)?)', text)
+        if not m:
+            return None
+        score100 = float(m.group(1))
+        ai = bool(re.search(r'"ai_generated"\s*:\s*true', text, re.I))
+        label = "ai_generated" if ai else "not_ai_generated"
+        return label, min(max(score100 / 100.0, 0.0), 1.0)
+    if isinstance(obj, dict):
+        score100 = float(obj.get("score") or 0)
+        ai = bool(obj.get("ai_generated")) or score100 >= 50
+        label = "ai_generated" if ai else "not_ai_generated"
+        return label, min(max(score100 / 100.0, 0.0), 1.0)
+    return None
+
+
+def db_save_image_check(ticket_id, filename, ai_label, ai_score):
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_ticket_image_checks (ticket_id, filename, ai_label, ai_score)
+                VALUES (%s, %s, %s, %s)
+            """, (str(ticket_id), str(filename or "")[:200], str(ai_label or ""), float(ai_score or 0)))
+        conn.commit()
+    except Exception as exc:
+        print(f"db_save_image_check error: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def db_get_image_checks(ticket_id):
+    if not db_enabled():
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT filename, ai_label, ai_score, checked_at
+                FROM mcwv_ticket_image_checks
+                WHERE ticket_id = %s
+                ORDER BY id ASC
+            """, (str(ticket_id),))
+            return cur.fetchall()
+    except Exception as exc:
+        print(f"db_get_image_checks error: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+
+
+def db_clear_image_checks(ticket_id):
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM mcwv_ticket_image_checks WHERE ticket_id = %s", (str(ticket_id),))
+        conn.commit()
+    except Exception as exc:
+        print(f"db_clear_image_checks error: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+async def run_ai_screenshot_checks(channel, applicant_id, ticket_id, limit=12):
+    """Collect the applicant's image attachments in the ticket, run each through
+    the AI detector and persist results. Returns a list of
+    {filename, label, score} — [] when not configured or nothing to check."""
+    if not ai_check_enabled() or channel is None or not hasattr(channel, "history"):
+        return []
+    attachments = []
+    try:
+        async for message in channel.history(limit=250, oldest_first=False):
+            if getattr(message.author, "id", None) != int(applicant_id):
+                continue
+            for att in getattr(message, "attachments", []) or []:
+                if is_image_attachment(att):
+                    attachments.append(att)
+    except Exception as exc:
+        print(f"[ai-check] history scan failed in {getattr(channel, 'id', 'unknown')}: {exc}")
+        return []
+
+    seen = set()
+    unique = []
+    for att in attachments:
+        if att.url not in seen:
+            seen.add(att.url)
+            unique.append(att)
+    unique = unique[:limit]
+    if not unique:
+        return []
+
+    async def check_one(att):
+        try:
+            async with session.get(
+                att.url,
+                headers={"User-Agent": "MCWV-Bot/1.0"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as res:
+                if res.status != 200:
+                    return None
+                data = await res.read()
+            if ai_check_uses_v3():
+                result = await check_image_ai_v3(data, att.filename, att.content_type)
+            else:
+                result = await check_image_ai_hive(data, att.filename, att.content_type)
+            if result:
+                label, score = result
+                db_save_image_check(ticket_id, att.filename, label, score)
+                return {"filename": str(att.filename or "image"), "label": label, "score": score}
+        except Exception as exc:
+            print(f"[ai-check] image {getattr(att, 'filename', '?')} failed: {exc}")
+        return None
+
+    results = await asyncio.gather(*(check_one(a) for a in unique), return_exceptions=True)
+    return [r for r in results if isinstance(r, dict)]
+
+
+def format_ai_check_results(results):
+    """Discord-safe summary lines for a list of {filename, label, score}."""
+    if not results:
+        return "No checks yet."
+    lines = []
+    for r in results:
+        pct = float(r.get("score") or 0) * 100
+        flag = "\u26a0\ufe0f" if pct >= 50 else "\u2705"
+        lines.append(f"{flag} `{str(r.get('filename') or 'image')[:40]}` — **{pct:.0f}%** AI")
+    return "\n".join(lines)
+
+
+def ai_check_flags(results):
+    return [r for r in results if float(r.get("score") or 0) >= 0.5]
+
+
+def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None, avatar_url=None, ai_results=None):
     embed = discord.Embed(
         title="MCWV Application Ready for Review",
         description=(
@@ -8046,11 +8409,17 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
     embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
     embed.add_field(name="Roblox", value=f"**{roblox_name}**\n`{roblox_id}`", inline=True)
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
+    if ai_results is not None:
+        flags = ai_check_flags(ai_results)
+        title = "\U0001f5bc\ufe0f Screenshot AI check"
+        if flags:
+            title = f"\U0001f5bc\ufe0f Screenshot AI check \u00b7 \u26a0\ufe0f {len(flags)} flag{'s' if len(flags) != 1 else ''}"
+        embed.add_field(name=title, value=format_ai_check_results(ai_results)[:1024], inline=False)
     embed.set_footer(text=f"Claimed by {claimed_by}" if claimed_by else "Pending staff review")
     return embed
 
 
-async def send_application_review_card(guild, channel, ticket_id, applicant, app_row):
+async def send_application_review_card(guild, channel, ticket_id, applicant, app_row, ai_results=None):
     """Post the 'Application Ready for Review' staff card into the ticket channel.
 
     The card lives inside the applicant's ticket only — there is no review-channel
@@ -8074,6 +8443,7 @@ async def send_application_review_card(guild, channel, ticket_id, applicant, app
             app_row[4],
             app_row[5],
             avatar_url=avatar_url,
+            ai_results=ai_results,
         )
         await channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
         return True
@@ -8685,6 +9055,26 @@ async def build_staff_info_embed(ticket_row):
         inline=False,
     )
 
+    # AI screenshot checks (raw scores — advisory only)
+    checks = db_get_image_checks(ticket_id)
+    if checks:
+        lines = []
+        for filename, ai_label, ai_score, checked_at in checks:
+            pct = float(ai_score or 0) * 100
+            flag = "\u26a0\ufe0f" if pct >= 50 else "\u2705"
+            lines.append(f"{flag} `{str(filename)[:40]}` — **{pct:.0f}%** AI")
+        flags = sum(1 for _, _, s, _ in checks if float(s or 0) >= 0.5)
+        title = "\U0001f5bc\ufe0f Screenshot AI check"
+        if flags:
+            title += f" \u00b7 \u26a0\ufe0f {flags} flag{'s' if flags != 1 else ''}"
+        embed.add_field(name=title, value="\n".join(lines)[:1024], inline=False)
+    elif ai_check_enabled():
+        embed.add_field(
+            name="\U0001f5bc\ufe0f Screenshot AI check",
+            value="No checks recorded yet — applicant hasn't confirmed screenshots.",
+            inline=False,
+        )
+
     embed.set_footer(text="Only staff can see this panel.")
     return embed
 
@@ -9084,6 +9474,26 @@ async def accept_application_ticket(interaction, ticket_row):
             value="\n".join(f"⚠️ {item}" for item in errors)[:1024],
             inline=False,
         )
+    # AI screenshot flags (advisory) — shown on accept so staff can double-check.
+    try:
+        checks = db_get_image_checks(ticket_row[0])
+        if checks:
+            flag_lines = []
+            clean_count = 0
+            for filename, ai_label, ai_score, checked_at in checks:
+                pct = float(ai_score or 0) * 100
+                if pct >= 50:
+                    flag_lines.append(f"• `{str(filename)[:40]}` — {pct:.0f}% AI")
+                else:
+                    clean_count += 1
+            if flag_lines:
+                status_embed.add_field(
+                    name="⚠️ Screenshot AI flags (verify before accepting!)",
+                    value="\n".join(flag_lines)[:1024] + (f"\n({clean_count} clean)" if clean_count else ""),
+                    inline=False,
+                )
+    except Exception as ai_exc:
+        print(f"[ticket] accept AI summary failed: {ai_exc}")
     if MCWV_HUB_LINKS_ENABLED:
         status_embed.add_field(
             name="Hub Profile",
@@ -9252,6 +9662,21 @@ class ScreenshotUploadedView(discord.ui.View):
             )
             db_ticket_log(row[0], interaction.user.id, "screenshots/uploaded", "Applicant confirmed screenshots were uploaded")
 
+            # AI screenshot detection (Hive). Advisory only — raw scores are
+            # shown to staff; nothing is blocked. Skipped silently when no key.
+            ai_results = None
+            if ai_check_enabled():
+                db_clear_image_checks(row[0])
+                ai_results = await run_ai_screenshot_checks(interaction.channel, interaction.user.id, row[0])
+                flags = ai_check_flags(ai_results or [])
+                db_ticket_log(
+                    row[0],
+                    interaction.user.id,
+                    "screenshots/ai_check",
+                    f"{len(ai_results or [])} images checked, {len(flags)} flagged as possible AI",
+                    {"scores": [{r['filename']: round(r['score'], 3)} for r in (ai_results or [])]},
+                )
+
             for child in self.children:
                 child.disabled = True
 
@@ -9275,6 +9700,7 @@ class ScreenshotUploadedView(discord.ui.View):
                     row[0],
                     applicant,
                     app_row,
+                    ai_results=ai_results,
                 )
                 if not posted:
                     await interaction.channel.send(
@@ -9676,6 +10102,25 @@ class AcceptConfirmView(discord.ui.View):
                 await interaction.message.edit(view=self)
             except Exception:
                 pass
+
+            # AI screenshot flags — warn the accepting officer BEFORE the accept
+            # runs (advisory only, acceptance still proceeds).
+            try:
+                checks = db_get_image_checks(self.ticket_id)
+                flag_lines = [
+                    f"• `{str(f)[:40]}` — {float(s or 0) * 100:.0f}% AI"
+                    for f, l, s, t in checks
+                    if float(s or 0) >= 0.5
+                ]
+                if flag_lines:
+                    await interaction.followup.send(
+                        "⚠️ **AI screenshot check** flagged on this application:\n"
+                        + "\n".join(flag_lines)[:1000]
+                        + "\nAccepting anyway — please verify the screenshots manually.",
+                        ephemeral=True,
+                    )
+            except Exception as ai_exc:
+                print(f"[ticket] accept AI pre-warning failed: {ai_exc}")
 
             accepted = await accept_application_ticket(interaction, row)
             if accepted:
