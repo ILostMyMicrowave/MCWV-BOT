@@ -5643,6 +5643,12 @@ MCWV_HOURLY_STATS_BG_PATH = os.environ.get(
 MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE = os.environ.get("MCWV_HOURLY_STATS_AUTO_WAR_TOGGLE", "1") != "0"
 HOURLY_STATS_AUTO_DISABLE_MISSES_REQUIRED = max(1, int(os.environ.get("MCWV_HOURLY_STATS_AUTO_DISABLE_MISSES", "2") or "2"))
 PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "3317771874"))
+
+# Wars that ended before this date were captured AFTER the API started pruning
+# (best-effort recovery) — full CW-style live capture began with the war that
+# ends on/after this date. Used for the "data may be incomplete" notes.
+MCWV_HISTORY_ACCURATE_SINCE = os.environ.get("MCWV_HISTORY_ACCURATE_SINCE", "2026-08-16")
+MCWV_HISTORY_INCOMPLETE_NOTE = f"Wars before {MCWV_HISTORY_ACCURATE_SINCE} may be incomplete"
 # Full official PS99 store gamepass list (id -> clean label). The runtime map
 # is refreshed daily from Roblox's store page by _get_ps99_gamepass_map() and
 # falls back to this baked copy when Roblox refuses to play nice.
@@ -11170,7 +11176,7 @@ def build_checkplayer_embed(data, page=0, per_page=7):
     has_participated = any(r.get("participated_only") for r in rows)
     footer_parts = [source_txt, f"{len(rows)} battles", f"pg {page+1}/{total_pages}"]
     if page == 0:
-        footer_parts.append("pre-backfill wars may be incomplete")
+        footer_parts.append(f"\u26a0\ufe0f {MCWV_HISTORY_INCOMPLETE_NOTE}")
     embed.set_footer(text=" \u00b7 ".join(footer_parts))
 
     return embed
@@ -11500,7 +11506,7 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
     src = " + ".join(sources) if sources else "PS99"
     ft = f"{src}  \u00b7  {len(rows)} battles"
     if page == 0:
-        ft += "  \u00b7  older wars may be partial"
+        ft += f"  \u00b7  \u26a0\ufe0f {MCWV_HISTORY_INCOMPLETE_NOTE}"
     d.text((MARGIN, H - sc(25)), ft, font=F["footer"], fill=(135, 145, 170, 210))
 
     await asyncio.sleep(0)
