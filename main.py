@@ -21296,6 +21296,79 @@ def games_gate_message(user_id):
 
 # ---------------- COIN ENGINE (integer + atomic) ----------------
 
+def games_coin_log_zero(target_id, kind, meta=None):
+    """Log a zero-amount event (free usage tracking). ALWAYS logs so daily
+    limits can't be bypassed by zero-amount paths."""
+    try:
+        if not db_enabled():
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING",
+                (int(target_id),),
+            )
+            cur.execute(
+                """INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta)
+                   VALUES (%s, %s, %s, 0, (SELECT balance FROM mcwv_coins WHERE discord_id = %s), %s::jsonb)""",
+                (int(target_id), int(target_id), str(kind)[:40], int(target_id), json.dumps(meta or {})),
+            )
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[games] coin_log_zero failed: {exc}")
+
+
+def games_prepaid_get(user_id, kind):
+    try:
+        if not db_enabled():
+            return 0
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING",
+                (int(user_id),),
+            )
+            col = {"hatch": "prepaid_hatches", "spin": "prepaid_spins", "scratch": "prepaid_scratches"}.get(kind)
+            if not col:
+                return 0
+            cur.execute(f"SELECT {col} FROM mcwv_coins WHERE discord_id = %s", (int(user_id),))
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception as exc:
+        print(f"[games] prepaid get failed: {exc}")
+        return 0
+
+
+def games_prepaid_consume(user_id, kind):
+    """Use one prepaid item if available. Returns True if consumed."""
+    try:
+        if not db_enabled():
+            return False
+        with conn.cursor() as cur:
+            col = {"hatch": "prepaid_hatches", "spin": "prepaid_spins", "scratch": "prepaid_scratches"}.get(kind)
+            if not col:
+                return False
+            cur.execute(
+                f"UPDATE mcwv_coins SET {col} = {col} - 1 WHERE discord_id = %s AND {col} > 0 RETURNING {col}",
+                (int(user_id),),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            return False
+        games_coin_log_zero(user_id, f"prepaid_{kind}_used", meta={"kind": kind})
+        return True
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[games] prepaid consume failed: {exc}")
+        return False
+
+
 def games_coin_adjust(target_id, amount, kind, actor_id=None, meta=None):
     """Atomic balance change. Returns (ok, new_balance_or_error)."""
     if not db_enabled():
@@ -21485,8 +21558,14 @@ def init_games_tables():
                 daily_streak INTEGER DEFAULT 0,
                 last_interest_at TIMESTAMPTZ,
                 total_earned BIGINT DEFAULT 0,
-                total_spent BIGINT DEFAULT 0
+                total_spent BIGINT DEFAULT 0,
+                prepaid_hatches INTEGER DEFAULT 0,
+                prepaid_spins INTEGER DEFAULT 0,
+                prepaid_scratches INTEGER DEFAULT 0
             )""")
+            cur.execute("ALTER TABLE mcwv_coins ADD COLUMN IF NOT EXISTS prepaid_hatches INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE mcwv_coins ADD COLUMN IF NOT EXISTS prepaid_spins INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE mcwv_coins ADD COLUMN IF NOT EXISTS prepaid_scratches INTEGER DEFAULT 0")
             cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_coin_log (
                 id BIGSERIAL PRIMARY KEY,
                 actor_id BIGINT, target_id BIGINT, type TEXT, amount BIGINT,
@@ -21576,11 +21655,32 @@ async def games_coins(interaction: discord.Interaction, user: discord.User = Non
     await interaction.response.defer(ephemeral=True)
     target = user or interaction.user
     bal = games_coin_balance(target.id)
-    unlimited = "∞ unlimited (testing)" if games_is_unlimited(target.id) else ""
-    embed = discord.Embed(title=f"🪙 {target.display_name}'s Coins", color=discord.Color.from_rgb(245, 200, 66))
-    embed.add_field(name="Cash", value=f"**{bal['balance']:,}**" + (f" {unlimited}" if unlimited else ""), inline=True)
-    embed.add_field(name="Bank", value=f"**{bal['bank']:,}**", inline=True)
-    embed.add_field(name="Total", value=f"**{bal['balance'] + bal['bank']:,}**", inline=True)
+    unlimited = "\u221e unlimited (testing)" if games_is_unlimited(target.id) else ""
+    prepaid = {
+        "\U0001f95a Hatches": games_prepaid_get(target.id, "hatch"),
+        "\U0001f3a1 Spins": games_prepaid_get(target.id, "spin"),
+        "\U0001f3b4 Scratches": games_prepaid_get(target.id, "scratch"),
+    }
+    prepaid_txt = " \u00b7 ".join(f"{k}: {v}" for k, v in prepaid.items() if v) or "none"
+    embed = discord.Embed(
+        title=f"\U0001fa99 {target.display_name}'s Coins",
+        color=discord.Color.from_rgb(245, 200, 66),
+    )
+    embed.add_field(name="\U0001f4b5 Cash", value=f"**{bal['balance']:,}** {unlimited}".strip(), inline=True)
+    embed.add_field(name="\U0001f3e6 Bank", value=f"**{bal['bank']:,}**", inline=True)
+    embed.add_field(name="\U0001f4ca Total", value=f"**{bal['balance'] + bal['bank']:,}**", inline=True)
+    embed.add_field(name="\U0001f392 Prepaid items", value=prepaid_txt, inline=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(SUM(amount), 0) FROM mcwv_coin_log WHERE target_id = %s AND amount > 0", (int(target.id),))
+            earned = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COALESCE(SUM(-amount), 0) FROM mcwv_coin_log WHERE target_id = %s AND amount < 0", (int(target.id),))
+            spent = int(cur.fetchone()[0] or 0)
+        embed.add_field(name="\U0001f4c8 Lifetime earned", value=f"**{earned:,}**", inline=True)
+        embed.add_field(name="\U0001f4c9 Lifetime spent", value=f"**{spent:,}**", inline=True)
+    except Exception as exc:
+        print(f"[games] coins lifetime fetch failed: {exc}")
+    embed.set_footer(text="Banked coins earn 1%/day interest (capped at 100k)")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -21614,13 +21714,20 @@ async def games_daily(interaction: discord.Interaction):
             conn.commit()
         games_coin_adjust(uid, award, "daily", meta={"streak": streak})
         games_track("daily", interaction.channel_id, minted=award)
+        flames = "\U0001f525" * min(streak, 10)
+        bar_filled = "\u2588" * min(streak, 10) + "\u2591" * max(0, 10 - min(streak, 10))
         embed = discord.Embed(
-            title="📅 Daily Check-in",
-            description=f"+**{award:,}** coins",
+            title="\U0001f4c5 Daily Check-in",
+            description=f"+**{award:,}** coins added to your balance",
             color=discord.Color.green(),
         )
-        embed.add_field(name="Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
-        embed.add_field(name="Next", value="24 hours from now", inline=True)
+        embed.add_field(
+            name=f"Streak \u00b7 {streak} day{'s' if streak != 1 else ''}",
+            value=f"{flames}\n`{bar_filled}`",
+            inline=True,
+        )
+        embed.add_field(name="Next check-in", value="In 24 hours", inline=True)
+        embed.set_footer(text=f"Streak resets after 48h without checking in \u00b7 next reward: {GAMES_DAILY_BASE + GAMES_DAILY_STREAK_BONUS * streak:,} coins")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as exc:
         try:
@@ -21713,18 +21820,106 @@ async def games_withdraw(interaction: discord.Interaction, amount: str):
         await interaction.followup.send(f"❌ Withdraw failed: `{type(exc).__name__}`", ephemeral=True)
 
 
-@bot.tree.command(name="shop", description="Browse the game shop", guild=guild_obj)
+class ShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def _buy(self, interaction, item, price, prepaid_kind):
+        # Defer FIRST: the coin spend + inventory update are blocking DB work
+        # and must never race Discord's 3-second interaction window.
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
+        if interaction.user.id != self._owner:
+            return await interaction.followup.send("This shop isn't yours — run `/shop`.", ephemeral=True)
+        ok, res = games_coin_spend(interaction.user.id, price, f"shop_{prepaid_kind}", meta={"item": item})
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        try:
+            with conn.cursor() as cur:
+                col = {"hatch": "prepaid_hatches", "spin": "prepaid_spins", "scratch": "prepaid_scratches"}[prepaid_kind]
+                cur.execute(
+                    f"UPDATE mcwv_coins SET {col} = {col} + 1 WHERE discord_id = %s RETURNING {col}",
+                    (interaction.user.id,),
+                )
+                new_count = int(cur.fetchone()[0])
+            conn.commit()
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            games_coin_adjust(interaction.user.id, price, "shop_refund")
+            print(f"[games] shop purchase failed: {exc}")
+            return await interaction.followup.send("❌ Purchase failed — coins returned.", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ Bought **{item}** for **{price:,}** coins — you have **{new_count}** banked "
+            f"(used automatically on your next {'/hatch' if prepaid_kind == 'hatch' else '/spin' if prepaid_kind == 'spin' else '/scratch'}).",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🥚 Extra Hatch · 100", style=discord.ButtonStyle.primary, row=0)
+    async def buy_hatch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._buy(interaction, "Extra Hatch", GAMES_HATCH_COST, "hatch")
+
+    @discord.ui.button(label="🎡 Extra Spin · 250", style=discord.ButtonStyle.primary, row=0)
+    async def buy_spin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._buy(interaction, "Extra Spin", GAMES_SPIN_COST_EXTRA, "spin")
+
+    @discord.ui.button(label="🎴 Extra Scratch · 100", style=discord.ButtonStyle.primary, row=0)
+    async def buy_scratch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._buy(interaction, "Extra Scratch", 100, "scratch")
+
+    @discord.ui.button(label="🎫 Lottery Ticket · 50", style=discord.ButtonStyle.success, row=1)
+    async def buy_lottery(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
+        if interaction.user.id != self._owner:
+            return await interaction.followup.send("This shop isn't yours — run `/shop`.", ephemeral=True)
+        ok, res = games_coin_spend(interaction.user.id, GAMES_LOTTERY_TICKET_COST, "lottery_ticket", meta={"tickets": 1})
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        pool = int(db_get_setting(GAMES_SETTING_LOTTERY_POOL, "0") or 0)
+        db_set_setting(GAMES_SETTING_LOTTERY_POOL, str(pool + GAMES_LOTTERY_TICKET_COST))
+        await interaction.followup.send(
+            f"🎟 Ticket bought! Lottery pool is now **{pool + GAMES_LOTTERY_TICKET_COST:,}** coins.", ephemeral=True)
+
+
+@bot.tree.command(name="shop", description="Buy game items with coins", guild=guild_obj)
 async def games_shop(interaction: discord.Interaction):
     if not games_gate_allowed(interaction):
         return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    embed = discord.Embed(title="🛒 Game Shop", color=discord.Color.from_rgb(245, 200, 66),
-                          description="Game items only — no server perks. Use `/cases` for role cases.")
-    embed.add_field(name="🥚 Extra hatch", value=f"**{GAMES_HATCH_COST}** coins — one more /hatch today", inline=True)
-    embed.add_field(name="🎡 Extra spin", value=f"**{GAMES_SPIN_COST_EXTRA}** coins — one more /spin today", inline=True)
-    embed.add_field(name="🎫 Lottery ticket", value=f"**{GAMES_LOTTERY_TICKET_COST}** coins — /lottery buy", inline=True)
-    embed.set_footer(text="Bank: /deposit + /withdraw · 1%/day interest (capped at 100k)")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    bal = games_coin_balance(interaction.user.id)
+    view = ShopView()
+    view._owner = interaction.user.id
+    embed = discord.Embed(
+        title="🛒 MCWV Game Shop",
+        color=discord.Color.from_rgb(245, 200, 66),
+        description=(
+            "**Your balance:** \U0001fa99 `{:,}` cash \u00b7 \U0001f3e6 `{:,}` bank\n\n"
+            "Purchases are banked and used automatically on your next game.\n"
+            "**Game items only** \u2014 role loot boxes live in `/cases`."
+        ).format(bal["balance"], bal["bank"]),
+    )
+    embed.add_field(
+        name="What's for sale",
+        value=(
+            "\U0001f95a **Extra Hatch** \u2014 `100` coins\n"
+            "\U0001f3a1 **Extra Spin** \u2014 `250` coins\n"
+            "\U0001f3b4 **Extra Scratch** \u2014 `100` coins\n"
+            "\U0001f39f **Lottery Ticket** \u2014 `50` coins\n\n"
+            "*Free dailies still apply first \u2014 extras only kick in after you've used them.*"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Bank: /deposit + /withdraw · 1%/day interest (capped at 100k banked)")
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 # ---------------- ROLE CASES ----------------
@@ -21749,12 +21944,66 @@ async def games_cases(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Could not list cases: `{type(exc).__name__}`", ephemeral=True)
 
 
+class CaseConfirmView(discord.ui.View):
+    """Shows a case's contents + odds, then rolls on confirm."""
+
+    def __init__(self, case_id, case_name, price, emoji, roles, weights):
+        super().__init__(timeout=120)
+        self.case_id = int(case_id)
+        self.case_name = case_name
+        self.price = int(price)
+        self.emoji = emoji
+        self.roles = roles          # list of discord.Role or None (nothing)
+        self.weights = weights      # float % list, aligned
+        self.rolled = False
+
+    @discord.ui.button(label="Open for this price", style=discord.ButtonStyle.success, emoji="🎁")
+    async def open_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.rolled:
+            return await interaction.response.send_message("This case was already rolled.", ephemeral=True)
+        self.rolled = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("🎲 Rolling…", ephemeral=True)
+        ok, res = games_coin_spend(interaction.user.id, self.price, "case_open", meta={"case": self.case_name})
+        if not ok:
+            self.rolled = False
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        won = games_weighted_choice(self.roles, self.weights)
+        if won is None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, price_paid) VALUES (%s,%s,%s)",
+                                (self.case_id, interaction.user.id, self.price))
+                conn.commit()
+            except Exception:
+                pass
+            games_track("case", interaction.channel_id, burned=self.price)
+            return await interaction.followup.send(
+                f"{self.emoji} **{self.case_name}** rolled… nothing this time. Better luck next roll!")
+
+        try:
+            member = interaction.user
+            if isinstance(member, discord.Member) and won not in member.roles:
+                await member.add_roles(won, reason=f"Unboxed from case '{self.case_name}'")
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,%s)",
+                            (self.case_id, interaction.user.id, won.id, self.price))
+            conn.commit()
+        except Exception as exc:
+            print(f"[games] case role grant failed: {exc}")
+        games_track("case", interaction.channel_id, burned=self.price)
+        tier = "\u2728 RARE!" if self.weights[self.roles.index(won)] <= 5 else "\U0001f389"
+        await interaction.followup.send(f"{tier} {interaction.user.mention} unboxed **{won.mention}** from {self.emoji} **{self.case_name}**!")
+
+
 @bot.tree.command(name="case", description="Open a role case (contents + chances shown)", guild=guild_obj)
 @app_commands.describe(name="Case name")
 async def games_case_open(interaction: discord.Interaction, name: str):
     if not games_gate_allowed(interaction):
         return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE AND LOWER(name) = LOWER(%s)", (name.strip(),))
@@ -21770,6 +22019,7 @@ async def games_case_open(interaction: discord.Interaction, name: str):
         guild = interaction.guild
         roles = []
         weights = []
+        lines = []
         total = 0.0
         for role_id, chance in contents:
             role = guild.get_role(int(role_id))
@@ -21778,43 +22028,31 @@ async def games_case_open(interaction: discord.Interaction, name: str):
             roles.append(role)
             weights.append(float(chance))
             total += float(chance)
+            rarity = "\u2728" if float(chance) <= 5 else ("\U0001f49c" if float(chance) <= 15 else "\U0001f4e6")
+            lines.append(f"{rarity} {role.mention} \u2014 **{float(chance):g}%**")
         if not roles:
             return await interaction.followup.send("❌ Case contents are invalid (roles deleted?).", ephemeral=True)
         filler_weight = max(0.0, 100.0 - total)
         if filler_weight > 0:
-            roles.append(None)  # nothing
+            roles.append(None)
             weights.append(filler_weight)
+            lines.append(f"\u2b1c Nothing \u2014 **{filler_weight:g}%**")
 
-        ok, res = games_coin_spend(interaction.user.id, int(price), "case_open", meta={"case": cname})
-        if not ok:
-            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
-        won = games_weighted_choice(roles, weights)
-
-        if won is None:
-            # record roll with no win
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, price_paid) VALUES (%s,%s,%s)", (cid, interaction.user.id, int(price)))
-                conn.commit()
-            except Exception:
-                pass
-            games_track("case", interaction.channel_id, burned=int(price))
-            return await interaction.followup.send(f"{emoji} **{cname}** rolled… nothing this time. Better luck next roll!", ephemeral=False)
-
-        # grant role + log
-        try:
-            member = interaction.user
-            if isinstance(member, discord.Member) and won not in member.roles:
-                await member.add_roles(won, reason=f"Unboxed from case '{cname}'")
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,%s)",
-                            (cid, interaction.user.id, won.id, int(price)))
-            conn.commit()
-        except Exception as exc:
-            print(f"[games] case role grant failed: {exc}")
-        games_track("case", interaction.channel_id, burned=int(price))
-        tier = "✨ RARE (5%+)" if weights[roles.index(won)] <= 5 else "🎉"
-        await interaction.followup.send(f"{tier} {interaction.user.mention} unboxed **{won.mention}** from {emoji} **{cname}**!", ephemeral=False)
+        bal = games_coin_balance(interaction.user.id)
+        can_afford = games_is_unlimited(interaction.user.id) or bal["balance"] >= int(price)
+        embed = discord.Embed(
+            title=f"{emoji} {cname}",
+            description="\n".join(lines) or "No contents.",
+            color=discord.Color.from_rgb(168, 130, 255),
+        )
+        embed.add_field(name="Price", value=f"**{int(price):,}** coins" + (" \u00b7 \u221e unlimited" if games_is_unlimited(interaction.user.id) else ""), inline=True)
+        embed.add_field(name="Your cash", value=f"**{bal['balance']:,}**" + ("" if can_afford else " \u2014 not enough!"), inline=True)
+        embed.set_footer(text="The price is fully consumed on every roll.")
+        view = CaseConfirmView(cid, cname, int(price), emoji, roles, weights)
+        if not can_afford:
+            for child in view.children:
+                child.disabled = True
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     except Exception as exc:
         print(f"[games] case open failed: {exc}")
         await interaction.followup.send(f"❌ Case open failed: `{type(exc).__name__}`", ephemeral=True)
@@ -22082,10 +22320,19 @@ async def games_start_guess_round(channel, pet_key=None, mode=None):
     if not image_buf:
         return None
     mode_label = {"zoom": "\U0001f50d Zoom", "silhouette": "\U0001f319 Silhouette", "pixel": "\U0001f4fa Pixel", "scrambled": "\U0001f9e9 Scrambled"}.get(mode, mode)
-    await channel.send(
-        f"**\U0001f43e Guess the Pet!** ({mode_label})\nFirst correct name wins **250 coins** — just type it!",
-        file=discord.File(image_buf, filename="guess_pet.png"),
+    mode_color = {
+        "zoom": discord.Color.from_rgb(108, 34, 245),
+        "silhouette": discord.Color.from_rgb(71, 85, 105),
+        "pixel": discord.Color.from_rgb(59, 130, 246),
+        "scrambled": discord.Color.from_rgb(245, 158, 11),
+    }.get(mode, discord.Color.from_rgb(108, 34, 245))
+    round_embed = discord.Embed(
+        title=f"\U0001f43e Guess the Pet \u2014 {mode_label}",
+        description="First correct name wins **\U0001fa99 250 coins** \u2014 just type it in chat!",
+        color=mode_color,
     )
+    round_embed.set_footer(text=f"\u23f1 {GAMES_ROUND_TIMEOUT // 60} minutes to answer \u00b7 {GAMES_MAX_ANSWER_ATTEMPTS} guesses each")
+    await channel.send(embed=round_embed, file=discord.File(image_buf, filename="guess_pet.png"))
     round_info = {
         "pet_key": pet_key,
         "pet_name": pet_key,
@@ -22129,7 +22376,9 @@ async def games_maybe_spawn(message):
     _spawn_last_channel[message.channel.id] = now
     _spawn_last_global["ts"] = now
     try:
-        await games_start_guess_round(message.channel)
+        # Fire-and-forget: the icon fetch inside must never stall message
+        # processing (which would cause command timeouts bot-wide).
+        asyncio.create_task(games_start_guess_round(message.channel))
     except Exception as exc:
         print(f"[games] random spawn failed: {exc}")
 
@@ -22154,9 +22403,13 @@ async def games_handle_answer(message):
     games_coin_adjust(message.author.id, 250, "guess_win", meta={"pet": round_info["pet_name"]})
     games_track("guess", message.channel.id, minted=250)
     try:
-        await message.channel.send(
-            f"🎉 **{message.author.mention} got it — {round_info['pet_name']}!** +250 coins",
+        win_embed = discord.Embed(
+            title="\U0001f389 Correct!",
+            description=f"{message.author.mention} got it \u2014 **{round_info['pet_name']}**!",
+            color=discord.Color.green(),
         )
+        win_embed.set_footer(text="+250 coins")
+        await message.channel.send(embed=win_embed)
     except Exception:
         pass
     return True
@@ -22253,11 +22506,14 @@ async def games_hatch(interaction: discord.Interaction, egg: str = None):
     used = await games_hatch_count_today(interaction.user.id)
     free = used < GAMES_HATCH_FREE_PER_DAY
     if not free:
-        ok, res = games_coin_spend(interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name})
-        if not ok:
-            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        if not games_prepaid_consume(interaction.user.id, "hatch"):
+            ok, res = games_coin_spend(interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name})
+            if not ok:
+                return await interaction.followup.send(f"❌ {res}", ephemeral=True)
 
     pet_name, tier = games_hatch_roll(egg_def)
+    # ALWAYS log usage so free hatches can't be farmed
+    games_coin_log_zero(interaction.user.id, "hatch", meta={"egg": egg_name, "free": free})
     tier_meta = {
         "titanic": ("\U0001f30c TITANIC!", (245, 158, 11), 0.5),
         "huge": ("\U0001f4a5 HUGE!", (168, 85, 247), 2.0),
@@ -22343,21 +22599,26 @@ class DuelChallengeView(discord.ui.View):
 
     @discord.ui.button(label="Accept Duel", style=discord.ButtonStyle.success, emoji="\u2694\ufe0f")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Defer FIRST: escrow spends are blocking DB work.
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
         if interaction.user.id != self.target_id:
-            return await interaction.response.send_message("Only the challenged player can accept.", ephemeral=True)
+            return await interaction.followup.send("Only the challenged player can accept.", ephemeral=True)
         duel = ACTIVE_DUELS.get(self.duel_id)
         if not duel or duel["state"] != "pending":
-            return await interaction.response.send_message("That duel is no longer pending.", ephemeral=True)
-        # escrow challenger's wager (target's was escrowed at challenge time? No —
-        # escrow BOTH now for simplicity and refund clarity)
+            return await interaction.followup.send("That duel is no longer pending.", ephemeral=True)
+        # escrow BOTH wagers now (atomic spend each; refunds are idempotent)
         ok1, r1 = games_coin_spend(self.challenger_id, self.wager, "duel_escrow", meta={"duel": self.duel_id})
         if not ok1:
-            await interaction.response.send_message(f"❌ Challenger can't pay: {r1}", ephemeral=True)
+            await interaction.followup.send(f"❌ Challenger can't pay: {r1}", ephemeral=True)
             return
         ok2, r2 = games_coin_spend(self.target_id, self.wager, "duel_escrow", meta={"duel": self.duel_id})
         if not ok2:
             games_coin_adjust(self.challenger_id, self.wager, "duel_refund", meta={"duel": self.duel_id})
-            await interaction.response.send_message(f"❌ You can't pay: {r2}", ephemeral=True)
+            await interaction.followup.send(f"❌ You can't pay: {r2}", ephemeral=True)
             return
         duel["state"] = "active"
         duel["escrowed"] = True
@@ -22367,13 +22628,21 @@ class DuelChallengeView(discord.ui.View):
             conn.commit()
         except Exception:
             pass
-        await interaction.response.edit_message(content="\u2694\ufe0f **DUEL ACCEPTED — good luck both!**", view=None)
+        try:
+            await interaction.edit_original_response(content="\u2694\ufe0f **DUEL ACCEPTED — good luck both!**", view=None)
+        except Exception:
+            await interaction.followup.send("\u2694\ufe0f **DUEL ACCEPTED — good luck both!**", ephemeral=True)
         await start_duel_round(interaction.channel, duel)
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
         if interaction.user.id != self.target_id:
-            return await interaction.response.send_message("Only the challenged player can decline.", ephemeral=True)
+            return await interaction.followup.send("Only the challenged player can decline.", ephemeral=True)
         duel = ACTIVE_DUELS.get(self.duel_id)
         if duel:
             duel["state"] = "declined"
@@ -22383,7 +22652,10 @@ class DuelChallengeView(discord.ui.View):
             conn.commit()
         except Exception:
             pass
-        await interaction.response.edit_message(content="\ud83d\ude45 Duel declined.", view=None)
+        try:
+            await interaction.edit_original_response(content="\ud83d\ude45 Duel declined.", view=None)
+        except Exception:
+            await interaction.followup.send("\ud83d\ude45 Duel declined.", ephemeral=True)
 
 
 async def start_duel_round(channel, duel):
@@ -22510,11 +22782,18 @@ async def games_duel(interaction: discord.Interaction, user: discord.User, wager
         "channel_id": interaction.channel.id,
     }
     view = DuelChallengeView(duel_id, user.id, interaction.user.id, wager, game_type)
-    await interaction.followup.send(
-        f"\u2694\ufe0f {user.mention} — **{interaction.user.display_name}** challenges you to a duel "
-        f"({game_type} round) for **{wager:,}** coins! Accept to lock the wager.",
-        view=view,
+    duel_embed = discord.Embed(
+        title="\u2694\ufe0f Duel Challenge",
+        description=(
+            f"**{interaction.user.mention}** challenges **{user.mention}**!\n\n"
+            f"**Game:** {'\U0001f50d Guess the Pet' if game_type == 'guess' else '\U0001f504 Scramble'} (bot-picked)\n"
+            f"**Wager:** \U0001fa99 **{wager:,}** coins each \u00b7 pot = **{wager * 2:,}**\n\n"
+            "First correct answer takes the pot. Accept to lock your wager!"
+        ),
+        color=discord.Color.from_rgb(248, 113, 113),
     )
+    duel_embed.set_footer(text="Declining is free \u00b7 no answer in 45s = full refund")
+    await interaction.followup.send(embed=duel_embed, view=view)
 
 
 # ---------------- TRIVIA ----------------
@@ -22734,7 +23013,7 @@ async def games_petdle(interaction: discord.Interaction, guess: str = None):
 def games_spin_today(user_id):
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM mcwv_coin_log WHERE target_id = %s AND type IN ('spin_win','spin_nothing','spin_free') AND created_at > NOW() - INTERVAL '24 hours'", (int(user_id),))
+            cur.execute("SELECT COUNT(*) FROM mcwv_coin_log WHERE target_id = %s AND type = 'spin' AND created_at > NOW() - INTERVAL '24 hours'", (int(user_id),))
             return int(cur.fetchone()[0] or 0)
     except Exception:
         return 0
@@ -22751,19 +23030,86 @@ def games_jackpot_set(value):
     db_set_setting(GAMES_SETTING_JACKPOT, str(int(value)))
 
 
-def games_spin_roll():
-    """Returns (label, win_amount, is_jackpot)."""
-    sectors = [
-        ("100 coins", 100), ("250 coins", 250), ("500 coins", 500), ("1000 coins", 1000),
-        ("Free scratch", 0), ("Nothing", 0), ("JACKPOT", 0, True),
+def games_spin_sectors():
+    """(label, fixed_amount, is_jackpot, color) — angles are weight-proportional."""
+    return [
+        ("100 coins", 100, False, (59, 130, 246)),
+        ("250 coins", 250, False, (99, 102, 241)),
+        ("500 coins", 500, False, (168, 85, 247)),
+        ("1,000 coins", 1000, False, (139, 92, 246)),
+        ("Free scratch", 0, False, (14, 165, 233)),
+        ("Nothing", 0, False, (100, 116, 139)),
+        ("JACKPOT", 0, True, (245, 158, 11)),
     ]
-    weights = [30, 22, 12, 6, 10, 19, 1]
-    idx = games_weighted_choice(range(len(sectors)), weights)
-    label = sectors[idx][0]
-    amount = sectors[idx][1]
-    if len(sectors[idx]) > 2:
-        return "JACKPOT", games_jackpot_get(), True
-    return label, amount, False
+
+
+def games_spin_weights():
+    return [30, 22, 12, 6, 10, 19, 1]
+
+
+def games_spin_roll():
+    """Returns (sector_idx, label, amount, is_jackpot)."""
+    idx = games_weighted_choice(range(len(games_spin_sectors())), games_spin_weights())
+    label, amount, is_jackpot, _ = games_spin_sectors()[idx]
+    if is_jackpot:
+        amount = games_jackpot_get()
+    return idx, label, amount, is_jackpot
+
+
+def games_build_wheel_image(win_idx):
+    """Draw the spin wheel with the winning sector at the top pointer."""
+    import math as _math
+    SIZE = 480
+    img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    cx = cy = SIZE // 2
+    R = SIZE // 2 - 18
+    sectors = games_spin_sectors()
+    weights = games_spin_weights()
+    total_w = float(sum(weights))
+    # winning sector mid-angle (degrees, clockwise from 3 o'clock, PIL convention)
+    cum = 0.0
+    win_mid = 0.0
+    angles = []
+    for i, w in enumerate(weights):
+        start = cum
+        sweep = w / total_w * 360.0
+        angles.append((start, sweep))
+        if i == win_idx:
+            win_mid = start + sweep / 2.0
+        cum += sweep
+    rotation = 270.0 - win_mid  # top = 270 deg in PIL clockwise convention
+    for i, (start, sweep) in enumerate(angles):
+        _, _, _, color = sectors[i]
+        a0 = start + rotation
+        a1 = a0 + sweep
+        d.pieslice((cx - R, cy - R, cx + R, cy + R), a0, a1, fill=color, outline=(9, 9, 14, 255))
+    # labels (rotated)
+    try:
+        label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    except Exception:
+        label_font = ImageFont.load_default()
+    for i, (start, sweep) in enumerate(angles):
+        label = sectors[i][0]
+        if i == win_idx and sectors[i][2]:
+            label = "JACKPOT!"
+        mid = start + sweep / 2.0 + rotation
+        rad = _math.radians(mid)
+        lx = cx + _math.cos(rad) * R * 0.62
+        ly = cy + _math.sin(rad) * R * 0.62
+        txt = Image.new("RGBA", (150, 40), (0, 0, 0, 0))
+        ImageDraw.Draw(txt).text((4, 8), label, font=label_font, fill=(255, 255, 255, 255))
+        txt = txt.rotate(-(mid - 90.0), expand=True, resample=Image.Resampling.BICUBIC)
+        img.alpha_composite(txt, (int(lx - txt.width / 2), int(ly - txt.height / 2)))
+    # center hub
+    d.ellipse((cx - 26, cy - 26, cx + 26, cy + 26), fill=(15, 17, 30, 255), outline=(255, 255, 255, 120))
+    # pointer (triangle at top)
+    px, py = cx, 14
+    d.polygon([(px, py), (px - 16, py + 26), (px + 16, py + 26)], fill=(245, 158, 11, 255), outline=(255, 255, 255, 200))
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
 
 
 @bot.tree.command(name="spin", description="Spin the wheel once a day — progressive jackpot!", guild=guild_obj)
@@ -22774,31 +23120,42 @@ async def games_spin(interaction: discord.Interaction):
     spins = games_spin_today(interaction.user.id)
     free = spins < 1
     if not free:
-        ok, res = games_coin_spend(interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra")
-        if not ok:
-            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        if not games_prepaid_consume(interaction.user.id, "spin"):
+            ok, res = games_coin_spend(interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra")
+            if not ok:
+                return await interaction.followup.send(f"❌ {res}", ephemeral=True)
 
-    label, amount, is_jackpot = games_spin_roll()
+    # ALWAYS log usage so the free spin can't be farmed on zero-prize outcomes
+    games_coin_log_zero(interaction.user.id, "spin", meta={"free": free})
+
+    idx, label, amount, is_jackpot = games_spin_roll()
     jackpot = games_jackpot_get()
     jackpot_inc = secrets.randbelow(41) + 10  # jackpot grows 10-50 per spin
-    embed = discord.Embed(title="🎡 Spin the Wheel", color=discord.Color.from_rgb(108, 34, 245))
+    wheel_buf = games_build_wheel_image(idx)
+
+    embed = discord.Embed(title="\U0001f3a1 Spin the Wheel", color=discord.Color.from_rgb(108, 34, 245))
     if is_jackpot:
         games_coin_adjust(interaction.user.id, amount, "spin_jackpot", meta={"amount": amount})
         games_jackpot_set(int(db_get_setting(GAMES_SETTING_JACKPOT_SEED, "5000")))
         games_track("spin", interaction.channel.id, minted=amount)
-        embed.description = f"🎰 **JACKPOT!** {interaction.user.mention} wins the whole **{amount:,}** coin jackpot!"
+        embed.description = f"\U0001f3b0 **JACKPOT!** {interaction.user.mention} wins the whole **{amount:,}** coin jackpot!"
     elif amount > 0:
         games_coin_adjust(interaction.user.id, amount, "spin_win", meta={"amount": amount})
         games_jackpot_set(jackpot + jackpot_inc)
         games_track("spin", interaction.channel.id, minted=amount)
-        embed.description = f"✨ You landed on **{label}** — +{amount:,} coins!"
+        embed.description = f"\u2728 You landed on **{label}** \u2014 **+{amount:,}** coins!"
     else:
         games_jackpot_set(jackpot + jackpot_inc)
         games_track("spin", interaction.channel.id)
-        embed.description = f"You landed on **{label}** — better luck tomorrow!"
-    embed.add_field(name="Progressive Jackpot", value=f"**{games_jackpot_get():,}** coins", inline=False)
-    embed.set_footer(text="1 free spin per day (24h rolling) · extra spins from /shop")
-    await interaction.followup.send(embed=embed, ephemeral=not is_jackpot)
+        embed.description = f"You landed on **{label}** \u2014 better luck tomorrow!"
+    embed.add_field(name="\U0001f3b0 Progressive Jackpot", value=f"**{games_jackpot_get():,}** coins", inline=True)
+    embed.add_field(name="\U0001f5d3 Spins today", value=f"{spins + 1} used", inline=True)
+    embed.set_footer(text="1 free spin per day (24h rolling) \u00b7 extra spins from /shop")
+    await interaction.followup.send(
+        embed=embed,
+        file=discord.File(wheel_buf, filename="wheel.png") if wheel_buf else None,
+        ephemeral=not is_jackpot,
+    )
 
 
 # ---------------- SCRATCH ----------------
@@ -22811,9 +23168,11 @@ async def games_scratch(interaction: discord.Interaction):
     # 1 free daily
     used = games_scratch_today(interaction.user.id)
     if used >= 1:
-        ok, res = games_coin_spend(interaction.user.id, 100, "scratch_extra")
-        if not ok:
-            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        if not games_prepaid_consume(interaction.user.id, "scratch"):
+            ok, res = games_coin_spend(interaction.user.id, 100, "scratch_extra")
+            if not ok:
+                return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+    games_coin_log_zero(interaction.user.id, "scratch", meta={"free": used < 1})
     pool = [p for p in GAMES_PET_SEED]
     tier_weights = []
     for p in pool:
@@ -22852,7 +23211,7 @@ async def games_scratch(interaction: discord.Interaction):
 def games_scratch_today(user_id):
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM mcwv_coin_log WHERE target_id = %s AND type IN ('scratch_win','scratch_extra') AND created_at > NOW() - INTERVAL '24 hours'", (int(user_id),))
+            cur.execute("SELECT COUNT(*) FROM mcwv_coin_log WHERE target_id = %s AND type = 'scratch' AND created_at > NOW() - INTERVAL '24 hours'", (int(user_id),))
             return int(cur.fetchone()[0] or 0)
     except Exception:
         return 0
@@ -22982,7 +23341,7 @@ async def games_bingo_mark_all():
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         return
-    try:
+    def _mark(battle_id_str):
         ctx = {"rank": None, "points": 0, "top_member_points": 0, "scorers": 0, "progress_pct": 0, "hours_left": 999}
         st = get_battles_war_state()
         if st and st.get("finish"):
@@ -22991,7 +23350,7 @@ async def games_bingo_mark_all():
                 ctx["hours_left"] = (st["finish"] - now) / 3600.0
         # MCWV latest snapshot
         with conn.cursor() as cur:
-            cur.execute("SELECT rank, battle_points, progress_percent FROM war_snapshots WHERE clan_name = %s AND battle_id = %s ORDER BY captured_at DESC LIMIT 1", (CLAN_NAME, str(battle_id)))
+            cur.execute("SELECT rank, battle_points, progress_percent FROM war_snapshots WHERE clan_name = %s AND battle_id = %s ORDER BY captured_at DESC LIMIT 1", (CLAN_NAME, battle_id_str))
             row = cur.fetchone()
             if row:
                 ctx["rank"] = int(row[0] or 0)
@@ -23000,11 +23359,11 @@ async def games_bingo_mark_all():
                     ctx["progress_pct"] = float(row[2] or 0)
                 except Exception:
                     pass
-            cur.execute("SELECT COALESCE(MAX(points),0) FROM player_leaderboard_history WHERE battle_id = lower(%s)", (str(battle_id),))
+            cur.execute("SELECT COALESCE(MAX(points),0) FROM player_leaderboard_history WHERE battle_id = lower(%s)", (battle_id_str,))
             ctx["top_member_points"] = int(cur.fetchone()[0] or 0)
-            cur.execute("SELECT COUNT(*) FROM player_leaderboard_history WHERE battle_id = lower(%s) AND points > 0", (str(battle_id),))
+            cur.execute("SELECT COUNT(*) FROM player_leaderboard_history WHERE battle_id = lower(%s) AND points > 0", (battle_id_str,))
             ctx["scorers"] = int(cur.fetchone()[0] or 0)
-            cur.execute("SELECT id, discord_id, card, marked FROM mcwv_bingo_cards WHERE battle_id = %s", (str(battle_id),))
+            cur.execute("SELECT id, discord_id, card, marked FROM mcwv_bingo_cards WHERE battle_id = %s", (battle_id_str,))
             cards = cur.fetchall()
         updates = []
         for cid, uid, card_json, marked_json in cards:
@@ -23017,10 +23376,14 @@ async def games_bingo_mark_all():
                     new_marked.add(i)
             if new_marked != set(marked):
                 updates.append((json.dumps(sorted(new_marked)), cid))
-        with conn.cursor() as cur:
-            for marked_json, cid in updates:
-                cur.execute("UPDATE mcwv_bingo_cards SET marked = %s::jsonb WHERE id = %s", (marked_json, cid))
-        conn.commit()
+        if updates:
+            with conn.cursor() as cur:
+                for marked_json, cid in updates:
+                    cur.execute("UPDATE mcwv_bingo_cards SET marked = %s::jsonb WHERE id = %s", (marked_json, cid))
+            conn.commit()
+
+    try:
+        await asyncio.to_thread(_mark, str(battle_id))
     except Exception as exc:
         try:
             conn.rollback()
@@ -23234,48 +23597,92 @@ async def games_housekeeping_loop():
     try:
         if not DATABASE_URL or conn is None or conn.closed != 0:
             return
-        # 1. Expire stale rounds / duels / sessions
+        # 1. Expire stale rounds / duels / sessions (reveal answers on timeout)
         now = time.time()
         for ch, r in list(ACTIVE_GUESS_ROUNDS.items()):
             if now - float(r["started"]) > GAMES_ROUND_TIMEOUT:
                 ACTIVE_GUESS_ROUNDS.pop(ch, None)
+                try:
+                    channel = bot.get_channel(int(ch))
+                    if channel:
+                        await channel.send(f"\u23f0 Time's up! It was **{r.get('pet_name', '?')}**.")
+                except Exception:
+                    pass
         for ch, s in list(ACTIVE_SCRAMBLE.items()):
             if now - float(s["started"]) > GAMES_ROUND_TIMEOUT:
                 ACTIVE_SCRAMBLE.pop(ch, None)
+                try:
+                    channel = bot.get_channel(int(ch))
+                    if channel:
+                        await channel.send(f"\u23f0 Time's up! The word was **{s.get('answer', '?')}**.")
+                except Exception:
+                    pass
+        for ch, g in list(ACTIVE_HANGMAN.items()):
+            if now - float(g["started"]) > 300:
+                ACTIVE_HANGMAN.pop(ch, None)
+                try:
+                    channel = bot.get_channel(int(ch))
+                    if channel:
+                        await channel.send(f"\u23f0 Hangman expired — it was **{g.get('word', '?')}**.")
+                except Exception:
+                    pass
+        # expire stale pending duels (DB + memory)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE mcwv_duels SET state = 'expired' WHERE state = 'pending' AND created_at < NOW() - INTERVAL '5 minutes' RETURNING id")
+                expired = [int(r[0]) for r in cur.fetchall()]
+            conn.commit()
+            for duel_id in expired:
+                ACTIVE_DUELS.pop(duel_id, None)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(f"[games] duel expiry failed: {exc}")
         for uid, s in list(ACTIVE_TOWER.items()):
             if now - float(s.get("started", now)) > 600 and not s.get("active"):
                 ACTIVE_TOWER.pop(uid, None)
-        # 2. Daily interest tick (1%/day, capped, integer math)
+        # 2. Daily interest tick (1%/day, capped, integer math) — in a thread so
+        #    it can never stall commands.
         rate = int(db_get_setting(GAMES_SETTING_INTEREST_RATE, str(GAMES_INTEREST_RATE_PCT_DEFAULT)) or 0)
         cap = int(db_get_setting(GAMES_SETTING_INTEREST_CAP, str(GAMES_INTEREST_CAP_DEFAULT)) or 0)
-        if rate > 0:
+
+        def _interest_tick():
+            if rate <= 0:
+                return
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE mcwv_coins
+                    SET bank = bank + (LEAST(bank, %s) * %s / 100),
+                        last_interest_at = NOW()
+                    WHERE bank > 0
+                      AND (last_interest_at IS NULL OR last_interest_at < NOW() - INTERVAL '24 hours')
+                    RETURNING discord_id, bank
+                """, (cap, rate))
+                rows = cur.fetchall()
+                for uid, new_bank in rows:
+                    cur.execute(
+                        "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) VALUES (%s,%s,'interest',0,%s,%s::jsonb)",
+                        (uid, uid, int(new_bank), json.dumps({"bank_after": int(new_bank)})))
+            conn.commit()
+            if rows:
+                print(f"[games] interest ticked for {len(rows)} members")
+
+        try:
+            await asyncio.to_thread(_interest_tick)
+        except Exception as exc:
             try:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE mcwv_coins
-                        SET bank = bank + (LEAST(bank, %s) * %s / 100),
-                            last_interest_at = NOW()
-                        WHERE bank > 0
-                          AND (last_interest_at IS NULL OR last_interest_at < NOW() - INTERVAL '24 hours')
-                        RETURNING discord_id, bank
-                    """, (cap, rate))
-                    rows = cur.fetchall()
-                    for uid, new_bank in rows:
-                        cur.execute(
-                            "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) VALUES (%s,%s,'interest',0,%s,%s::jsonb)",
-                            (uid, uid, int(new_bank), json.dumps({"bank_after": int(new_bank)})))
-                conn.commit()
-                if rows:
-                    print(f"[games] interest ticked for {len(rows)} members")
-            except Exception as exc:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                print(f"[games] interest tick failed: {exc}")
+                conn.rollback()
+            except Exception:
+                pass
+            print(f"[games] interest tick failed: {exc}")
         # 3. Bingo marking (every 5 min only)
         if int(time.time()) % 300 < 60:
-            await games_bingo_mark_all()
+            try:
+                await games_bingo_mark_all()
+            except Exception as exc:
+                print(f"[games] bingo marking failed: {exc}")
         # 4. Lottery auto-draw (Sunday 20:00 UTC window)
         now_dt = datetime.now(timezone.utc)
         if now_dt.weekday() == 6 and now_dt.hour == 20 and now_dt.minute == 0:
