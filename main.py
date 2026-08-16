@@ -11798,43 +11798,30 @@ async def gather_search_data(roblox_id, roblox_name):
 
 
 def build_search_embed(data):
+    """CW-style: a single line per field, clean and scannable."""
     embed = discord.Embed(
-        title="🔍 Global Search Results",
+        title="Global Search Results",
         color=discord.Color.from_rgb(108, 34, 245),
-        timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="👤 Name", value=str(data.get("roblox_name") or "?"), inline=True)
-    embed.add_field(name="🏰 Clan", value=str(data.get("clan_name") or "—"), inline=True)
+
+    lines = []
+    lines.append(f"\U0001f9d1 **Name:** {data.get('roblox_name') or '?'}")
+    lines.append(f"\U0001f3f0 **Clan:** {data.get('clan_name') or '\u2014'}")
     clan_rank = data.get("clan_rank")
     clan_size = data.get("clan_size")
-    embed.add_field(
-        name="🔰 Clan Rank",
-        value=f"{clan_rank}/{clan_size}" if clan_rank and clan_size else "—",
-        inline=True,
-    )
-    embed.add_field(name="🎉 Event", value=str(data.get("battle_name") or data.get("battle_id") or "—"), inline=True)
+    lines.append(f"\U0001f530 **Clan Rank:** {clan_rank}/{clan_size}" if clan_rank and clan_size else "\U0001f530 **Clan Rank:** \u2014")
+    lines.append("")
+    lines.append(f"\U0001f389 **Event:** {data.get('battle_name') or data.get('battle_id') or '\u2014'}")
     stars = data.get("stars")
-    embed.add_field(name="🌟 Stars", value=(f"{fmt_search_points(stars)} ⭐" if stars is not None else "—"), inline=True)
-    placement_parts = []
-    if data.get("clan_place"):
-        placement_parts.append(f"Clan #{data['clan_place']}")
-    if data.get("earned_medal"):
-        placement_parts.append("🏅 medal")
-    embed.add_field(name="🎖 Placement", value=" · ".join(placement_parts) if placement_parts else "—", inline=True)
+    lines.append(f"\U0001f31f **Stars:** {fmt_search_points(stars)} \u2b50" if stars is not None else "\U0001f31f **Stars:** \u2014")
 
     if data.get("global_rank") and data.get("global_total"):
-        embed.add_field(
-            name="🏆 Global Rank",
-            value=f"#{data['global_rank']:,} of {fmt_search_points(data['global_total'])}",
-            inline=True,
-        )
+        lines.append(f"\U0001f3c6 **Global Rank:** #{data['global_rank']} of {fmt_search_points(data['global_total'])}")
         if data.get("better_pct") is not None:
             better = data["better_pct"]
-            embed.add_field(
-                name="💠 Percentile",
-                value=f"Better than {better:.2f}% of players; {100 - better:.2f}% are better",
-                inline=True,
-            )
+            lines.append(f"\U0001f4a0 **Better than {better:.2f}% of players; {100 - better:.2f}% are better**")
+
+    embed.description = "\n".join(lines)
 
     if data.get("avatar_url"):
         embed.set_thumbnail(url=data["avatar_url"])
@@ -11908,14 +11895,7 @@ async def build_search_card(data):
         """Frosty glass panel: real backdrop blur of the galaxy background,
         translucent white frost, crisp border and a top highlight line."""
         x1, y1, x2, y2 = box
-        # soft drop shadow
-        sh = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
-        ImageDraw.Draw(sh).rounded_rectangle(
-            (x1 + sc(3), y1 + sc(5), x2 + sc(3), y2 + sc(5)),
-            radius=sc(radius), fill=(0, 0, 0, 70),
-        )
-        img.alpha_composite(sh)
-        # backdrop blur: crop the panel area from the raw galaxy bg and blur it
+        # backdrop blur: crop the panel area from the darkened galaxy bg and blur it
         try:
             bx1, by1 = max(x1 - sc(6), 0), max(y1 - sc(6), 0)
             bx2, by2 = min(x2 + sc(6), W * S), min(y2 + sc(6), H * S)
@@ -11927,6 +11907,13 @@ async def build_search_card(data):
             img.paste(crop, (bx1, by1), pmask)
         except Exception:
             pass
+        # soft drop shadow (composited AFTER the blur so it actually shows)
+        sh = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        ImageDraw.Draw(sh).rounded_rectangle(
+            (x1 + sc(3), y1 + sc(6), x2 + sc(3), y2 + sc(6)),
+            radius=sc(radius), fill=(0, 0, 0, 80),
+        )
+        img.alpha_composite(sh)
         # translucent frost fill + border (layer-composited so alpha blends)
         frost = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
         fd = ImageDraw.Draw(frost)
@@ -11987,14 +11974,29 @@ async def build_search_card(data):
         subtitle += f"  •  {data['battle_name']}"
     d.text((name_x, sc(82)), subtitle[:50], font=F["sub"], fill=GRAY)
 
-    # Right-side chips: clan placement + medal
+    # Right-side chips: stars, global rank, clan placement, medal
+    header_chips = []
+    if data.get("stars") is not None:
+        header_chips.append((f"⭐ {fmt_search_points(data['stars'])}", AMBER))
+    if data.get("global_rank"):
+        header_chips.append((f"GLOBAL #{data['global_rank']:,}", PURPLE))
+    if data.get("clan_place"):
+        header_chips.append((f"CLAN #{data['clan_place']}", BLUE))
+    if data.get("earned_medal"):
+        header_chips.append(("MEDAL", AMBER))
     chip_x = M + CONTENT - sc(16)
     chip_y = sc(42)
-    if data.get("clan_place"):
-        chip(f"CLAN #{data['clan_place']}", BLUE, chip_x, chip_y)
-        chip_x -= d.textlength(f"CLAN #{data['clan_place']}", font=F["chip"]) + sc(30)
-    if data.get("earned_medal"):
-        chip("MEDAL", AMBER, chip_x, chip_y)
+    for text, color in header_chips:
+        chip(text, color, chip_x, chip_y)
+        chip_x -= d.textlength(text, font=F["chip"]) + sc(34)
+
+    # Avatar halo (soft purple glow behind the avatar)
+    halo = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+    ImageDraw.Draw(halo).rounded_rectangle(
+        (av_x - sc(8), sc(40) - sc(8), av_x + sc(64) + sc(8), sc(40) + sc(64) + sc(8)),
+        radius=sc(20), fill=(140, 90, 255, 55),
+    )
+    img.alpha_composite(halo)
 
     # ================= METRIC CARDS =================
     hourly = data.get("hourly") or []
@@ -12019,6 +12021,10 @@ async def build_search_card(data):
         x = M + i * (card_w + gap)
         glass((x, card_y, x + card_w, card_y + card_h), radius=16, fill_a=16, border_a=50)
         d.text((x + sc(14), card_y + sc(12)), label, font=F["label"], fill=SLATE)
+        # value with soft shadow for depth (layer-composited so alpha blends)
+        vsh = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        ImageDraw.Draw(vsh).text((x + sc(15), card_y + sc(31)), value, font=F["metric"], fill=(0, 0, 0, 160))
+        img.alpha_composite(vsh)
         d.text((x + sc(14), card_y + sc(30)), value, font=F["metric"], fill=color)
         # small colored tick on the card's left edge
         d.line((x + sc(14), card_y + sc(58), x + sc(14) + sc(20), card_y + sc(58)), fill=(*color[:3], 140), width=sc(3))
@@ -12028,11 +12034,14 @@ async def build_search_card(data):
     chart_h = sc(214)
     glass((M, chart_y, M + CONTENT, chart_y + chart_h), radius=20, fill_a=14, border_a=50)
 
-    cx1 = M + sc(20)
+    cx1 = M + sc(84)
     cy1 = chart_y + sc(46)
-    cx2 = M + CONTENT - sc(20)
+    cx2 = M + CONTENT - sc(26)
     cy2 = chart_y + chart_h - sc(34)
 
+    tsh = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+    ImageDraw.Draw(tsh).text((cx1 + sc(1), chart_y + sc(15)), "POINTS / HOUR", font=F["chart_title"], fill=(0, 0, 0, 170))
+    img.alpha_composite(tsh)
     d.text((cx1, chart_y + sc(14)), "POINTS / HOUR", font=F["chart_title"], fill=PURPLE)
     d.text((cx2, chart_y + sc(16)), "LAST 24 HOURS", font=F["muted"], fill=SLATE, anchor="ra")
 
