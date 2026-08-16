@@ -3631,6 +3631,11 @@ def init_db_schema():
             init_giveaway_tables()
         except Exception as exc:
             print("Event table init failed:", exc)
+        # Games & economy tables
+        try:
+            init_games_tables()
+        except Exception as exc:
+            print("Games table init failed:", exc)
         print("DB tables ready")
     except Exception as e:
         print("DB schema init failed:", e)
@@ -20801,6 +20806,10 @@ def start_bot_loops():
     if not db_keeper_loop.is_running():
         db_keeper_loop.start()
 
+    # ---------------- GAMES HOUSEKEEPING LOOP ----------------
+    if not games_housekeeping_loop.is_running():
+        games_housekeeping_loop.start()
+
     # ---------------- WAR CACHE WINDOW LOOP ----------------
     if not war_cache_window_loop.is_running():
         war_cache_window_loop.start()
@@ -20854,6 +20863,7 @@ ALL_LOOPS = [
     ("Giveaway", "check_giveaway_event"),
     ("DB Keeper", "db_keeper_loop"),
     ("War Cache", "war_cache_window_loop"),
+    ("Games Housekeeping", "games_housekeeping_loop"),
 ]
 
 
@@ -21109,6 +21119,2210 @@ async def setwartime_cmd(interaction: discord.Interaction, battle_id: str, start
         f"ℹ️ The API will no longer overwrite these. Reset from the Hub admin or edit again.",
         ephemeral=True,
     )
+
+
+# ---------------- MCWV GAMES & ECONOMY (TESTING) ----------------
+# Stage-gated: games are hidden until the owner flips games_enabled on.
+# Allowed during testing: owner (infinite balance) + listed testers.
+
+GAMES_SETTING_ENABLED = "games_enabled"
+GAMES_SETTING_SPAWN_CHANCE = "games_spawn_chance"       # percent, e.g. "1" = 1%
+GAMES_SETTING_SPAWN_CHANNELS = "games_spawn_channels"   # JSON list of channel ids
+GAMES_SETTING_JACKPOT = "games_jackpot"
+GAMES_SETTING_JACKPOT_SEED = "games_jackpot_seed"
+GAMES_SETTING_LOTTERY_POOL = "games_lottery_pool"
+GAMES_SETTING_LOTTERY_END = "games_lottery_end_ts"
+GAMES_SETTING_INTEREST_RATE = "games_interest_rate_pct"
+GAMES_SETTING_INTEREST_CAP = "games_interest_cap"
+
+GAMES_DEFAULT_CHANCE_PCT = 1
+GAMES_SPAWN_CHANNEL_COOLDOWN = 300      # seconds between spawns in one channel
+GAMES_SPAWN_GLOBAL_COOLDOWN = 1200      # seconds between spawns server-wide (3/hr)
+GAMES_ROUND_TIMEOUT = 120               # seconds a guess round lives
+GAMES_DUEL_TIMEOUT = 45                 # seconds to answer a duel round
+GAMES_INTEREST_RATE_PCT_DEFAULT = 1     # 1% per day
+GAMES_INTEREST_CAP_DEFAULT = 100000     # interest only on first 100k banked
+GAMES_DAILY_BASE = 100
+GAMES_DAILY_STREAK_BONUS = 10
+GAMES_HATCH_FREE_PER_DAY = 3
+GAMES_HATCH_COST = 100
+GAMES_SPIN_COST_EXTRA = 250
+GAMES_LOTTERY_TICKET_COST = 50
+GAMES_PAY_MIN = 10
+GAMES_MAX_ANSWER_ATTEMPTS = 8           # guesses per round per user
+
+# Rarity odds (fun-first, locked): titanic 0.5, huge 2, exclusive 6, epic 15, rare 25, common rest
+GAMES_HATCH_TIERS = (
+    ("titanic", 0.5),
+    ("huge", 2.0),
+    ("exclusive", 6.0),
+    ("epic", 15.0),
+    ("rare", 25.0),
+    ("common", None),  # remainder
+)
+
+# Real pet seed (name -> rbxassetid), harvested from public db.biggames.io pages.
+# The daily item sync can extend this later.
+GAMES_PET_SEED = {
+    "Huge Basket Bunny": "75145545226238",
+    "Huge Blurred Axolotl": "89262001520583",
+    "Huge Corrupt Butterfly": "18882974863",
+    "Huge Leprechaun Kitsune": "100650487607408",
+    "Huge Lucki Angelus": "139803624702732",
+    "Huge Mining Monkey": "104634632776696",
+    "Huge Player Fox": "101605254258375",
+    "Huge Rogue Squid": "82176106497018",
+    "Huge Shuriken Corgi": "18978050941",
+    "Huge Temporal Owl": "18882992626",
+    "Titanic Angry Yeti": "131125477985744",
+    "Titanic Arcane Halo Cat": "131125477985744",
+    "Titanic Arcane Void Cat": "131125477985744",
+    "Titanic Axolotl": "131125477985744",
+    "Titanic Bread Shiba": "131125477985744",
+    "Titanic Calico Cat": "131125477985744",
+    "Titanic Captain Octopus": "131125477985744",
+    "Titanic Cheerful Yeti": "131125477985744",
+    "Titanic Chest Mimic": "131125477985744",
+    "Titanic Clover Butterfly": "131125477985744",
+    "Titanic Disco Ball Agony": "131125477985744",
+    "Titanic Dot Matrix Kitsune": "131125477985744",
+    "Titanic Helicopter Corgi": "131125477985744",
+    "Titanic Irish Wolfhound": "125815340060379",
+    "Titanic Lucki Chest Mimic": "82078892883300",
+    "Titanic Mucki": "131125477985744",
+    "Titanic Nyan Cat": "131125477985744",
+    "Titanic Pink Lucky Block": "131125477985744",
+    "Titanic Prickly Panda": "131125477985744",
+    "Titanic Sandcastle Kraken": "90627425215733",
+    "Titanic Smiley Penguin": "131125477985744",
+    "Titanic Super Coral Stingray": "131125477985744",
+    "Gargantuan Capybara": "131125477985744",
+    "Gargantuan Fluffy Cat": "131125477985744",
+}
+
+GAMES_EGG_SEED = [
+    {
+        "name": "Clan Egg",
+        "emoji": "\U0001f95a",
+        "description": "The MCWV test egg — full rarity ladder.",
+        "tiers": [
+            ("titanic", 0.5, [n for n in GAMES_PET_SEED if n.startswith("Titanic")]),
+            ("huge", 2.0, [n for n in GAMES_PET_SEED if n.startswith("Huge") or n.startswith("Gargantuan")]),
+            ("exclusive", 6.0, ["Exclusive Dragon", "Exclusive Phoenix"]),
+            ("epic", 15.0, ["Epic Unicorn", "Epic Griffin"]),
+            ("rare", 25.0, ["Rare Fox", "Rare Panda"]),
+            ("common", None, ["Clan Kitten", "Clan Puppy", "Clan Bird"]),
+        ],
+    },
+]
+
+GAMES_TRIVIA_SEED = [
+    ("How many Huges can you hatch from the Clan Egg test pool?", ["5", "10", "11", "20"], 2),
+    ("What is the strongest pet rarity in PS99?", ["Huge", "Exclusive", "Titanic", "Gargantuan"], 3),
+    ("Which of these is a real PS99 Titanic?", ["Titanic Nyan Cat", "Titanic Mega Dog", "Titanic Ultra Cat", "Titanic Bob"], 0),
+    ("What does RAP stand for?", ["Recent Average Price", "Rare Active Pets", "Random Auction Price", "Rapid Auction Points"], 0),
+    ("Which battle did MCWV finish #24 in?", ["Ninja Battle 2026", "Gummy Battle 2026", "Lunar Battle 2026", "Soccer Battle 2026"], 0),
+    ("What's the fun hatch rate for a Titanic in the Clan Egg?", ["0.05%", "0.5%", "5%", "50%"], 1),
+    ("What currency do clan war games use?", ["Coins", "Gems", "Diamonds", "Stars"], 0),
+    ("Which pet starts with 'Gargantuan'?", ["Capybara", "Cat", "Dog", "Dragon"], 0),
+    ("How many free hatches do you get per day?", ["1", "2", "3", "5"], 2),
+    ("Where do rare hatch announcements go?", ["Nowhere", "The channel it was won in", "DMs", "Voice"], 1),
+    ("What do you spend coins on in the shop?", ["Cases and game items", "Server roles", "Real money", "War points"], 0),
+    ("How long is a /daily streak gap before it resets?", ["24 hours", "48 hours", "1 week", "Never"], 1),
+]
+
+# ---------------- GATE + TESTERS ----------------
+
+def games_enabled():
+    return str(db_get_setting(GAMES_SETTING_ENABLED, "0")) == "1"
+
+
+def games_owner_check(member):
+    """Owner = guild owner OR owner-role in the users table."""
+    if member is None:
+        return False
+    g = getattr(member, "guild", None)
+    if g is not None and g.owner_id == member.id:
+        return True
+    return db_is_owner_discord(member.id)
+
+
+def games_is_tester(user_id):
+    try:
+        if not db_enabled():
+            return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM mcwv_game_testers WHERE discord_id = %s", (int(user_id),))
+            return cur.fetchone() is not None
+    except Exception as exc:
+        print(f"[games] tester check failed: {exc}")
+        return False
+
+
+def games_gate_allowed(interaction):
+    """True when the user may use games (public on, or owner/tester during testing)."""
+    if games_enabled():
+        return True
+    user = interaction.user
+    if games_owner_check(user if isinstance(user, discord.Member) else None):
+        return True
+    if isinstance(user, discord.Member) and user.guild is not None and user.guild.owner_id == user.id:
+        return True
+    return games_is_tester(user.id)
+
+
+def games_is_unlimited(user_id):
+    """Owner always has unlimited balance for testing; others need the flag."""
+    if db_is_owner_discord(user_id):
+        return True
+    try:
+        if not db_enabled():
+            return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT is_unlimited FROM mcwv_coins WHERE discord_id = %s", (int(user_id),))
+            row = cur.fetchone()
+            return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def games_gate_message(user_id):
+    if games_enabled():
+        return True
+    if db_is_owner_discord(user_id):
+        return True
+    return games_is_tester(user_id)
+
+
+# ---------------- COIN ENGINE (integer + atomic) ----------------
+
+def games_coin_adjust(target_id, amount, kind, actor_id=None, meta=None):
+    """Atomic balance change. Returns (ok, new_balance_or_error)."""
+    if not db_enabled():
+        return False, "Database is not available."
+    amount = int(amount)
+    target_id = int(target_id)
+    if amount == 0:
+        return True, 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING",
+                (target_id,),
+            )
+            cur.execute(
+                "UPDATE mcwv_coins SET balance = balance + %s WHERE discord_id = %s AND balance + %s >= 0 RETURNING balance",
+                (amount, target_id, amount),
+            )
+            row = cur.fetchone()
+            if row is None:
+                conn.rollback()
+                return False, "Not enough coins."
+            new_balance = int(row[0])
+            cur.execute(
+                """INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta)
+                   VALUES (%s, %s, %s, %s, %s, %s::jsonb)""",
+                (int(actor_id) if actor_id else target_id, target_id, str(kind)[:40], amount, new_balance,
+                 json.dumps(meta or {})),
+            )
+            if amount > 0:
+                cur.execute(
+                    "UPDATE mcwv_coins SET total_earned = total_earned + %s WHERE discord_id = %s",
+                    (amount, target_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE mcwv_coins SET total_spent = total_spent + %s WHERE discord_id = %s",
+                    (-amount, target_id),
+                )
+        conn.commit()
+        return True, new_balance
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[games] coin_adjust error: {exc}")
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def games_coin_spend(user_id, amount, kind, actor_id=None, meta=None):
+    """Spend coins; unlimited users skip the deduction but still log (type gets '_test' suffix)."""
+    user_id = int(user_id)
+    if games_is_unlimited(user_id):
+        return games_coin_log_test(user_id, amount, kind, meta)
+    return games_coin_adjust(user_id, -int(amount), kind, actor_id=actor_id, meta=meta)
+
+
+def games_coin_log_test(user_id, amount, kind, meta=None):
+    try:
+        if not db_enabled():
+            return False, "Database is not available."
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING",
+                (int(user_id),),
+            )
+            cur.execute(
+                """INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta)
+                   VALUES (%s, %s, %s, 0, (SELECT balance FROM mcwv_coins WHERE discord_id = %s), %s::jsonb)""",
+                (int(user_id), int(user_id), f"{kind}_test"[:40], int(user_id), json.dumps(meta or {"test": True})),
+            )
+        conn.commit()
+        return True, 0
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def games_coin_balance(user_id):
+    try:
+        if not db_enabled():
+            return {"balance": 0, "bank": 0}
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING",
+                (int(user_id),),
+            )
+            cur.execute("SELECT balance, bank FROM mcwv_coins WHERE discord_id = %s", (int(user_id),))
+            row = cur.fetchone()
+            return {"balance": int(row[0] or 0), "bank": int(row[1] or 0)}
+    except Exception as exc:
+        print(f"[games] balance fetch failed: {exc}")
+        return {"balance": 0, "bank": 0}
+
+
+# ---------------- GAME RNG + NAMES ----------------
+
+def games_roll_chance(pct):
+    """True with pct% probability using crypto-grade RNG."""
+    pct = max(0.0, min(100.0, float(pct)))
+    return secrets.randbelow(1000000) < int(pct * 10000)
+
+
+def games_weighted_choice(items, weights):
+    total = sum(weights)
+    if total <= 0:
+        return items[0] if items else None
+    roll = secrets.randbelow(int(total * 10000))
+    acc = 0
+    for item, w in zip(items, weights):
+        acc += int(w * 10000)
+        if roll < acc:
+            return item
+    return items[-1]
+
+
+def normalize_answer(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def games_answers_match(raw_answer, pet_name):
+    ans = normalize_answer(raw_answer)
+    name = normalize_answer(pet_name)
+    if not ans or not name:
+        return False
+    if ans == name:
+        return True
+    # allow dropping leading "the"
+    if name.startswith("the") and ans == name[3:]:
+        return True
+    if ans.startswith("the") and name == ans[3:]:
+        return True
+    return False
+
+
+def games_safe_name(pet_name):
+    """Display name for round messages."""
+    return str(pet_name or "")[:60]
+
+
+# ---------------- ACTIVE ROUNDS + DUELS + SESSIONS (memory) ----------------
+
+ACTIVE_GUESS_ROUNDS = {}      # channel_id -> round dict
+ACTIVE_DUELS = {}             # duel_id -> duel dict (persisted in mcwv_duels too)
+ACTIVE_TRIVIA = {}            # user_id -> trivia session
+ACTIVE_HANGMAN = {}           # channel_id -> hangman session
+ACTIVE_SCRAMBLE = {}          # channel_id -> scramble round
+ACTIVE_TOWER = {}             # user_id -> tower session
+_spawn_last_channel = {}
+_spawn_last_global = {"ts": 0.0}
+
+
+def games_track(game, channel_id, sessions=1, minted=0, burned=0):
+    try:
+        if not db_enabled():
+            return
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_game_stats (game, sessions, coins_minted, coins_burned, last_played)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (game) DO UPDATE SET
+                    sessions = mcwv_game_stats.sessions + EXCLUDED.sessions,
+                    coins_minted = mcwv_game_stats.coins_minted + EXCLUDED.coins_minted,
+                    coins_burned = mcwv_game_stats.coins_burned + EXCLUDED.coins_burned,
+                    last_played = NOW()
+            """, (str(game)[:40], int(sessions), int(minted), int(burned)))
+        conn.commit()
+    except Exception as exc:
+        print(f"[games] stat track failed: {exc}")
+
+
+def init_games_tables():
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_coins (
+                discord_id BIGINT PRIMARY KEY,
+                balance BIGINT NOT NULL DEFAULT 0,
+                bank BIGINT NOT NULL DEFAULT 0,
+                is_unlimited BOOLEAN DEFAULT FALSE,
+                last_daily_at TIMESTAMPTZ,
+                daily_streak INTEGER DEFAULT 0,
+                last_interest_at TIMESTAMPTZ,
+                total_earned BIGINT DEFAULT 0,
+                total_spent BIGINT DEFAULT 0
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_coin_log (
+                id BIGSERIAL PRIMARY KEY,
+                actor_id BIGINT, target_id BIGINT, type TEXT, amount BIGINT,
+                balance_after BIGINT, meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS mcwv_coin_log_target_idx ON mcwv_coin_log (target_id, created_at DESC)")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_game_testers (
+                discord_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_cases (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                price BIGINT NOT NULL DEFAULT 100,
+                emoji TEXT DEFAULT '\\U0001f381',
+                enabled BOOLEAN DEFAULT TRUE,
+                created_by BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_case_contents (
+                id BIGSERIAL PRIMARY KEY,
+                case_id BIGINT NOT NULL,
+                role_id BIGINT NOT NULL,
+                chance NUMERIC(5,2) NOT NULL,
+                UNIQUE (case_id, role_id)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_case_rolls (
+                id BIGSERIAL PRIMARY KEY,
+                case_id BIGINT, user_id BIGINT, won_role_id BIGINT,
+                price_paid BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_pet_collections (
+                discord_id BIGINT NOT NULL,
+                pet_key TEXT NOT NULL,
+                count INTEGER DEFAULT 0,
+                first_hatched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (discord_id, pet_key)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_duels (
+                id BIGSERIAL PRIMARY KEY,
+                challenger BIGINT, target BIGINT, wager BIGINT,
+                game_type TEXT, state TEXT, winner BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_game_stats (
+                game TEXT PRIMARY KEY,
+                sessions BIGINT DEFAULT 0,
+                coins_minted BIGINT DEFAULT 0,
+                coins_burned BIGINT DEFAULT 0,
+                last_played TIMESTAMPTZ
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_bingo_cards (
+                id BIGSERIAL PRIMARY KEY,
+                discord_id BIGINT, battle_id TEXT,
+                card JSONB NOT NULL DEFAULT '[]'::jsonb,
+                marked JSONB NOT NULL DEFAULT '[]'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (discord_id, battle_id)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS mcwv_tower_scores (
+                discord_id BIGINT PRIMARY KEY,
+                best_floor INTEGER DEFAULT 0,
+                best_score BIGINT DEFAULT 0,
+                runs INTEGER DEFAULT 0,
+                reached_at TIMESTAMPTZ
+            )""")
+        conn.commit()
+        print("🎮 Games tables ready")
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"🎮 Games table init failed: {exc}")
+
+
+
+# ---------------- ECONOMY COMMANDS ----------------
+
+@bot.tree.command(name="coins", description="Check your (or someone's) coin balance", guild=guild_obj)
+@app_commands.describe(user="Whose balance to check")
+async def games_coins(interaction: discord.Interaction, user: discord.User = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    target = user or interaction.user
+    bal = games_coin_balance(target.id)
+    unlimited = "∞ unlimited (testing)" if games_is_unlimited(target.id) else ""
+    embed = discord.Embed(title=f"🪙 {target.display_name}'s Coins", color=discord.Color.from_rgb(245, 200, 66))
+    embed.add_field(name="Cash", value=f"**{bal['balance']:,}**" + (f" {unlimited}" if unlimited else ""), inline=True)
+    embed.add_field(name="Bank", value=f"**{bal['bank']:,}**", inline=True)
+    embed.add_field(name="Total", value=f"**{bal['balance'] + bal['bank']:,}**", inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="daily", description="Daily check-in — 100 coins + 10 per streak day", guild=guild_obj)
+async def games_daily(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    uid = interaction.user.id
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_coins (discord_id) VALUES (%s) ON CONFLICT (discord_id) DO NOTHING", (uid,))
+            cur.execute("SELECT last_daily_at, daily_streak FROM mcwv_coins WHERE discord_id = %s", (uid,))
+            row = cur.fetchone()
+            last = row[0]
+            streak = int(row[1] or 0)
+            now = datetime.now(timezone.utc)
+            if last is not None:
+                hours_since = (now - last).total_seconds() / 3600.0
+                if hours_since < 24:
+                    nxt = last + timedelta(hours=24)
+                    return await interaction.followup.send(
+                        f"⏳ Already claimed! Next check-in {discord.utils.format_dt(nxt, 'R')}.", ephemeral=True)
+                streak = streak + 1 if hours_since < 48 else 1
+            else:
+                streak = 1
+            award = GAMES_DAILY_BASE + GAMES_DAILY_STREAK_BONUS * (streak - 1)
+            cur.execute(
+                "UPDATE mcwv_coins SET last_daily_at = NOW(), daily_streak = %s WHERE discord_id = %s", (streak, uid))
+            conn.commit()
+        games_coin_adjust(uid, award, "daily", meta={"streak": streak})
+        games_track("daily", interaction.channel_id, minted=award)
+        embed = discord.Embed(
+            title="📅 Daily Check-in",
+            description=f"+**{award:,}** coins",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
+        embed.add_field(name="Next", value="24 hours from now", inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[games] daily failed: {exc}")
+        await interaction.followup.send("❌ Something went wrong claiming your daily.", ephemeral=True)
+
+
+@bot.tree.command(name="pay", description="Send coins to another member", guild=guild_obj)
+@app_commands.describe(user="Who to pay", amount="Amount (min 10)")
+async def games_pay(interaction: discord.Interaction, user: discord.User, amount: int):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    amount = int(amount)
+    if amount < GAMES_PAY_MIN:
+        return await interaction.followup.send(f"❌ Minimum transfer is **{GAMES_PAY_MIN}** coins.", ephemeral=True)
+    if user.id == interaction.user.id:
+        return await interaction.followup.send("❌ You can't pay yourself!", ephemeral=True)
+    ok, res = games_coin_spend(interaction.user.id, amount, "pay_sent", meta={"to": user.id})
+    if not ok:
+        return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+    ok2, _ = games_coin_adjust(user.id, amount, "pay_received", actor_id=interaction.user.id, meta={"from": interaction.user.id})
+    if not ok2:
+        # refund
+        games_coin_adjust(interaction.user.id, amount, "pay_refund")
+        return await interaction.followup.send("❌ Could not pay that user — coins returned.", ephemeral=True)
+    await interaction.followup.send(f"✅ Sent **{amount:,}** coins to {user.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="deposit", description="Move cash into your bank (earns daily interest)", guild=guild_obj)
+@app_commands.describe(amount="Amount to deposit, or 'all'")
+async def games_deposit(interaction: discord.Interaction, amount: str):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    uid = interaction.user.id
+    bal = games_coin_balance(uid)
+    amt = bal["balance"] if str(amount).strip().lower() == "all" else int(amount)
+    if amt <= 0 or amt > bal["balance"]:
+        return await interaction.followup.send("❌ Invalid amount.", ephemeral=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mcwv_coins SET balance = balance - %s, bank = bank + %s WHERE discord_id = %s RETURNING bank",
+                (amt, amt, uid))
+            new_bank = cur.fetchone()[0]
+            cur.execute(
+                "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) VALUES (%s,%s,'deposit',%s,%s,%s::jsonb)",
+                (uid, uid, amt, int(new_bank), json.dumps({"bank_after": int(new_bank)})))
+        conn.commit()
+        await interaction.followup.send(f"🏦 Deposited **{amt:,}** — bank balance is now **{new_bank:,}** (+1%/day interest, capped).", ephemeral=True)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        await interaction.followup.send(f"❌ Deposit failed: `{type(exc).__name__}`", ephemeral=True)
+
+
+@bot.tree.command(name="withdraw", description="Move banked coins back to cash", guild=guild_obj)
+@app_commands.describe(amount="Amount to withdraw, or 'all'")
+async def games_withdraw(interaction: discord.Interaction, amount: str):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    uid = interaction.user.id
+    bal = games_coin_balance(uid)
+    amt = bal["bank"] if str(amount).strip().lower() == "all" else int(amount)
+    if amt <= 0 or amt > bal["bank"]:
+        return await interaction.followup.send("❌ Invalid amount.", ephemeral=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mcwv_coins SET bank = bank - %s, balance = balance + %s WHERE discord_id = %s RETURNING balance",
+                (amt, amt, uid))
+            new_bal = cur.fetchone()[0]
+            cur.execute(
+                "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) VALUES (%s,%s,'withdraw',%s,%s,%s::jsonb)",
+                (uid, uid, -amt, int(new_bal), json.dumps({})))
+        conn.commit()
+        await interaction.followup.send(f"✅ Withdrew **{amt:,}** — cash is now **{new_bal:,}**.", ephemeral=True)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        await interaction.followup.send(f"❌ Withdraw failed: `{type(exc).__name__}`", ephemeral=True)
+
+
+@bot.tree.command(name="shop", description="Browse the game shop", guild=guild_obj)
+async def games_shop(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(title="🛒 Game Shop", color=discord.Color.from_rgb(245, 200, 66),
+                          description="Game items only — no server perks. Use `/cases` for role cases.")
+    embed.add_field(name="🥚 Extra hatch", value=f"**{GAMES_HATCH_COST}** coins — one more /hatch today", inline=True)
+    embed.add_field(name="🎡 Extra spin", value=f"**{GAMES_SPIN_COST_EXTRA}** coins — one more /spin today", inline=True)
+    embed.add_field(name="🎫 Lottery ticket", value=f"**{GAMES_LOTTERY_TICKET_COST}** coins — /lottery buy", inline=True)
+    embed.set_footer(text="Bank: /deposit + /withdraw · 1%/day interest (capped at 100k)")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------------- ROLE CASES ----------------
+
+@bot.tree.command(name="cases", description="Browse available role cases", guild=guild_obj)
+async def games_cases(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE ORDER BY price ASC")
+            rows = cur.fetchall()
+        if not rows:
+            return await interaction.followup.send("No cases yet — staff will add some soon!", ephemeral=True)
+        embed = discord.Embed(title="🎁 Role Cases", color=discord.Color.from_rgb(168, 130, 255),
+                              description="Open with `/case open <name>`. The price is consumed on every roll.")
+        for cid, name, price, emoji in rows:
+            embed.add_field(name=f"{emoji} {name} — {price:,} coins", value=f"`/case open {name}`", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not list cases: `{type(exc).__name__}`", ephemeral=True)
+
+
+@bot.tree.command(name="case", description="Open a role case (contents + chances shown)", guild=guild_obj)
+@app_commands.describe(name="Case name")
+async def games_case_open(interaction: discord.Interaction, name: str):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, price, emoji FROM mcwv_cases WHERE enabled = TRUE AND LOWER(name) = LOWER(%s)", (name.strip(),))
+            case = cur.fetchone()
+            if not case:
+                return await interaction.followup.send("❌ Case not found.", ephemeral=True)
+            cid, cname, price, emoji = case
+            cur.execute("SELECT role_id, chance FROM mcwv_case_contents WHERE case_id = %s ORDER BY chance DESC", (cid,))
+            contents = cur.fetchall()
+        if not contents:
+            return await interaction.followup.send("❌ That case has no contents yet.", ephemeral=True)
+
+        guild = interaction.guild
+        roles = []
+        weights = []
+        total = 0.0
+        for role_id, chance in contents:
+            role = guild.get_role(int(role_id))
+            if role is None:
+                continue
+            roles.append(role)
+            weights.append(float(chance))
+            total += float(chance)
+        if not roles:
+            return await interaction.followup.send("❌ Case contents are invalid (roles deleted?).", ephemeral=True)
+        filler_weight = max(0.0, 100.0 - total)
+        if filler_weight > 0:
+            roles.append(None)  # nothing
+            weights.append(filler_weight)
+
+        ok, res = games_coin_spend(interaction.user.id, int(price), "case_open", meta={"case": cname})
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        won = games_weighted_choice(roles, weights)
+
+        if won is None:
+            # record roll with no win
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, price_paid) VALUES (%s,%s,%s)", (cid, interaction.user.id, int(price)))
+                conn.commit()
+            except Exception:
+                pass
+            games_track("case", interaction.channel_id, burned=int(price))
+            return await interaction.followup.send(f"{emoji} **{cname}** rolled… nothing this time. Better luck next roll!", ephemeral=False)
+
+        # grant role + log
+        try:
+            member = interaction.user
+            if isinstance(member, discord.Member) and won not in member.roles:
+                await member.add_roles(won, reason=f"Unboxed from case '{cname}'")
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO mcwv_case_rolls (case_id, user_id, won_role_id, price_paid) VALUES (%s,%s,%s,%s)",
+                            (cid, interaction.user.id, won.id, int(price)))
+            conn.commit()
+        except Exception as exc:
+            print(f"[games] case role grant failed: {exc}")
+        games_track("case", interaction.channel_id, burned=int(price))
+        tier = "✨ RARE (5%+)" if weights[roles.index(won)] <= 5 else "🎉"
+        await interaction.followup.send(f"{tier} {interaction.user.mention} unboxed **{won.mention}** from {emoji} **{cname}**!", ephemeral=False)
+    except Exception as exc:
+        print(f"[games] case open failed: {exc}")
+        await interaction.followup.send(f"❌ Case open failed: `{type(exc).__name__}`", ephemeral=True)
+
+
+# ---------------- OWNER / STAFF ADMIN ----------------
+
+@bot.tree.command(name="games", description="Games hub + testing controls", guild=guild_obj)
+@app_commands.describe(action="What to do", value="Value for the action")
+@app_commands.choices(action=[
+    app_commands.Choice(name="toggle (on/off)", value="toggle"),
+    app_commands.Choice(name="tester add", value="tester_add"),
+    app_commands.Choice(name="tester remove", value="tester_remove"),
+    app_commands.Choice(name="tester list", value="tester_list"),
+    app_commands.Choice(name="spawn chance", value="spawn_chance"),
+    app_commands.Choice(name="spawn channel add", value="spawn_add"),
+    app_commands.Choice(name="spawn channel remove", value="spawn_remove"),
+    app_commands.Choice(name="spawn channels list", value="spawn_list"),
+    app_commands.Choice(name="stats", value="stats"),
+])
+async def games_admin(interaction: discord.Interaction, action: str, value: str = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    is_owner = games_owner_check(interaction.user)
+    is_staff = is_owner or (ALLOWED_ROLE_ID in [r.id for r in getattr(interaction.user, "roles", [])])
+
+    if action == "stats":
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT game, sessions, coins_minted, coins_burned, last_played FROM mcwv_game_stats ORDER BY sessions DESC LIMIT 15")
+                rows = cur.fetchall()
+            embed = discord.Embed(title="🎮 Game Stats", color=discord.Color.blurple())
+            lines = [f"• **{g}** — {s} sessions, +{m:,} minted, −{b:,} burned" for g, s, m, b, _ in rows] or ["Nothing played yet!"]
+            embed.description = "\n".join(lines)
+            jackpot = db_get_setting(GAMES_SETTING_JACKPOT, db_get_setting(GAMES_SETTING_JACKPOT_SEED, "5000"))
+            embed.add_field(name="Spin jackpot", value=f"**{int(jackpot):,}** coins", inline=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Stats failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+
+    if not is_owner:
+        return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+
+    if action == "toggle":
+        new_state = str(value or "").strip().lower()
+        if new_state not in ("on", "off"):
+            return await interaction.followup.send("Usage: `/games toggle` with value `on` or `off`.", ephemeral=True)
+        db_set_setting(GAMES_SETTING_ENABLED, "1" if new_state == "on" else "0")
+        return await interaction.followup.send(f"✅ Games are now **{'PUBLIC' if new_state == 'on' else 'TESTING-ONLY'}**.", ephemeral=True)
+
+    if action == "tester_add":
+        m = value or ""
+        uid = int(re.sub(r"\D", "", m)) if re.search(r"\d{15,}", m) else None
+        if not uid:
+            return await interaction.followup.send("Mention a user: `/games tester add @user`.", ephemeral=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO mcwv_game_testers (discord_id, added_by) VALUES (%s,%s) ON CONFLICT (discord_id) DO NOTHING", (uid, interaction.user.id))
+            conn.commit()
+            await interaction.followup.send(f"✅ <@{uid}> added as a game tester.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+
+    if action == "tester_remove":
+        uid = int(re.sub(r"\D", "", value or "")) if value and re.search(r"\d{15,}", value) else None
+        if not uid:
+            return await interaction.followup.send("Mention a user to remove.", ephemeral=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM mcwv_game_testers WHERE discord_id = %s", (uid,))
+            conn.commit()
+            await interaction.followup.send(f"✅ <@{uid}> removed from testers.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+
+    if action == "tester_list":
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT discord_id FROM mcwv_game_testers ORDER BY added_at")
+                rows = cur.fetchall()
+            await interaction.followup.send("Testers: " + (" ".join(f"<@{r[0]}>" for r in rows) if rows else "none (owner only)"), ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+
+    if action == "spawn_chance":
+        try:
+            pct = float(value or "")
+        except Exception:
+            return await interaction.followup.send("Usage: value = percent (e.g. 1 = 1% per message).", ephemeral=True)
+        db_set_setting(GAMES_SETTING_SPAWN_CHANCE, str(max(0.0, min(100.0, pct))))
+        return await interaction.followup.send(f"✅ Spawn chance set to **{pct}%** per message.", ephemeral=True)
+
+    if action in ("spawn_add", "spawn_remove"):
+        if not re.search(r"\d{15,}", value or ""):
+            return await interaction.followup.send("Mention a channel (#games).", ephemeral=True)
+        cid = int(re.sub(r"\D", "", value))
+        raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+        try:
+            chans = json.loads(raw or "[]")
+        except Exception:
+            chans = []
+        if action == "spawn_add" and cid not in chans:
+            chans.append(cid)
+        elif action == "spawn_remove" and cid in chans:
+            chans.remove(cid)
+        db_set_setting(GAMES_SETTING_SPAWN_CHANNELS, json.dumps(chans))
+        return await interaction.followup.send(f"✅ Spawn channels updated: {' '.join(f'<#{c}>' for c in chans) or 'none'}", ephemeral=True)
+
+    if action == "spawn_list":
+        raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+        try:
+            chans = json.loads(raw or "[]")
+        except Exception:
+            chans = []
+        return await interaction.followup.send("Spawn channels: " + (" ".join(f"<#{c}>" for c in chans) if chans else "none set"), ephemeral=True)
+
+    return await interaction.followup.send("Unknown action.", ephemeral=True)
+
+
+@bot.tree.command(name="coinsadmin", description="Owner coin admin (add/remove/set/ledger/audit)", guild=guild_obj)
+@app_commands.describe(action="add / remove / set / ledger / audit", user="Target user", amount="Amount")
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="set", value="set"),
+    app_commands.Choice(name="ledger", value="ledger"),
+    app_commands.Choice(name="audit", value="audit"),
+])
+async def coins_admin(interaction: discord.Interaction, action: str, user: discord.User = None, amount: int = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not games_owner_check(interaction.user):
+        return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+
+    if action == "ledger":
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, actor_id, target_id, type, amount, balance_after, created_at
+                               FROM mcwv_coin_log ORDER BY id DESC LIMIT 15""")
+                rows = cur.fetchall()
+            lines = [f"`#{r[0]}` <@{r[2]}> **{r[3]}** {r[4]:+,} (bal {r[5]:,})" for r in rows] or ["Ledger empty."]
+            embed = discord.Embed(title="🧾 Recent Coin Ledger", description="\n".join(lines), color=discord.Color.greyple())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Ledger failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+
+    if action == "audit":
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(SUM(balance + bank), 0) FROM mcwv_coins")
+                total_bal = int(cur.fetchone()[0])
+                cur.execute("SELECT COALESCE(SUM(amount), 0) FROM mcwv_coin_log")
+                total_flow = int(cur.fetchone()[0])
+            # net flow should equal total balances (approx check)
+            await interaction.followup.send(
+                f"📊 **Audit**\nTotal balances: **{total_bal:,}**\nNet ledger flow: **{total_flow:,}**\n"
+                f"{'✅ Balanced' if total_bal >= 0 and total_flow >= 0 else '⚠️ Check the ledger!'}", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Audit failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+
+    if user is None or amount is None:
+        return await interaction.followup.send("Usage: `/coinsadmin <action> @user <amount>`.", ephemeral=True)
+    if action == "add":
+        ok, res = games_coin_adjust(user.id, int(amount), "admin_add", actor_id=interaction.user.id)
+        return await interaction.followup.send(f"✅ +{amount:,} to {user.mention}." if ok else f"❌ {res}", ephemeral=True)
+    if action == "remove":
+        ok, res = games_coin_adjust(user.id, -int(amount), "admin_remove", actor_id=interaction.user.id)
+        return await interaction.followup.send(f"✅ −{amount:,} from {user.mention}." if ok else f"❌ {res}", ephemeral=True)
+    if action == "set":
+        bal = games_coin_balance(user.id)
+        delta = int(amount) - bal["balance"]
+        ok, res = games_coin_adjust(user.id, delta, "admin_set", actor_id=interaction.user.id)
+        return await interaction.followup.send(f"✅ {user.mention} balance set to {amount:,}." if ok else f"❌ {res}", ephemeral=True)
+    return await interaction.followup.send("Unknown action.", ephemeral=True)
+
+
+
+# ---------------- GUESS THE PET ENGINE ----------------
+
+async def games_fetch_pet_icon(asset_id):
+    """Download a pet icon from the public PS99 image endpoint."""
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.get(
+            f"{PS99_API}/image/{asset_id}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as res:
+            if res.status != 200:
+                return None
+            return await res.read()
+    except Exception as exc:
+        print(f"[games] pet icon fetch failed {asset_id}: {exc}")
+        return None
+
+
+def games_build_round_image(icon_bytes, mode="zoom"):
+    """Transform a pet icon into a guessable puzzle image. Returns BytesIO."""
+    try:
+        img = Image.open(BytesIO(icon_bytes)).convert("RGBA")
+        S = 3
+        if mode == "silhouette":
+            # black fill on the pet's alpha shape
+            alpha = img.split()[3]
+            solid = Image.new("RGBA", img.size, (5, 6, 12, 255))
+            solid.putalpha(alpha.point(lambda a: 255 if a > 40 else 0))
+            img = solid
+        elif mode == "pixel":
+            small = img.resize((12, 12), Image.Resampling.BILINEAR)
+            img = small.resize((img.width, img.height), Image.Resampling.NEAREST)
+        elif mode == "scrambled":
+            w, h = img.size
+            tw, th = w // 4, h // 4
+            tiles = []
+            for ty in range(4):
+                for tx in range(4):
+                    tiles.append(img.crop((tx * tw, ty * th, (tx + 1) * tw, (ty + 1) * th)))
+            order = list(range(16))
+            secrets.SystemRandom().shuffle(order)
+            canvas = Image.new("RGBA", (w, h), (10, 12, 22, 255))
+            for i, idx in enumerate(order):
+                tx, ty = i % 4, i // 4
+                canvas.paste(tiles[idx], (tx * tw, ty * th))
+            img = canvas
+        else:  # zoom
+            w, h = img.size
+            cw, ch = max(24, w // 3), max(24, h // 3)
+            x = secrets.randbelow(max(1, w - cw))
+            y = secrets.randbelow(max(1, h - ch))
+            crop = img.crop((x, y, x + cw, y + ch))
+            img = crop.resize((w, h), Image.Resampling.NEAREST)
+        buf = BytesIO()
+        img.convert("RGB").save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        return buf
+    except Exception as exc:
+        print(f"[games] round image build failed: {exc}")
+        return None
+
+
+async def games_start_guess_round(channel, pet_key=None, mode=None):
+    """Post a new guess round in the given channel. Returns the round dict or None."""
+    pets = [p for p in GAMES_PET_SEED if p.startswith("Huge") or p.startswith("Titanic") or p.startswith("Gargantuan")]
+    if not pets:
+        return None
+    if pet_key is None:
+        pet_key = secrets.choice(pets)
+    if mode is None:
+        mode = secrets.choice(["zoom", "silhouette", "pixel", "scrambled"])
+    asset_id = GAMES_PET_SEED.get(pet_key)
+    icon = await games_fetch_pet_icon(asset_id) if asset_id else None
+    if not icon:
+        return None
+    image_buf = games_build_round_image(icon, mode)
+    if not image_buf:
+        return None
+    mode_label = {"zoom": "\U0001f50d Zoom", "silhouette": "\U0001f319 Silhouette", "pixel": "\U0001f4fa Pixel", "scrambled": "\U0001f9e9 Scrambled"}.get(mode, mode)
+    await channel.send(
+        f"**\U0001f43e Guess the Pet!** ({mode_label})\nFirst correct name wins **250 coins** — just type it!",
+        file=discord.File(image_buf, filename="guess_pet.png"),
+    )
+    round_info = {
+        "pet_key": pet_key,
+        "pet_name": pet_key,
+        "mode": mode,
+        "started": time.time(),
+        "attempts": {},
+        "channel_id": channel.id,
+    }
+    ACTIVE_GUESS_ROUNDS[channel.id] = round_info
+    return round_info
+
+
+def games_spawn_allowed(channel_id):
+    raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+    try:
+        chans = json.loads(raw or "[]")
+    except Exception:
+        chans = []
+    return int(channel_id) in chans
+
+
+async def games_maybe_spawn(message):
+    """1% random spawn — called from on_message."""
+    if not message.guild or message.author.bot:
+        return
+    if not games_spawn_allowed(message.channel.id):
+        return
+    if not games_gate_message(message.author.id):
+        return
+    now = time.time()
+    if now - float(_spawn_last_channel.get(message.channel.id, 0)) < GAMES_SPAWN_CHANNEL_COOLDOWN:
+        return
+    if now - float(_spawn_last_global.get("ts", 0)) < GAMES_SPAWN_GLOBAL_COOLDOWN:
+        return
+    try:
+        chance = float(db_get_setting(GAMES_SETTING_SPAWN_CHANCE, str(GAMES_DEFAULT_CHANCE_PCT)) or GAMES_DEFAULT_CHANCE_PCT)
+    except Exception:
+        chance = GAMES_DEFAULT_CHANCE_PCT
+    if not games_roll_chance(chance):
+        return
+    _spawn_last_channel[message.channel.id] = now
+    _spawn_last_global["ts"] = now
+    try:
+        await games_start_guess_round(message.channel)
+    except Exception as exc:
+        print(f"[games] random spawn failed: {exc}")
+
+
+async def games_handle_answer(message):
+    """Score answers against the active round in this channel."""
+    round_info = ACTIVE_GUESS_ROUNDS.get(message.channel.id)
+    if not round_info:
+        return False
+    if message.author.bot:
+        return False
+    if time.time() - float(round_info["started"]) > GAMES_ROUND_TIMEOUT:
+        ACTIVE_GUESS_ROUNDS.pop(message.channel.id, None)
+        return False
+    attempts = round_info["attempts"].get(message.author.id, 0)
+    if attempts >= GAMES_MAX_ANSWER_ATTEMPTS:
+        return False
+    round_info["attempts"][message.author.id] = attempts + 1
+    if not games_answers_match(message.content, round_info["pet_name"]):
+        return False
+    ACTIVE_GUESS_ROUNDS.pop(message.channel.id, None)
+    games_coin_adjust(message.author.id, 250, "guess_win", meta={"pet": round_info["pet_name"]})
+    games_track("guess", message.channel.id, minted=250)
+    try:
+        await message.channel.send(
+            f"🎉 **{message.author.mention} got it — {round_info['pet_name']}!** +250 coins",
+        )
+    except Exception:
+        pass
+    return True
+
+
+@bot.tree.command(name="guess", description="Start a Guess the Pet round (admin) or check stats", guild=guild_obj)
+@app_commands.describe(action="start / stats", mode="zoom / silhouette / pixel / scrambled / random", pet="Optional pet name")
+@app_commands.choices(action=[
+    app_commands.Choice(name="start a round", value="start"),
+    app_commands.Choice(name="stats", value="stats"),
+])
+@app_commands.choices(mode=[
+    app_commands.Choice(name="random", value="random"),
+    app_commands.Choice(name="zoom", value="zoom"),
+    app_commands.Choice(name="silhouette", value="silhouette"),
+    app_commands.Choice(name="pixel", value="pixel"),
+    app_commands.Choice(name="scrambled", value="scrambled"),
+])
+async def games_guess(interaction: discord.Interaction, action: str, mode: str = "random", pet: str = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if action == "stats":
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT sessions, coins_minted FROM mcwv_game_stats WHERE game = 'guess'")
+                row = cur.fetchone()
+            wins = row[0] if row else 0
+            await interaction.followup.send(f"🐾 Guess the Pet: **{wins}** rounds won, **{row[1] if row else 0:,}** coins given out.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Stats failed: `{type(exc).__name__}`", ephemeral=True)
+        return
+    is_owner = games_owner_check(interaction.user)
+    is_staff = is_owner or (ALLOWED_ROLE_ID in [r.id for r in getattr(interaction.user, "roles", [])])
+    if not is_staff:
+        return await interaction.followup.send("❌ Staff only for starting rounds.", ephemeral=True)
+    if interaction.channel.id in ACTIVE_GUESS_ROUNDS:
+        return await interaction.followup.send("❌ A round is already active here — wait for it to finish.", ephemeral=True)
+    m = None if (mode or "random") == "random" else mode
+    started = await games_start_guess_round(interaction.channel, pet_key=pet, mode=m)
+    if not started:
+        return await interaction.followup.send("❌ Could not start a round (image fetch failed?).", ephemeral=True)
+    await interaction.followup.send("✅ Round started above!", ephemeral=True)
+
+
+# ---------------- /hatch + /pets ----------------
+
+def games_hatch_roll(egg):
+    """Roll a pet from an egg's tier table. Returns (pet_name, tier)."""
+    tier_names = []
+    tier_weights = []
+    for tier, chance, pets in egg["tiers"]:
+        if not pets:
+            continue
+        if chance is None:
+            continue  # common handled below
+        tier_names.append(tier)
+        tier_weights.append(float(chance))
+    # remainder = common
+    used = sum(tier_weights)
+    common_weight = max(0.0, 100.0 - used)
+    tier_names.append("common")
+    tier_weights.append(common_weight)
+    tier = games_weighted_choice(tier_names, tier_weights)
+    pool = next((pets for t, c, pets in egg["tiers"] if t == tier), [])
+    if not pool:
+        pool = next((pets for t, c, pets in egg["tiers"] if pets), ["Clan Kitten"])
+    return secrets.choice(pool), tier
+
+
+async def games_hatch_count_today(user_id):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM mcwv_coin_log
+                WHERE target_id = %s AND type = 'hatch' AND created_at > NOW() - INTERVAL '24 hours'
+            """, (int(user_id),))
+            return int(cur.fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+@bot.tree.command(name="hatch", description="Hatch a Clan Egg — 3 free daily, extras cost coins", guild=guild_obj)
+@app_commands.describe(egg="Which egg to hatch")
+async def games_hatch(interaction: discord.Interaction, egg: str = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    egg_name = egg or GAMES_EGG_SEED[0]["name"]
+    egg_def = next((e for e in GAMES_EGG_SEED if e["name"].lower() == egg_name.lower()), None)
+    if not egg_def:
+        return await interaction.followup.send(f"❌ Unknown egg. Available: {', '.join(e['name'] for e in GAMES_EGG_SEED)}", ephemeral=True)
+
+    used = await games_hatch_count_today(interaction.user.id)
+    free = used < GAMES_HATCH_FREE_PER_DAY
+    if not free:
+        ok, res = games_coin_spend(interaction.user.id, GAMES_HATCH_COST, "hatch_extra", meta={"egg": egg_name})
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+
+    pet_name, tier = games_hatch_roll(egg_def)
+    tier_meta = {
+        "titanic": ("\U0001f30c TITANIC!", (245, 158, 11), 0.5),
+        "huge": ("\U0001f4a5 HUGE!", (168, 85, 247), 2.0),
+        "exclusive": ("\U0001f48e Exclusive!", (59, 130, 246), 6.0),
+        "epic": ("\U0001f49c Epic", (192, 132, 252), 15.0),
+        "rare": ("\U0001f499 Rare", (96, 165, 250), 25.0),
+        "common": ("\U0001f43e Common", (156, 163, 175), None),
+    }.get(tier, (tier, (156, 163, 175), None))
+    label, color, _ = tier_meta
+
+    # collection book
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mcwv_pet_collections (discord_id, pet_key, count)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (discord_id, pet_key) DO UPDATE SET count = mcwv_pet_collections.count + 1
+            """, (interaction.user.id, pet_name))
+        conn.commit()
+    except Exception as exc:
+        print(f"[games] collection upsert failed: {exc}")
+
+    asset_id = GAMES_PET_SEED.get(pet_name)
+    icon = await games_fetch_pet_icon(asset_id) if asset_id else None
+    games_track("hatch", interaction.channel_id, burned=0 if free else GAMES_HATCH_COST)
+
+    embed = discord.Embed(
+        title=f"{egg_def['emoji']} {egg_def['name']}",
+        description=f"{interaction.user.mention} hatched a **{pet_name}**",
+        color=discord.Color.from_rgb(*color),
+    )
+    embed.add_field(name="Rarity", value=f"{label}" + (f" ({tier_meta[2]}%)" if tier_meta[2] else ""), inline=True)
+    embed.add_field(name="Hatches used today", value=f"{used + 1}/{GAMES_HATCH_FREE_PER_DAY} free", inline=True)
+    public = tier in ("titanic", "huge")
+    if icon:
+        try:
+            img = Image.open(BytesIO(icon)).convert("RGBA").resize((128, 128), Image.Resampling.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            embed.set_thumbnail(url="attachment://pet.png")
+            await interaction.followup.send(embed=embed, file=discord.File(buf, filename="pet.png"), ephemeral=not public)
+            return
+        except Exception as exc:
+            print(f"[games] hatch image failed: {exc}")
+    await interaction.followup.send(embed=embed, ephemeral=not public)
+
+
+@bot.tree.command(name="pets", description="Your hatched pet collection", guild=guild_obj)
+@app_commands.describe(user="Whose collection to view")
+async def games_pets(interaction: discord.Interaction, user: discord.User = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    target = user or interaction.user
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pet_key, count, first_hatched_at FROM mcwv_pet_collections WHERE discord_id = %s ORDER BY count DESC, pet_key ASC LIMIT 25", (target.id,))
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) FROM mcwv_pet_collections WHERE discord_id = %s", (target.id,))
+            total_unique = int(cur.fetchone()[0] or 0)
+        if not rows:
+            return await interaction.followup.send(f"{target.display_name} hasn't hatched anything yet — try `/hatch`!", ephemeral=True)
+        lines = [f"• **{name}** ×{count}" for name, count, _ in rows]
+        embed = discord.Embed(title=f"\U0001f43e {target.display_name}'s Collection", description="\n".join(lines), color=discord.Color.from_rgb(168, 85, 247))
+        embed.set_footer(text=f"{total_unique} unique pets hatched")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Collection failed: `{type(exc).__name__}`", ephemeral=True)
+
+
+
+# ---------------- DUELS (live 1v1) ----------------
+
+class DuelChallengeView(discord.ui.View):
+    def __init__(self, duel_id, target_id, challenger_id, wager, game_type):
+        super().__init__(timeout=180)
+        self.duel_id = duel_id
+        self.target_id = int(target_id)
+        self.challenger_id = int(challenger_id)
+        self.wager = int(wager)
+        self.game_type = game_type
+
+    @discord.ui.button(label="Accept Duel", style=discord.ButtonStyle.success, emoji="\u2694\ufe0f")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_id:
+            return await interaction.response.send_message("Only the challenged player can accept.", ephemeral=True)
+        duel = ACTIVE_DUELS.get(self.duel_id)
+        if not duel or duel["state"] != "pending":
+            return await interaction.response.send_message("That duel is no longer pending.", ephemeral=True)
+        # escrow challenger's wager (target's was escrowed at challenge time? No —
+        # escrow BOTH now for simplicity and refund clarity)
+        ok1, r1 = games_coin_spend(self.challenger_id, self.wager, "duel_escrow", meta={"duel": self.duel_id})
+        if not ok1:
+            await interaction.response.send_message(f"❌ Challenger can't pay: {r1}", ephemeral=True)
+            return
+        ok2, r2 = games_coin_spend(self.target_id, self.wager, "duel_escrow", meta={"duel": self.duel_id})
+        if not ok2:
+            games_coin_adjust(self.challenger_id, self.wager, "duel_refund", meta={"duel": self.duel_id})
+            await interaction.response.send_message(f"❌ You can't pay: {r2}", ephemeral=True)
+            return
+        duel["state"] = "active"
+        duel["escrowed"] = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE mcwv_duels SET state = 'active' WHERE id = %s", (int(self.duel_id),))
+            conn.commit()
+        except Exception:
+            pass
+        await interaction.response.edit_message(content="\u2694\ufe0f **DUEL ACCEPTED — good luck both!**", view=None)
+        await start_duel_round(interaction.channel, duel)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_id:
+            return await interaction.response.send_message("Only the challenged player can decline.", ephemeral=True)
+        duel = ACTIVE_DUELS.get(self.duel_id)
+        if duel:
+            duel["state"] = "declined"
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE mcwv_duels SET state = 'declined' WHERE id = %s", (int(self.duel_id),))
+            conn.commit()
+        except Exception:
+            pass
+        await interaction.response.edit_message(content="\ud83d\ude45 Duel declined.", view=None)
+
+
+async def start_duel_round(channel, duel):
+    """Shared live challenge for both duelists — first correct answer wins the pot."""
+    game_type = duel["game_type"]
+    a_id, b_id = duel["challenger"], duel["target"]
+    duel["answers"] = {a_id: 0, b_id: 0}
+    duel["locked_until"] = {}
+    duel["round_started"] = time.time()
+
+    if game_type == "guess":
+        pets = [p for p in GAMES_PET_SEED if p.startswith("Huge") or p.startswith("Titanic") or p.startswith("Gargantuan")]
+        pet = secrets.choice(pets)
+        icon = await games_fetch_pet_icon(GAMES_PET_SEED.get(pet))
+        if icon:
+            buf = games_build_round_image(icon, "zoom")
+            duel["answer"] = pet
+            await channel.send(
+                f"\u2694\ufe0f **DUEL** <@{a_id}> vs <@{b_id}> — first to name this pet wins **{duel['wager'] * 2:,}** coins!\n"
+                f"(pot = {duel['wager']} + {duel['wager']})",
+                file=discord.File(buf, filename="duel.png") if buf else None,
+            )
+            return
+    # fallback: scramble
+    pool = [p for p in GAMES_PET_SEED]
+    word = secrets.choice(pool)
+    letters = list(re.sub(r"[^A-Za-z]", "", word).lower())
+    shuffled = letters[:]
+    while len(shuffled) > 1 and shuffled == letters:
+        secrets.SystemRandom().shuffle(shuffled)
+    duel["answer"] = word
+    await channel.send(
+        f"\u2694\ufe0f **DUEL** <@{a_id}> vs <@{b_id}> — first to unscramble the pet name wins **{duel['wager'] * 2:,}** coins!\n"
+        f"`{' '.join(shuffled).upper()}`"
+    )
+
+
+async def games_handle_duel_answer(message):
+    for duel_id, duel in list(ACTIVE_DUELS.items()):
+        if duel.get("state") != "active":
+            continue
+        if message.channel.id != duel.get("channel_id"):
+            continue
+        if message.author.id not in (duel["challenger"], duel["target"]):
+            continue
+        if message.author.bot:
+            continue
+        if time.time() - float(duel.get("round_started", 0)) > GAMES_DUEL_TIMEOUT:
+            await settle_duel(duel_id, None, "timeout")
+            continue
+        locked = duel.get("locked_until", {}).get(message.author.id, 0)
+        if time.time() < locked:
+            continue
+        if not games_answers_match(message.content, duel.get("answer", "")):
+            duel["locked_until"][message.author.id] = time.time() + 5
+            continue
+        await settle_duel(duel_id, message.author.id, "won")
+
+
+async def settle_duel(duel_id, winner_id, reason):
+    duel = ACTIVE_DUELS.pop(duel_id, None)
+    if not duel:
+        return
+    channel = None
+    try:
+        channel = bot.get_channel(int(duel.get("channel_id", 0)))
+    except Exception:
+        pass
+    pot = int(duel["wager"]) * 2
+    if winner_id and duel.get("escrowed"):
+        games_coin_adjust(winner_id, pot, "duel_win", meta={"duel": duel_id})
+        games_track("duel", duel.get("channel_id", 0), minted=pot)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE mcwv_duels SET state = 'settled', winner = %s WHERE id = %s", (int(winner_id), int(duel_id)))
+            conn.commit()
+        except Exception:
+            pass
+        if channel:
+            await channel.send(f"\U0001f3c6 **<@{winner_id}> wins the duel and the pot — +{pot:,} coins!**")
+    else:
+        if duel.get("escrowed"):
+            games_coin_adjust(duel["challenger"], duel["wager"], "duel_refund", meta={"duel": duel_id})
+            games_coin_adjust(duel["target"], duel["wager"], "duel_refund", meta={"duel": duel_id})
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE mcwv_duels SET state = 'cancelled' WHERE id = %s", (int(duel_id),))
+            conn.commit()
+        except Exception:
+            pass
+        if channel:
+            await channel.send("\u23f0 Duel timed out — both wagers refunded.")
+
+
+@bot.tree.command(name="duel", description="Challenge someone to a live 1v1 for a coin wager", guild=guild_obj)
+@app_commands.describe(user="Who to challenge", wager="Coins on the line")
+async def games_duel(interaction: discord.Interaction, user: discord.User, wager: int):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    wager = int(wager)
+    if wager <= 0:
+        return await interaction.followup.send("❌ Wager must be positive.", ephemeral=True)
+    if user.id == interaction.user.id:
+        return await interaction.followup.send("❌ You can't duel yourself!", ephemeral=True)
+    if user.bot:
+        return await interaction.followup.send("❌ Bots don't duel.", ephemeral=True)
+    for d in ACTIVE_DUELS.values():
+        if d.get("state") in ("pending", "active") and interaction.user.id in (d["challenger"], d["target"]):
+            return await interaction.followup.send("❌ You already have an active duel.", ephemeral=True)
+    game_type = secrets.choice(["guess", "scramble"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_duels (challenger, target, wager, game_type, state) VALUES (%s,%s,%s,%s,'pending') RETURNING id",
+                (interaction.user.id, user.id, wager, game_type))
+            duel_id = int(cur.fetchone()[0])
+        conn.commit()
+    except Exception as exc:
+        return await interaction.followup.send(f"❌ Could not create duel: `{type(exc).__name__}`", ephemeral=True)
+    ACTIVE_DUELS[duel_id] = {
+        "id": duel_id, "challenger": interaction.user.id, "target": user.id,
+        "wager": wager, "game_type": game_type, "state": "pending", "escrowed": False,
+        "channel_id": interaction.channel.id,
+    }
+    view = DuelChallengeView(duel_id, user.id, interaction.user.id, wager, game_type)
+    await interaction.followup.send(
+        f"\u2694\ufe0f {user.mention} — **{interaction.user.display_name}** challenges you to a duel "
+        f"({game_type} round) for **{wager:,}** coins! Accept to lock the wager.",
+        view=view,
+    )
+
+
+# ---------------- TRIVIA ----------------
+
+class TriviaAnswerView(discord.ui.View):
+    def __init__(self, correct, session, timeout=20):
+        super().__init__(timeout=timeout)
+        self.correct = correct
+        self.session = session
+        self.answered = False
+
+    @discord.ui.button(label="A", style=discord.ButtonStyle.secondary)
+    async def opt_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._answer(interaction, 0)
+
+    @discord.ui.button(label="B", style=discord.ButtonStyle.secondary)
+    async def opt_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._answer(interaction, 1)
+
+    @discord.ui.button(label="C", style=discord.ButtonStyle.secondary)
+    async def opt_c(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._answer(interaction, 2)
+
+    @discord.ui.button(label="D", style=discord.ButtonStyle.secondary)
+    async def opt_d(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._answer(interaction, 3)
+
+    async def _answer(self, interaction: discord.Interaction, idx: int):
+        if self.answered or interaction.user.id != self.session["user_id"]:
+            return await interaction.response.send_message("This question is already answered / not yours.", ephemeral=True)
+        self.answered = True
+        correct = idx == self.correct
+        for i, child in enumerate(self.children):
+            child.disabled = True
+            if i == self.correct:
+                child.style = discord.ButtonStyle.success
+        await interaction.response.edit_message(view=self)
+        self.session["q_index"] += 1
+        if correct:
+            self.session["score"] += 1
+        await interaction.followup.send("✅ Correct!" if correct else f"❌ Wrong — it was {['A','B','C','D'][self.correct]}.")
+
+
+@bot.tree.command(name="trivia", description="PS99 trivia — 10 questions, 20 coins per correct", guild=guild_obj)
+async def games_trivia(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    session = {"user_id": interaction.user.id, "q_index": 0, "score": 0}
+    questions = GAMES_TRIVIA_SEED[:]
+    secrets.SystemRandom().shuffle(questions)
+    questions = questions[:5]  # test build: 5 questions, 20s each
+    for q, options, correct in questions:
+        embed = discord.Embed(
+            title=f"❓ Question {session['q_index'] + 1}/{len(questions)}",
+            description=q,
+            color=discord.Color.from_rgb(99, 102, 241),
+        )
+        for i, opt in enumerate(options):
+            embed.add_field(name=f"{'ABCD'[i]}.", value=opt, inline=False)
+        view = TriviaAnswerView(correct, session)
+        if session["q_index"] >= len(questions) - 1:
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        # wait for the answer (poll the session)
+        start = time.time()
+        while not view.answered and time.time() - start < 22:
+            await asyncio.sleep(0.5)
+        if not view.answered:
+            break
+    score = session["score"]
+    award = score * 20 + (500 if score == len(questions) else 0)
+    if award:
+        games_coin_adjust(interaction.user.id, award, "trivia_win", meta={"score": score})
+        games_track("trivia", interaction.channel_id, minted=award)
+    await interaction.followup.send(
+        f"🏁 Trivia done! You scored **{score}/{len(questions)}** and earned **{award:,}** coins." + ("\n💯 Perfect run!" if score == len(questions) else ""),
+        ephemeral=True,
+    )
+
+
+# ---------------- SCRAMBLE ----------------
+
+@bot.tree.command(name="scramble", description="Unscramble a pet name — first correct wins 100 coins", guild=guild_obj)
+async def games_scramble(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    if interaction.channel.id in ACTIVE_SCRAMBLE:
+        return await interaction.followup.send("❌ A scramble is already active in this channel.", ephemeral=True)
+    pool = [p for p in GAMES_PET_SEED]
+    word = secrets.choice(pool)
+    letters = list(re.sub(r"[^A-Za-z]", "", word).lower())
+    shuffled = letters[:]
+    while len(shuffled) > 1 and shuffled == letters:
+        secrets.SystemRandom().shuffle(shuffled)
+    ACTIVE_SCRAMBLE[interaction.channel.id] = {"answer": word, "started": time.time()}
+    await interaction.followup.send(f"🔀 **Unscramble this pet name** (first correct wins 100 coins):\n`{' '.join(shuffled).upper()}`")
+
+
+async def games_handle_scramble(message):
+    s = ACTIVE_SCRAMBLE.get(message.channel.id)
+    if not s or message.author.bot:
+        return
+    if time.time() - float(s["started"]) > GAMES_ROUND_TIMEOUT:
+        ACTIVE_SCRAMBLE.pop(message.channel.id, None)
+        return
+    if games_answers_match(message.content, s["answer"]):
+        ACTIVE_SCRAMBLE.pop(message.channel.id, None)
+        games_coin_adjust(message.author.id, 100, "scramble_win", meta={"word": s["answer"]})
+        games_track("scramble", message.channel.id, minted=100)
+        await message.channel.send(f"🎉 **{message.author.mention} unscrambled it — {s['answer']}!** +100 coins")
+
+
+# ---------------- HANGMAN ----------------
+
+@bot.tree.command(name="hangman", description="Hangman with pet names — 6 lives", guild=guild_obj)
+async def games_hangman(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    if interaction.channel.id in ACTIVE_HANGMAN:
+        return await interaction.followup.send("❌ A hangman game is already active here.", ephemeral=True)
+    pool = [p for p in GAMES_PET_SEED]
+    word = secrets.choice(pool).lower()
+    core = re.sub(r"[^a-z]", "", word)
+    ACTIVE_HANGMAN[interaction.channel.id] = {
+        "word": word, "core": core, "guessed": set(), "wrong": 0, "started": time.time(),
+    }
+    await interaction.followup.send(render_hangman(interaction.channel.id))
+
+
+def render_hangman(channel_id):
+    g = ACTIVE_HANGMAN.get(channel_id)
+    if not g:
+        return "No active game."
+    display = " ".join(ch if ch in g["guessed"] else "\\_" for ch in g["core"])
+    lives = 6 - g["wrong"]
+    return f"🎩 **Hangman** ({len(g['core'])} letters)\n`{display}`\nLives: {'❤️' * lives}{'🖤' * g['wrong']}\nType a letter or guess the full name!"
+
+
+async def games_handle_hangman(message):
+    g = ACTIVE_HANGMAN.get(message.channel.id)
+    if not g or message.author.bot:
+        return
+    if time.time() - float(g["started"]) > 300:
+        ACTIVE_HANGMAN.pop(message.channel.id, None)
+        return
+    content = message.content.strip().lower()
+    if len(content) == 1 and content.isalpha():
+        if content in g["guessed"]:
+            return
+        g["guessed"].add(content)
+        if content not in g["core"]:
+            g["wrong"] += 1
+            if g["wrong"] >= 6:
+                ACTIVE_HANGMAN.pop(message.channel.id, None)
+                await message.channel.send(f"💀 Hangman lost! The pet was **{g['word']}**.")
+                return
+        elif all(ch in g["guessed"] for ch in g["core"]):
+            ACTIVE_HANGMAN.pop(message.channel.id, None)
+            games_coin_adjust(message.author.id, 150, "hangman_win", meta={"word": g["word"]})
+            games_track("hangman", message.channel.id, minted=150)
+            await message.channel.send(f"🎉 **{message.author.mention} solved it — {g['word']}!** +150 coins")
+            return
+        await message.channel.send(render_hangman(message.channel.id))
+    elif len(content) > 1:
+        if games_answers_match(content, g["word"]):
+            ACTIVE_HANGMAN.pop(message.channel.id, None)
+            games_coin_adjust(message.author.id, 150, "hangman_win", meta={"word": g["word"]})
+            games_track("hangman", message.channel.id, minted=150)
+            await message.channel.send(f"🎉 **{message.author.mention} solved it — {g['word']}!** +150 coins")
+
+
+# ---------------- PETDLE (Wordle) ----------------
+
+@bot.tree.command(name="petdle", description="Daily Wordle with pet names (variable length)", guild=guild_obj)
+@app_commands.describe(guess="Your guess")
+async def games_petdle(interaction: discord.Interaction, guess: str = None):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if guess is None:
+        return await interaction.followup.send(
+            "🐾 **Petdle** — guess today's pet name, one guess per command.\n"
+            "`/petdle <guess>` — 🟩 right letter right place, 🟨 right letter wrong place, ⬛ not in the name.",
+            ephemeral=True)
+    guess_clean = normalize_answer(guess)
+    if not guess_clean:
+        return await interaction.followup.send("❌ Invalid guess.", ephemeral=True)
+    # daily target from seed, deterministic per UTC date
+    pool = sorted(GAMES_PET_SEED.keys())
+    day_index = datetime.now(timezone.utc).toordinal()
+    target = pool[day_index % len(pool)]
+    target_core = normalize_answer(target)
+    g = guess_clean[:max(len(target_core), 3)]
+    if g == target_core:
+        games_coin_adjust(interaction.user.id, 200, "petdle_win", meta={"word": target})
+        return await interaction.followup.send(f"🎉 **{target}** — solved! +200 coins", ephemeral=True)
+    # feedback
+    out = []
+    for i, ch in enumerate(g):
+        if i < len(target_core) and ch == target_core[i]:
+            out.append("🟩")
+        elif ch in target_core:
+            out.append("🟨")
+        else:
+            out.append("⬛")
+    hint = f"{''.join(out)}"
+    await interaction.followup.send(f"`{' '.join(g).upper()}`\n{hint}\n\nTarget is **{len(target_core)}** letters. Try again with `/petdle <guess>`!", ephemeral=True)
+
+
+
+# ---------------- SPIN WHEEL (progressive jackpot) ----------------
+
+def games_spin_today(user_id):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM mcwv_coin_log WHERE target_id = %s AND type IN ('spin_win','spin_nothing','spin_free') AND created_at > NOW() - INTERVAL '24 hours'", (int(user_id),))
+            return int(cur.fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+def games_jackpot_get():
+    try:
+        return int(db_get_setting(GAMES_SETTING_JACKPOT, db_get_setting(GAMES_SETTING_JACKPOT_SEED, "5000")) or 0)
+    except Exception:
+        return 5000
+
+
+def games_jackpot_set(value):
+    db_set_setting(GAMES_SETTING_JACKPOT, str(int(value)))
+
+
+def games_spin_roll():
+    """Returns (label, win_amount, is_jackpot)."""
+    sectors = [
+        ("100 coins", 100), ("250 coins", 250), ("500 coins", 500), ("1000 coins", 1000),
+        ("Free scratch", 0), ("Nothing", 0), ("JACKPOT", 0, True),
+    ]
+    weights = [30, 22, 12, 6, 10, 19, 1]
+    idx = games_weighted_choice(range(len(sectors)), weights)
+    label = sectors[idx][0]
+    amount = sectors[idx][1]
+    if len(sectors[idx]) > 2:
+        return "JACKPOT", games_jackpot_get(), True
+    return label, amount, False
+
+
+@bot.tree.command(name="spin", description="Spin the wheel once a day — progressive jackpot!", guild=guild_obj)
+async def games_spin(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    spins = games_spin_today(interaction.user.id)
+    free = spins < 1
+    if not free:
+        ok, res = games_coin_spend(interaction.user.id, GAMES_SPIN_COST_EXTRA, "spin_extra")
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+
+    label, amount, is_jackpot = games_spin_roll()
+    jackpot = games_jackpot_get()
+    jackpot_inc = secrets.randbelow(41) + 10  # jackpot grows 10-50 per spin
+    embed = discord.Embed(title="🎡 Spin the Wheel", color=discord.Color.from_rgb(108, 34, 245))
+    if is_jackpot:
+        games_coin_adjust(interaction.user.id, amount, "spin_jackpot", meta={"amount": amount})
+        games_jackpot_set(int(db_get_setting(GAMES_SETTING_JACKPOT_SEED, "5000")))
+        games_track("spin", interaction.channel.id, minted=amount)
+        embed.description = f"🎰 **JACKPOT!** {interaction.user.mention} wins the whole **{amount:,}** coin jackpot!"
+    elif amount > 0:
+        games_coin_adjust(interaction.user.id, amount, "spin_win", meta={"amount": amount})
+        games_jackpot_set(jackpot + jackpot_inc)
+        games_track("spin", interaction.channel.id, minted=amount)
+        embed.description = f"✨ You landed on **{label}** — +{amount:,} coins!"
+    else:
+        games_jackpot_set(jackpot + jackpot_inc)
+        games_track("spin", interaction.channel.id)
+        embed.description = f"You landed on **{label}** — better luck tomorrow!"
+    embed.add_field(name="Progressive Jackpot", value=f"**{games_jackpot_get():,}** coins", inline=False)
+    embed.set_footer(text="1 free spin per day (24h rolling) · extra spins from /shop")
+    await interaction.followup.send(embed=embed, ephemeral=not is_jackpot)
+
+
+# ---------------- SCRATCH ----------------
+
+@bot.tree.command(name="scratch", description="Scratch 3 pets — daily free, match for prizes", guild=guild_obj)
+async def games_scratch(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer()
+    # 1 free daily
+    used = games_scratch_today(interaction.user.id)
+    if used >= 1:
+        ok, res = games_coin_spend(interaction.user.id, 100, "scratch_extra")
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+    pool = [p for p in GAMES_PET_SEED]
+    tier_weights = []
+    for p in pool:
+        if p.startswith("Titanic"):
+            tier_weights.append(5)
+        elif p.startswith("Huge") or p.startswith("Gargantuan"):
+            tier_weights.append(20)
+        else:
+            tier_weights.append(100)
+    picks = [games_weighted_choice(pool, tier_weights) for _ in range(3)]
+    count_map = {}
+    for p in picks:
+        count_map[p] = count_map.get(p, 0) + 1
+    best = max(count_map.values())
+    award = 0
+    if best == 3:
+        if picks[0].startswith("Titanic"):
+            award = 10000
+        elif picks[0].startswith(("Huge", "Gargantuan")):
+            award = 5000
+        else:
+            award = 500
+    elif best == 2:
+        award = 100
+    if award:
+        games_coin_adjust(interaction.user.id, award, "scratch_win", meta={"picks": picks})
+        games_track("scratch", interaction.channel_id, minted=award)
+    embed = discord.Embed(title="🎴 Scratch Card", description="Your three pets:", color=discord.Color.from_rgb(250, 204, 21))
+    embed.add_field(name="1", value=picks[0], inline=True)
+    embed.add_field(name="2", value=picks[1], inline=True)
+    embed.add_field(name="3", value=picks[2], inline=True)
+    embed.add_field(name="Result", value=f"**{'+' + format(award, ',') + ' coins' if award else 'No match 😔'}**", inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=award < 1000)
+
+
+def games_scratch_today(user_id):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM mcwv_coin_log WHERE target_id = %s AND type IN ('scratch_win','scratch_extra') AND created_at > NOW() - INTERVAL '24 hours'", (int(user_id),))
+            return int(cur.fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+# ---------------- WEEKLY LOTTERY ----------------
+
+@bot.tree.command(name="lottery", description="Weekly lottery — buy tickets, auto-draws Sunday 20:00 UTC", guild=guild_obj)
+@app_commands.describe(action="buy / view / draw (owner)")
+@app_commands.choices(action=[
+    app_commands.Choice(name="buy tickets", value="buy"),
+    app_commands.Choice(name="view pool", value="view"),
+    app_commands.Choice(name="draw now (owner)", value="draw"),
+])
+async def games_lottery(interaction: discord.Interaction, action: str, amount: int = 1):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if action == "buy":
+        n = max(1, int(amount))
+        total_cost = n * GAMES_LOTTERY_TICKET_COST
+        ok, res = games_coin_spend(interaction.user.id, total_cost, "lottery_ticket", meta={"tickets": n})
+        if not ok:
+            return await interaction.followup.send(f"❌ {res}", ephemeral=True)
+        pool = int(db_get_setting(GAMES_SETTING_LOTTERY_POOL, "0") or 0)
+        db_set_setting(GAMES_SETTING_LOTTERY_POOL, str(pool + total_cost))
+        await interaction.followup.send(f"🎟 Bought **{n}** ticket(s) for {total_cost:,} coins. Pool is now **{pool + total_cost:,}**.", ephemeral=True)
+        return
+    if action == "view":
+        pool = int(db_get_setting(GAMES_SETTING_LOTTERY_POOL, "0") or 0)
+        return await interaction.followup.send(f"🎟 Lottery pool: **{pool:,}** coins. Winner takes 70%.", ephemeral=True)
+    if action == "draw":
+        if not games_owner_check(interaction.user):
+            return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+        await games_lottery_draw(interaction.channel)
+        return
+
+
+async def games_lottery_draw(channel):
+    pool = int(db_get_setting(GAMES_SETTING_LOTTERY_POOL, "0") or 0)
+    if pool <= 0:
+        await channel.send("🎟 No lottery pool to draw yet.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT target_id, -amount FROM mcwv_coin_log WHERE type = 'lottery_ticket'")
+            entries = []
+            for uid, tickets in cur.fetchall():
+                entries.extend([int(uid)] * int(tickets))
+        if not entries:
+            db_set_setting(GAMES_SETTING_LOTTERY_POOL, "0")
+            await channel.send("🎟 Lottery had no valid tickets — pool burned.")
+            return
+        winner = secrets.choice(entries)
+        prize = int(pool * 0.7)
+        games_coin_adjust(winner, prize, "lottery_win", meta={"pool": pool})
+        games_track("lottery", getattr(channel, "id", 0), minted=prize)
+        db_set_setting(GAMES_SETTING_LOTTERY_POOL, "0")
+        await channel.send(f"🎟 **Lottery drawn!** <@{winner}> wins **{prize:,}** coins (70% of {pool:,}).")
+    except Exception as exc:
+        print(f"[games] lottery draw failed: {exc}")
+
+
+# ---------------- WAR BINGO ----------------
+
+GAMES_BINGO_EVENTS = [
+    ("MCWV reaches top 25", lambda ctx: ctx.get("rank") and ctx["rank"] <= 25),
+    ("MCWV reaches top 10", lambda ctx: ctx.get("rank") and ctx["rank"] <= 10),
+    ("MCWV reaches top 5", lambda ctx: ctx.get("rank") and ctx["rank"] <= 5),
+    ("MCWV passes 100M points", lambda ctx: ctx.get("points", 0) >= 100_000_000),
+    ("MCWV passes 500M points", lambda ctx: ctx.get("points", 0) >= 500_000_000),
+    ("MCWV passes 1B points", lambda ctx: ctx.get("points", 0) >= 1_000_000_000),
+    ("A member passes 1M points", lambda ctx: bool(ctx.get("top_member_points", 0) >= 1_000_000)),
+    ("A member passes 5M points", lambda ctx: bool(ctx.get("top_member_points", 0) >= 5_000_000)),
+    ("A member passes 10M points", lambda ctx: bool(ctx.get("top_member_points", 0) >= 10_000_000)),
+    ("10 members score points", lambda ctx: ctx.get("scorers", 0) >= 10),
+    ("25 members score points", lambda ctx: ctx.get("scorers", 0) >= 25),
+    ("50 members score points", lambda ctx: ctx.get("scorers", 0) >= 50),
+    ("War timer passes 50%", lambda ctx: ctx.get("progress_pct", 0) >= 50),
+    ("War timer passes 75%", lambda ctx: ctx.get("progress_pct", 0) >= 75),
+    ("Final 24 hours", lambda ctx: ctx.get("hours_left", 999) <= 24),
+    ("Final 6 hours", lambda ctx: ctx.get("hours_left", 999) <= 6),
+]
+
+
+@bot.tree.command(name="bingo", description="War Bingo — free card, auto-marked live during wars", guild=guild_obj)
+async def games_bingo(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        st = get_battles_war_state()
+        battle_id = str(st["battle_id"]) if st and st.get("battle_id") else None
+    if not battle_id:
+        return await interaction.followup.send("❌ No active or scheduled war found.", ephemeral=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT card, marked FROM mcwv_bingo_cards WHERE discord_id = %s AND battle_id = %s", (interaction.user.id, str(battle_id)))
+            row = cur.fetchone()
+        if row:
+            card, marked = json.loads(row[0] or "[]"), json.loads(row[1] or "[]")
+            lines = []
+            for i, ev in enumerate(card):
+                tick = "✅" if i in marked else "⬜"
+                lines.append(f"{tick} {ev}")
+            embed = discord.Embed(title=f"🎯 War Bingo — {battle_id}", description="\n".join(lines), color=discord.Color.gold())
+            embed.set_footer(text=f"{len(marked)}/24 marked · auto-updates during the war")
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+        pool = GAMES_BINGO_EVENTS[:]
+        secrets.SystemRandom().shuffle(pool)
+        card = [ev[0] for ev in pool[:24]]
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mcwv_bingo_cards (discord_id, battle_id, card) VALUES (%s,%s,%s::jsonb) ON CONFLICT (discord_id, battle_id) DO NOTHING",
+                (interaction.user.id, str(battle_id), json.dumps(card)))
+        conn.commit()
+        await interaction.followup.send(
+            f"🎯 Bingo card created for **{battle_id}**! It marks itself live during the war — check `/bingo` anytime.",
+            ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Bingo failed: `{type(exc).__name__}`", ephemeral=True)
+
+
+async def games_bingo_mark_all():
+    """Housekeeping: mark cards against live war state."""
+    battle_id = await get_active_battle_id_for_placement()
+    if not battle_id:
+        return
+    try:
+        ctx = {"rank": None, "points": 0, "top_member_points": 0, "scorers": 0, "progress_pct": 0, "hours_left": 999}
+        st = get_battles_war_state()
+        if st and st.get("finish"):
+            now = time.time()
+            if st["finish"] > now:
+                ctx["hours_left"] = (st["finish"] - now) / 3600.0
+        # MCWV latest snapshot
+        with conn.cursor() as cur:
+            cur.execute("SELECT rank, battle_points, progress_percent FROM war_snapshots WHERE clan_name = %s AND battle_id = %s ORDER BY captured_at DESC LIMIT 1", (CLAN_NAME, str(battle_id)))
+            row = cur.fetchone()
+            if row:
+                ctx["rank"] = int(row[0] or 0)
+                ctx["points"] = int(row[1] or 0)
+                try:
+                    ctx["progress_pct"] = float(row[2] or 0)
+                except Exception:
+                    pass
+            cur.execute("SELECT COALESCE(MAX(points),0) FROM player_leaderboard_history WHERE battle_id = lower(%s)", (str(battle_id),))
+            ctx["top_member_points"] = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM player_leaderboard_history WHERE battle_id = lower(%s) AND points > 0", (str(battle_id),))
+            ctx["scorers"] = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT id, discord_id, card, marked FROM mcwv_bingo_cards WHERE battle_id = %s", (str(battle_id),))
+            cards = cur.fetchall()
+        updates = []
+        for cid, uid, card_json, marked_json in cards:
+            card = json.loads(card_json or "[]")
+            marked = json.loads(marked_json or "[]")
+            new_marked = set(marked)
+            for i, ev_name in enumerate(card):
+                ev = next((e for e in GAMES_BINGO_EVENTS if e[0] == ev_name), None)
+                if ev and ev[1](ctx):
+                    new_marked.add(i)
+            if new_marked != set(marked):
+                updates.append((json.dumps(sorted(new_marked)), cid))
+        with conn.cursor() as cur:
+            for marked_json, cid in updates:
+                cur.execute("UPDATE mcwv_bingo_cards SET marked = %s::jsonb WHERE id = %s", (marked_json, cid))
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[games] bingo marking failed: {exc}")
+
+
+# ---------------- TOWER OF PETS ----------------
+
+@bot.tree.command(name="tower", description="Tower of Pets — endless mixed floors (trivia + guess), 3 hearts", guild=guild_obj)
+async def games_tower(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    session = ACTIVE_TOWER.get(interaction.user.id)
+    if session and session.get("active"):
+        return await interaction.followup.send(
+            f"🏗 You're already climbing — floor **{session['floor']}**, {session['hearts']} ❤️ left. "
+            f"Answer the last question or wait for it to time out.", ephemeral=True)
+    ACTIVE_TOWER[interaction.user.id] = {"user_id": interaction.user.id, "floor": 1, "hearts": 3, "score": 0, "active": True}
+    await interaction.followup.send(
+        "🏗 **Tower of Pets** — endless floors, mixed challenges, 3 hearts.\n"
+        "Each correct answer climbs a floor (coins scale with depth). First floor:", ephemeral=True)
+    await games_tower_ask(interaction, interaction.user.id)
+
+
+async def games_tower_ask(interaction, user_id):
+    session = ACTIVE_TOWER.get(user_id)
+    if not session or not session.get("active"):
+        return
+    if secrets.choice([True, False]):
+        # trivia floor
+        q, options, correct = secrets.choice(GAMES_TRIVIA_SEED)
+        embed = discord.Embed(title=f"🏗 Floor {session['floor']} — Trivia", description=q, color=discord.Color.from_rgb(99, 102, 241))
+        for i, opt in enumerate(options):
+            embed.add_field(name=f"{'ABCD'[i]}.", value=opt, inline=False)
+        view = TowerTriviaView(correct, session)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    else:
+        # guess floor
+        pets = [p for p in GAMES_PET_SEED if p.startswith("Huge") or p.startswith("Titanic")]
+        pet = secrets.choice(pets)
+        icon = await games_fetch_pet_icon(GAMES_PET_SEED.get(pet))
+        session["answer"] = pet
+        session["kind"] = "guess"
+        file = None
+        if icon:
+            buf = games_build_round_image(icon, "zoom")
+            if buf:
+                file = discord.File(buf, filename="tower.png")
+        await interaction.followup.send(
+            f"🏗 Floor {session['floor']} — name this pet! (`/tower answer <name>`)",
+            file=file, ephemeral=True)
+
+
+class TowerTriviaView(discord.ui.View):
+    def __init__(self, correct, session):
+        super().__init__(timeout=30)
+        self.correct = correct
+        self.session = session
+        self.done = False
+
+    @discord.ui.button(label="A", style=discord.ButtonStyle.secondary)
+    async def a(self, i: discord.Interaction, b): await self._go(i, 0)
+
+    @discord.ui.button(label="B", style=discord.ButtonStyle.secondary)
+    async def b_(self, i: discord.Interaction, b): await self._go(i, 1)
+
+    @discord.ui.button(label="C", style=discord.ButtonStyle.secondary)
+    async def c(self, i: discord.Interaction, b): await self._go(i, 2)
+
+    @discord.ui.button(label="D", style=discord.ButtonStyle.secondary)
+    async def d_(self, i: discord.Interaction, b): await self._go(i, 3)
+
+    async def _go(self, interaction, idx):
+        if self.done or interaction.user.id != self.session["user_id"]:
+            return await interaction.response.send_message("Not your run!", ephemeral=True)
+        self.done = True
+        await interaction.response.defer(ephemeral=True)
+        await games_tower_result(interaction, correct=idx == self.correct)
+
+
+async def games_tower_result(interaction, correct):
+    session = ACTIVE_TOWER.get(interaction.user.id)
+    if not session:
+        return
+    if correct:
+        award = session["floor"] * 25
+        session["floor"] += 1
+        session["score"] += award
+        games_coin_adjust(interaction.user.id, award, "tower_floor", meta={"floor": session["floor"] - 1})
+        await interaction.followup.send(f"✅ Floor clear! +{award} coins. Climbing to floor **{session['floor']}**…", ephemeral=True)
+        await games_tower_ask(interaction, interaction.user.id)
+    else:
+        session["hearts"] -= 1
+        if session["hearts"] <= 0:
+            session["active"] = False
+            best = 0
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO mcwv_tower_scores (discord_id, best_floor, best_score, runs) VALUES (%s,%s,%s,1) ON CONFLICT (discord_id) DO UPDATE SET best_floor = GREATEST(mcwv_tower_scores.best_floor, EXCLUDED.best_floor), best_score = GREATEST(mcwv_tower_scores.best_score, EXCLUDED.best_score), runs = mcwv_tower_scores.runs + 1, reached_at = NOW() RETURNING best_floor", (interaction.user.id, session["floor"] - 1, session["score"]))
+                    best = int(cur.fetchone()[0] or 0)
+                conn.commit()
+            except Exception:
+                pass
+            games_track("tower", interaction.channel_id, minted=session["score"])
+            ACTIVE_TOWER.pop(interaction.user.id, None)
+            await interaction.followup.send(
+                f"💀 Run over! You reached floor **{session['floor'] - 1}**, scored **{session['score']:,}** (best: {best}).", ephemeral=True)
+        else:
+            await interaction.followup.send(f"💔 Wrong — **{session['hearts']}** hearts left. Try again:", ephemeral=True)
+            await games_tower_ask(interaction, interaction.user.id)
+
+
+@bot.tree.command(name="toweranswer", description="Answer a Tower guess floor", guild=guild_obj)
+@app_commands.describe(answer="The pet name")
+async def games_tower_answer(interaction: discord.Interaction, answer: str):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    session = ACTIVE_TOWER.get(interaction.user.id)
+    if not session or not session.get("active"):
+        return await interaction.followup.send("No active tower run — start one with `/tower`.", ephemeral=True)
+    if session.get("kind") != "guess":
+        return await interaction.followup.send("Current floor is trivia — use the buttons.", ephemeral=True)
+    correct = games_answers_match(answer, session.get("answer", ""))
+    session["kind"] = None
+    await games_tower_result(interaction, correct=correct)
+
+
+
+# ---------------- GAMES GUIDE HUB ----------------
+
+class GamesGuideSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Economy", value="economy", emoji="🪙", description="Coins, daily, bank, interest"),
+            discord.SelectOption(label="Guess the Pet", value="guess", emoji="🐾", description="Name the pet, win coins"),
+            discord.SelectOption(label="Hatch", value="hatch", emoji="🥚", description="Eggs, odds, collections"),
+            discord.SelectOption(label="Duels", value="duels", emoji="⚔️", description="1v1 wagers"),
+            discord.SelectOption(label="Trivia", value="trivia", emoji="🧠", description="PS99 knowledge"),
+            discord.SelectOption(label="Spin", value="spin", emoji="🎡", description="Daily wheel + jackpot"),
+            discord.SelectOption(label="Scratch", value="scratch", emoji="🎴", description="Match 3 pets"),
+            discord.SelectOption(label="Lottery", value="lottery", emoji="🎟", description="Weekly pool"),
+            discord.SelectOption(label="Bingo", value="bingo", emoji="🎯", description="Live war bingo"),
+            discord.SelectOption(label="Tower", value="tower", emoji="🏗", description="Endless climb"),
+            discord.SelectOption(label="Word games", value="words", emoji="🔤", description="Petdle, scramble, hangman"),
+            discord.SelectOption(label="Rules", value="rules", emoji="📜", description="Fair play"),
+        ]
+        super().__init__(placeholder="What do you want to learn about?", options=options, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        pages = {
+            "economy": ("🪙 Economy", "**Earning:** `/daily` (100 + 10×streak) · winning games · duels · lottery · bank interest\n"
+                       "**Spending:** cases, extra hatches/spins/scratches, lottery tickets, duel wagers\n"
+                       "**Bank:** `/deposit` + `/withdraw` — banked coins earn **1%/day** (capped at 100k banked).\n"
+                       "**Commands:** `/coins` · `/pay` · `/shop` · `/cases`"),
+            "guess": ("🐾 Guess the Pet", "Rounds spawn randomly in chat (1% per message) or staff start them with `/guess start`.\n"
+                      "4 modes: zoom, silhouette, pixel, scrambled.\n"
+                      "First correct name wins **250 coins** — just type it!\n\n`/guess stats` shows your round wins."),
+            "hatch": ("🥚 Hatch", "`/hatch` — 3 free hatches per day (24h rolling), extras cost **100 coins**.\n"
+                      "Odds: Titanic **0.5%** · Huge **2%** · Exclusive 6% · Epic 15% · Rare 25% · Common rest.\n"
+                      "Huge/Titanic hatches announce publicly in the channel.\n`/pets` = your collection book."),
+            "duels": ("⚔️ Duels", "`/duel @player <wager>` — challenge someone. They accept, wagers lock, and the bot\n"
+                      "runs a live head-to-head round (pet zoom or scramble — bot picks).\n"
+                      "First correct answer takes the pot. Timeout = refund."),
+            "trivia": ("🧠 Trivia", "`/trivia` — 5 PS99 questions, 20s each, **20 coins per correct**.\n"
+                       "Perfect run bonus: **+500**. MCWV-history trivia coming later."),
+            "spin": ("🎡 Spin", "`/spin` — 1 free daily spin. Sectors pay 100–1000 coins, plus a **progressive jackpot**\n"
+                      "that grows with every spin until someone hits it. Extra spins: **250 coins**."),
+            "scratch": ("🎴 Scratch", "`/scratch` — reveals 3 pets. 3-of-a-kind pays: Titanic **10,000** · Huge **5,000** · any **500** · pair **100**.\n"
+                       "1 free daily, extras cost 100 coins."),
+            "lottery": ("🎟 Lottery", "`/lottery buy` — tickets cost **50 coins**. Winner takes **70%** of the pool.\n"
+                       "Draws Sunday 20:00 UTC (owner can draw early)."),
+            "bingo": ("🎯 War Bingo", "`/bingo` at war start — free 5×5 card of war events (rank milestones, point bars, timer).\n"
+                       "The bot marks it live during the war. Line = 100 · Bingo = 1,000 · Blackout = 2,500."),
+            "tower": ("🏗 Tower of Pets", "`/tower` — endless floors mixing trivia + guess-the-pet. 3 hearts.\n"
+                       "Coins scale with depth (25 × floor). Best runs hit the Tower leaderboard."),
+            "words": ("🔤 Word games", "`/petdle <guess>` — daily pet-name Wordle (variable length).\n"
+                       "`/scramble` — first to unscramble wins 100.\n"
+                       "`/hangman` — 6 lives, guess letters or the full name."),
+            "rules": ("📜 Rules", "• One account per person — no alt farming dailies/hatches\n"
+                      "• No colluding to feed duel/scramble wins\n"
+                      "• Coins are fake and for fun — don't sell or trade them for real stuff\n"
+                      "• Exploits found? Report to staff — you might get a finder's bonus 😉"),
+        }
+        title, body = pages.get(self.values[0], ("?", "?"))
+        embed = discord.Embed(title=title, description=body, color=discord.Color.from_rgb(108, 34, 245))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="gamesguide", description="Learn how the games and economy work", guild=guild_obj)
+async def games_guide(interaction: discord.Interaction):
+    if not games_gate_allowed(interaction):
+        return await interaction.response.send_message("🎮 Games are still in testing — coming soon.", ephemeral=True)
+    view = discord.ui.View(timeout=300)
+    view.add_item(GamesGuideSelect())
+    embed = discord.Embed(
+        title="🎮 MCWV Games",
+        description="Pick a topic below to learn how everything works.",
+        color=discord.Color.from_rgb(108, 34, 245),
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ---------------- GAMES HOUSEKEEPING LOOP ----------------
+
+@tasks.loop(minutes=1)
+async def games_housekeeping_loop():
+    try:
+        if not DATABASE_URL or conn is None or conn.closed != 0:
+            return
+        # 1. Expire stale rounds / duels / sessions
+        now = time.time()
+        for ch, r in list(ACTIVE_GUESS_ROUNDS.items()):
+            if now - float(r["started"]) > GAMES_ROUND_TIMEOUT:
+                ACTIVE_GUESS_ROUNDS.pop(ch, None)
+        for ch, s in list(ACTIVE_SCRAMBLE.items()):
+            if now - float(s["started"]) > GAMES_ROUND_TIMEOUT:
+                ACTIVE_SCRAMBLE.pop(ch, None)
+        for uid, s in list(ACTIVE_TOWER.items()):
+            if now - float(s.get("started", now)) > 600 and not s.get("active"):
+                ACTIVE_TOWER.pop(uid, None)
+        # 2. Daily interest tick (1%/day, capped, integer math)
+        rate = int(db_get_setting(GAMES_SETTING_INTEREST_RATE, str(GAMES_INTEREST_RATE_PCT_DEFAULT)) or 0)
+        cap = int(db_get_setting(GAMES_SETTING_INTEREST_CAP, str(GAMES_INTEREST_CAP_DEFAULT)) or 0)
+        if rate > 0:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE mcwv_coins
+                        SET bank = bank + (LEAST(bank, %s) * %s / 100),
+                            last_interest_at = NOW()
+                        WHERE bank > 0
+                          AND (last_interest_at IS NULL OR last_interest_at < NOW() - INTERVAL '24 hours')
+                        RETURNING discord_id, bank
+                    """, (cap, rate))
+                    rows = cur.fetchall()
+                    for uid, new_bank in rows:
+                        cur.execute(
+                            "INSERT INTO mcwv_coin_log (actor_id, target_id, type, amount, balance_after, meta) VALUES (%s,%s,'interest',0,%s,%s::jsonb)",
+                            (uid, uid, int(new_bank), json.dumps({"bank_after": int(new_bank)})))
+                conn.commit()
+                if rows:
+                    print(f"[games] interest ticked for {len(rows)} members")
+            except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print(f"[games] interest tick failed: {exc}")
+        # 3. Bingo marking (every 5 min only)
+        if int(time.time()) % 300 < 60:
+            await games_bingo_mark_all()
+        # 4. Lottery auto-draw (Sunday 20:00 UTC window)
+        now_dt = datetime.now(timezone.utc)
+        if now_dt.weekday() == 6 and now_dt.hour == 20 and now_dt.minute == 0:
+            last_draw = db_get_setting("games_lottery_last_draw_week", "")
+            week_key = f"{now_dt.year}-W{now_dt.isocalendar()[1]}"
+            if last_draw != week_key:
+                db_set_setting("games_lottery_last_draw_week", week_key)
+                raw = db_get_setting(GAMES_SETTING_SPAWN_CHANNELS, "[]")
+                try:
+                    chans = json.loads(raw or "[]")
+                except Exception:
+                    chans = []
+                ch = bot.get_channel(int(chans[0])) if chans else None
+                if ch:
+                    await games_lottery_draw(ch)
+    except Exception as exc:
+        print(f"[games] housekeeping error: {exc}")
+
+
+@games_housekeeping_loop.before_loop
+async def before_games_housekeeping():
+    await bot.wait_until_ready()
+
+
+# ---------------- MESSAGE HOOKS ----------------
+
+@bot.event
+async def on_message(message):
+    if message.guild is None:
+        return
+    if message.author.bot:
+        return
+    try:
+        # game answer handlers (guess rounds, duels, scramble, hangman)
+        await games_handle_answer(message)
+        await games_handle_duel_answer(message)
+        await games_handle_scramble(message)
+        await games_handle_hangman(message)
+        # random Guess the Pet spawn
+        await games_maybe_spawn(message)
+    except Exception as exc:
+        print(f"[games] on_message error: {exc}")
+    # keep prefix commands working
+    try:
+        await bot.process_commands(message)
+    except Exception:
+        pass
 
 
 # ---------------- READY ----------------
