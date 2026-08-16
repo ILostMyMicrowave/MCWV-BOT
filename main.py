@@ -11825,6 +11825,10 @@ def build_search_embed(data):
 
     if data.get("avatar_url"):
         embed.set_thumbnail(url=data["avatar_url"])
+
+    # The analytics card renders INSIDE the embed, below Discord's built-in
+    # divider line (attachment reference resolved when the file is sent).
+    embed.set_image(url="attachment://search.png")
     return embed
 
 
