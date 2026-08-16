@@ -46,6 +46,23 @@ def home():
     return "Bot is alive"
 
 
+@app.route("/health")
+def health():
+    probe = globals().get("database_probe_sync")
+    database_ready = bool(probe and probe())
+    bot_obj = globals().get("bot")
+    discord_ready = bool(bot_obj and bot_obj.is_ready())
+    healthy = database_ready and discord_ready
+    return jsonify({
+        "service": "MCWV BOT",
+        "status": "ok" if healthy else "degraded",
+        "database_ready": database_ready,
+        "discord_ready": discord_ready,
+        "event_loop_lag_ms": round(float(globals().get("_bot_event_loop_lag", 0.0)) * 1000, 1),
+        "guilds": len(bot_obj.guilds) if bot_obj else 0,
+    }), 200 if healthy else 503
+
+
 # ---------------- ADMIN API ----------------
 # The Hub talks to these routes server-to-server using X-Admin-API-Key.
 # Keep every route registered before the Flask thread starts.
@@ -1883,6 +1900,22 @@ DB_PATH = "bot.db"  # legacy name kept for reference only — event data lives i
 DATABASE_URL = os.environ.get("DATABASE_URL")
 conn = None  # single persistent bot-loop connection (created lazily by ensure_db_connection)
 
+# Bound bot-loop queries so a lock or stalled PostgreSQL statement cannot freeze
+# Discord long enough to lose a new interaction. Dedicated backfill workers keep
+# their own connection policy.
+DB_STATEMENT_TIMEOUT_MS = max(250, int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "1800")))
+DB_LOCK_TIMEOUT_MS = max(100, int(os.environ.get("DB_LOCK_TIMEOUT_MS", "900")))
+DB_CONNECTION_OPTIONS = (
+    f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS} "
+    f"-c lock_timeout={DB_LOCK_TIMEOUT_MS} "
+    "-c idle_in_transaction_session_timeout=10000"
+)
+DB_STARTUP_CONNECTION_OPTIONS = (
+    "-c statement_timeout=30000 -c lock_timeout=5000 "
+    "-c idle_in_transaction_session_timeout=30000"
+)
+_database_initializing = True
+
 import threading as _threading
 
 _event_local = _threading.local()
@@ -1903,6 +1936,7 @@ def _event_conn():
                 DATABASE_URL,
                 sslmode="require",
                 connect_timeout=5,
+                options=DB_CONNECTION_OPTIONS,
                 keepalives=1,
                 keepalives_idle=30,
                 keepalives_interval=10,
@@ -2258,6 +2292,7 @@ def ensure_db_connection():
             DATABASE_URL,
             sslmode="require",
             connect_timeout=5,
+            options=DB_STARTUP_CONNECTION_OPTIONS if _database_initializing else DB_CONNECTION_OPTIONS,
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -2277,6 +2312,92 @@ async def ensure_db_connection_async():
     if conn is not None and conn.closed == 0:
         return conn
     return await asyncio.to_thread(ensure_db_connection)
+
+
+# Autocomplete interactions cannot be deferred. Keep all option data in a
+# worker-refreshed in-memory snapshot so keystrokes never query PostgreSQL.
+_interaction_cache_lock = _threading.RLock()
+_broadcast_template_choice_cache = []
+_tracked_user_choice_cache = []
+
+
+def refresh_interaction_caches_sync():
+    global _broadcast_template_choice_cache, _tracked_user_choice_cache
+    if not DATABASE_URL:
+        return False
+    worker = None
+    try:
+        worker = psycopg2.connect(
+            DATABASE_URL,
+            sslmode="require",
+            connect_timeout=5,
+            options="-c statement_timeout=3000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000",
+        )
+        worker.autocommit = True
+        templates = []
+        users = []
+        with worker.cursor() as cur:
+            try:
+                cur.execute("SELECT id, name, audience FROM broadcast_templates ORDER BY LOWER(name) LIMIT 100")
+                templates = [
+                    {"id": int(row[0]), "name": str(row[1]), "audience": str(row[2] or "everyone")}
+                    for row in cur.fetchall()
+                ]
+            except Exception:
+                try:
+                    worker.rollback()
+                except Exception:
+                    pass
+            cur.execute("SELECT roblox_id, discord_id, username FROM users ORDER BY LOWER(username) LIMIT 5000")
+            users = [
+                (str(row[0]), int(row[1]) if row[1] is not None else 0, str(row[2] or row[0]))
+                for row in cur.fetchall()
+            ]
+        with _interaction_cache_lock:
+            _broadcast_template_choice_cache = templates
+            _tracked_user_choice_cache = users
+        return True
+    except Exception as exc:
+        print(f"[interaction-cache] refresh failed: {type(exc).__name__}")
+        return False
+    finally:
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+
+async def refresh_interaction_caches():
+    return await asyncio.to_thread(refresh_interaction_caches_sync)
+
+
+def database_probe_sync():
+    """Bounded real database probe used only by the Flask health thread."""
+    if not DATABASE_URL:
+        return False
+    worker = None
+    try:
+        worker = psycopg2.connect(
+            DATABASE_URL,
+            sslmode="require",
+            connect_timeout=4,
+            options="-c statement_timeout=1500 -c lock_timeout=750",
+        )
+        worker.autocommit = True
+        with worker.cursor() as cur:
+            cur.execute("SELECT 1")
+            row = cur.fetchone()
+        return bool(row and row[0] == 1)
+    except Exception:
+        return False
+    finally:
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
 
 def db_get_all_alts():
     if not db_enabled():
@@ -3725,8 +3846,21 @@ def db_get_all():
         return []
 
 
+_db_setting_cache = {}
+_db_setting_cache_lock = _threading.RLock()
+
+
 def db_get_setting(key, default=None):
+    cache_key = str(key)
+    with _db_setting_cache_lock:
+        if cache_key in _db_setting_cache:
+            # Settings used by permissions and modal constructors must be
+            # available without pre-acknowledgement PostgreSQL I/O. Writes in
+            # this process update the cache immediately.
+            return _db_setting_cache[cache_key]
     if not db_enabled():
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = default
         return default
 
     try:
@@ -3735,12 +3869,15 @@ def db_get_setting(key, default=None):
                 SELECT value
                 FROM settings
                 WHERE key = %s
-            """, (str(key),))
+            """, (cache_key,))
             row = cur.fetchone()
 
-        return row[0] if row else default
+        result = row[0] if row else default
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = result
+        return result
     except Exception as e:
-        print("db_get_setting error:", e)
+        print("db_get_setting error:", type(e).__name__)
         return default
 
 
@@ -3748,6 +3885,8 @@ def db_set_setting(key, value):
     if not db_enabled():
         return
 
+    cache_key = str(key)
+    cache_value = str(value)
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -3755,10 +3894,12 @@ def db_set_setting(key, value):
                 VALUES (%s, %s)
                 ON CONFLICT (key)
                 DO UPDATE SET value = EXCLUDED.value
-            """, (str(key), str(value)))
+            """, (cache_key, cache_value))
         conn.commit()
+        with _db_setting_cache_lock:
+            _db_setting_cache[cache_key] = cache_value
     except Exception as e:
-        print("db_set_setting error:", e)
+        print("db_set_setting error:", type(e).__name__)
         conn.rollback()
 
 
@@ -4653,6 +4794,33 @@ async def on_error(event_method: str, *args, **kwargs):
             pass
 
 
+async def _mcwv_view_on_error(self, interaction: discord.Interaction, error: Exception, item):
+    print(f"[component error] item={type(item).__name__} type={type(error).__name__}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("⚠️ That control failed safely. Please try again.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ That control failed safely. Please try again.", ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _mcwv_modal_on_error(self, interaction: discord.Interaction, error: Exception):
+    print(f"[modal error] modal={type(self).__name__} type={type(error).__name__}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("⚠️ That form failed safely. Please try again.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ That form failed safely. Please try again.", ephemeral=True)
+    except Exception:
+        pass
+
+
+# Central safety net for all current and future component/modal callbacks.
+discord.ui.View.on_error = _mcwv_view_on_error
+discord.ui.Modal.on_error = _mcwv_modal_on_error
+
+
 # ---------------- SLASH COMMANDS ----------------
 import random
 import secrets
@@ -4928,9 +5096,10 @@ class GiveawayView(discord.ui.View):
         custom_id="giveaway_my_entries"
     )
     async def my_entries(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         giveaway = get_active_giveaway()
         if not giveaway or not giveaway["active"]:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ No active giveaway right now.",
                 ephemeral=True
             )
@@ -4947,7 +5116,7 @@ class GiveawayView(discord.ui.View):
         embed.add_field(name="Entries", value=str(entries), inline=True)
         embed.add_field(name="Rate", value=f"{invites_per_entry} invites = 1 entry", inline=False)
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(
         label="Leaderboard",
@@ -4955,9 +5124,10 @@ class GiveawayView(discord.ui.View):
         custom_id="giveaway_leaderboard"
     )
     async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         giveaway = get_active_giveaway()
         if not giveaway or not giveaway["active"]:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ No active giveaway right now.",
                 ephemeral=True
             )
@@ -4982,7 +5152,7 @@ class GiveawayView(discord.ui.View):
                 break
 
         if not lines:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No entries yet.",
                 ephemeral=True
             )
@@ -4993,7 +5163,7 @@ class GiveawayView(discord.ui.View):
             color=discord.Color.blurple()
         )
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="giveaway_start", description="Start the MCWV invite giveaway", guild=guild_obj)
@@ -5213,17 +5383,17 @@ class InviteView(discord.ui.View):
         custom_id="invite_event_button"
     )
     async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-
+        await interaction.response.defer(ephemeral=True)
         event = get_active_event()
         if not event or not event["active"]:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ No active invite event.",
                 ephemeral=True
             )
 
         guild = interaction.guild
         if guild is None:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ This can only be used in a server.",
                 ephemeral=True
             )
@@ -5231,7 +5401,7 @@ class InviteView(discord.ui.View):
         channel = get_invite_channel(guild, interaction.client)
 
         if not channel:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ No valid channel for invites.",
                 ephemeral=True
             )
@@ -5243,7 +5413,7 @@ class InviteView(discord.ui.View):
             )
         except Exception as e:
             print(f"[invite system] create invite error: {e}")
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Failed to create invite.",
                 ephemeral=True
             )
@@ -5254,7 +5424,7 @@ class InviteView(discord.ui.View):
             (invite.code, interaction.user.id)
         )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Your invite link:\n{invite.url}",
             ephemeral=True
         )
@@ -5295,12 +5465,13 @@ class InviteView(discord.ui.View):
 @bot.tree.command(name="invite_debug", description="Staff diagnostic: show invite tracking state", guild=guild_obj)
 @require_role()
 async def invite_debug(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     event = get_active_event()
     guild = interaction.guild
 
     snap = INVITE_SNAPSHOTS.get(guild.id, {}) if guild else {}
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🧪 Invite System Debug\n\n"
         f"Active Event: {bool(event and event['active'])}\n"
         f"End Time: {event['end_time'] if event else 'None'}\n"
@@ -5312,15 +5483,16 @@ async def invite_debug(interaction: discord.Interaction):
 @bot.tree.command(name="invite_snapshot_refresh", description="Refresh the invite snapshot cache", guild=guild_obj)
 @require_role()
 async def invite_snapshot_refresh(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
     if not guild:
-        return await interaction.response.send_message("No guild found.", ephemeral=True)
+        return await interaction.followup.send("No guild found.", ephemeral=True)
 
     try:
         await load_invite_snapshot(guild)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🔄 Invite snapshot refreshed successfully.",
             ephemeral=True
         )
@@ -5331,7 +5503,7 @@ async def invite_snapshot_refresh(interaction: discord.Interaction):
         print("FULL SNAPSHOT ERROR:")
         print(traceback.format_exc())
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"❌ Failed to refresh snapshot:\n`{type(e).__name__}: {e}`",
             ephemeral=True
         )
@@ -5400,26 +5572,26 @@ async def host_invite_event(interaction: discord.Interaction, duration_hours: in
 @bot.tree.command(name="end_invite_event", description="End the current invite event and announce winners", guild=guild_obj)
 @require_role()
 async def end_invite_event(interaction: discord.Interaction):
-
+    await interaction.response.defer(ephemeral=True)
     try:
         event = get_active_event()
 
         if not event or not event["active"]:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ No active event.",
                 ephemeral=True
             )
 
         db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🏁 Event ended.",
             ephemeral=True
         )
 
     except Exception as e:
         print(f"[end_invite_event error] {e}")
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ Something went wrong ending the event.",
             ephemeral=True
         )
@@ -5514,6 +5686,7 @@ async def on_member_remove(member: discord.Member):
 
 @bot.tree.command(name="inviteleaderboard", description="Show the MCWV invite leaderboard", guild=guild_obj)
 async def inviteleaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
     rows = db_fetchall("""
         SELECT user_id, invites
         FROM invite_counts
@@ -5522,7 +5695,7 @@ async def inviteleaderboard(interaction: discord.Interaction):
     """)
 
     if not rows:
-        return await interaction.response.send_message("No invite joins yet.", ephemeral=True)
+        return await interaction.followup.send("No invite joins yet.", ephemeral=True)
 
     text = "\n".join(
         f"{i+1}. <@{r['user_id']}> — {r['invites']} joins"
@@ -5535,7 +5708,7 @@ async def inviteleaderboard(interaction: discord.Interaction):
         color=discord.Color.blurple()
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tasks.loop(seconds=30)
@@ -7240,6 +7413,7 @@ class BroadcastConfirmView(discord.ui.View):
 
     @discord.ui.button(label="🧪 Test send to me", style=discord.ButtonStyle.primary)
     async def testme(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         sample = next(
             (r for r in self.recipients if int(r.get("discord_id") or 0) == interaction.user.id),
             self.recipients[0],
@@ -7250,12 +7424,12 @@ class BroadcastConfirmView(discord.ui.View):
         )
         if ok:
             spot = "your DMs" if where == "dm" else "your ticket channel"
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🧪 Test broadcast sent to **{spot}** — check it renders how you want, then hit Send Broadcast.",
                 ephemeral=True,
             )
         else:
-            await interaction.response.send_message(f"❌ Test broadcast failed: {error}", ephemeral=True)
+            await interaction.followup.send(f"❌ Test broadcast failed: {error}", ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -7313,8 +7487,9 @@ async def broadcast_command(
     image_url: str = "",
     save_as_template: str = "",
 ):
+    await interaction.response.defer(ephemeral=True)
     if not has_broadcast_permission(interaction.user):
-        return await interaction.response.send_message("❌ You do not have permission to use broadcasts.", ephemeral=True)
+        return await interaction.followup.send("❌ You do not have permission to use broadcasts.", ephemeral=True)
 
     ensure_broadcast_feature_tables()
 
@@ -7322,7 +7497,7 @@ async def broadcast_command(
     if str(template or "").strip():
         tpl = db_get_broadcast_template(str(template).strip())
         if not tpl:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ No broadcast template found for `{template}`.", ephemeral=True
             )
 
@@ -7338,7 +7513,7 @@ async def broadcast_command(
     # Explicit option wins; otherwise inherit the template's saved artwork.
     raw_image = str(image_url or "").strip()
     if raw_image and not clean_broadcast_image_url(raw_image):
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             "❌ Image URL must start with http:// or https:// (or be left empty).", ephemeral=True
         )
     image_url = clean_broadcast_image_url(raw_image) or clean_broadcast_image_url(
@@ -7346,12 +7521,10 @@ async def broadcast_command(
     )
 
     if not message:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             "❌ A message is required — type one, or pick a template.",
             ephemeral=True,
         )
-
-    await interaction.response.defer(ephemeral=True)
 
     try:
         recipients = await resolve_broadcast_recipients(
@@ -7449,17 +7622,13 @@ async def broadcast_command(
 async def broadcast_template_autocomplete(interaction: discord.Interaction, current: str):
     if not has_broadcast_permission(interaction.user):
         return []
-    try:
-        templates = db_list_broadcast_templates(limit=25)
-        needle = str(current or "").strip().lower()
-        matches = [
-            app_commands.Choice(name=f"{t['name']} ({t['audience']})", value=str(t["id"]))
-            for t in templates
-            if not needle or needle in t["name"].lower()
-        ]
-        return matches[:25]
-    except Exception:
-        return []
+    with _interaction_cache_lock:
+        templates = list(_broadcast_template_choice_cache)
+    needle = str(current or "").strip().lower()
+    return [
+        app_commands.Choice(name=f"{t['name']} ({t['audience']})", value=str(t["id"]))
+        for t in templates if not needle or needle in t["name"].lower()
+    ][:25]
 
 
 @bot.tree.command(name="broadcast_templates", description="Manage saved broadcast templates", guild=guild_obj)
@@ -7509,8 +7678,9 @@ async def broadcast_templates_command(
     value: str = "",
     image_url: str = "",
 ):
+    await interaction.response.defer(ephemeral=True)
     if not has_broadcast_permission(interaction.user):
-        return await interaction.response.send_message("❌ You do not have permission to manage broadcast templates.", ephemeral=True)
+        return await interaction.followup.send("❌ You do not have permission to manage broadcast templates.", ephemeral=True)
 
     ensure_broadcast_feature_tables()
     actor_name = broadcast_actor_name(interaction)
@@ -7518,7 +7688,7 @@ async def broadcast_templates_command(
     if action.value == "list":
         templates = db_list_broadcast_templates(limit=25)
         if not templates:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No broadcast templates yet — create one with `/broadcast_templates create`.",
                 ephemeral=True,
             )
@@ -7532,16 +7702,16 @@ async def broadcast_templates_command(
             description="\n".join(lines)[:4000],
             color=MCWV_BRAND_COLOR if "MCWV_BRAND_COLOR" in globals() else discord.Color.blurple(),
         )
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
 
     if action.value == "create":
         if not name.strip():
-            return await interaction.response.send_message("❌ Give the template a name.", ephemeral=True)
+            return await interaction.followup.send("❌ Give the template a name.", ephemeral=True)
         if not message.strip():
-            return await interaction.response.send_message("❌ Give the template a message.", ephemeral=True)
+            return await interaction.followup.send("❌ Give the template a message.", ephemeral=True)
         clean_image = clean_broadcast_image_url(image_url)
         if str(image_url or "").strip() and not clean_image:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Image URL must start with http:// or https:// (or be left empty).", ephemeral=True
             )
         try:
@@ -7555,41 +7725,40 @@ async def broadcast_templates_command(
                 actor_name,
                 image_url=clean_image,
             )
+            await refresh_interaction_caches()
             art_note = " with 🖼️ artwork" if clean_image else ""
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"✅ Template **{name.strip()}** created (#{new_id}){art_note}. Use it via `/broadcast template:` — variables like {{username}} {{points}} {{rank}} work.",
                 ephemeral=True,
             )
         except Exception as exc:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Could not create template: {exc}", ephemeral=True
             )
 
     if action.value == "delete":
         if not name.strip():
-            return await interaction.response.send_message("❌ Give the template name or id to delete.", ephemeral=True)
+            return await interaction.followup.send("❌ Give the template name or id to delete.", ephemeral=True)
         deleted = db_delete_broadcast_template(name.strip())
         if deleted:
-            return await interaction.response.send_message(f"🗑️ Template `{name.strip()}` deleted.", ephemeral=True)
-        return await interaction.response.send_message(f"❌ No template found for `{name.strip()}`.", ephemeral=True)
+            await refresh_interaction_caches()
+            return await interaction.followup.send(f"🗑️ Template `{name.strip()}` deleted.", ephemeral=True)
+        return await interaction.followup.send(f"❌ No template found for `{name.strip()}`.", ephemeral=True)
 
-    return await interaction.response.send_message("Unknown action.", ephemeral=True)
+    return await interaction.followup.send("Unknown action.", ephemeral=True)
 
 
 @broadcast_templates_command.autocomplete("name")
 async def broadcast_templates_name_autocomplete(interaction: discord.Interaction, current: str):
     if not has_broadcast_permission(interaction.user):
         return []
-    try:
-        templates = db_list_broadcast_templates(limit=25)
-        needle = str(current or "").strip().lower()
-        return [
-            app_commands.Choice(name=t["name"], value=t["name"])
-            for t in templates
-            if not needle or needle in t["name"].lower()
-        ][:25]
-    except Exception:
-        return []
+    with _interaction_cache_lock:
+        templates = list(_broadcast_template_choice_cache)
+    needle = str(current or "").strip().lower()
+    return [
+        app_commands.Choice(name=t["name"], value=t["name"])
+        for t in templates if not needle or needle in t["name"].lower()
+    ][:25]
 
 
 def likely_ticket_channel(channel):
@@ -7701,12 +7870,13 @@ class TicketLinkUserSelect(discord.ui.UserSelect):
         self.channel_id = int(channel_id)
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         if not has_broadcast_permission(interaction.user):
-            return await interaction.response.send_message("❌ You do not have permission to save ticket links.", ephemeral=True)
+            return await interaction.followup.send("❌ You do not have permission to save ticket links.", ephemeral=True)
 
         member = self.values[0]
         if db_set_ticket_channel(member.id, self.channel_id):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ Saved this ticket for {member.mention}.",
                 ephemeral=True,
             )
@@ -7718,7 +7888,7 @@ class TicketLinkUserSelect(discord.ui.UserSelect):
             except Exception:
                 pass
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ {member.mention} is not linked in the bot database yet. Link/accept them first, then try again.",
                 ephemeral=True,
             )
@@ -9487,10 +9657,17 @@ class TicketWelcomeView(discord.ui.View):
     @discord.ui.button(label="Submit Application", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_submit_application")
     async def submit_application(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            row = find_ticket_in_channel(interaction.channel)
-            if not row:
-                return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-            if interaction.user.id != int(row[3]):
+            # Opening a modal cannot be deferred first. Validate from the cached
+            # channel topic only; the modal submission performs full DB checks
+            # after it has acknowledged Discord.
+            topic = str(getattr(interaction.channel, "topic", "") or "")
+            owner_match = re.search(r"mcwv-ticket-owner:(\d+)", topic)
+            if not owner_match:
+                return await interaction.response.send_message(
+                    "❌ This old application control has no safe owner metadata. Please use the main application panel.",
+                    ephemeral=True,
+                )
+            if interaction.user.id != int(owner_match.group(1)):
                 return await interaction.response.send_message("Only the ticket opener can submit this application.", ephemeral=True)
             await interaction.response.send_modal(ApplicationModal(interaction.user))
         except discord.HTTPException as http_exc:
@@ -9616,9 +9793,18 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         self.control_message_id = control_message_id
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if not has_mcwv_ticket_staff_permission(interaction.user):
+            return await interaction.followup.send("❌ Staff only.", ephemeral=True)
+        row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
+        if not row:
+            return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
+        resolved_ticket_id = str(row[0])
+        if self.ticket_id and self.ticket_id != "persistent" and resolved_ticket_id != str(self.ticket_id):
+            return await interaction.followup.send("❌ This confirmation does not match this ticket.", ephemeral=True)
+
         ticket_channel = await prepare_ticket_close(
             interaction.guild,
-            self.ticket_id,
+            resolved_ticket_id,
             interaction.user.id,
             str(self.reason.value),
             interaction.channel,
@@ -9636,7 +9822,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             return
 
         await interaction.followup.send("✅ Transcript saved and sent, control message removed. Deleting the ticket channel shortly.", ephemeral=True)
-        await finalize_ticket_close(ticket_channel, str(interaction.user), str(self.reason.value), self.ticket_id)
+        await finalize_ticket_close(ticket_channel, str(interaction.user), str(self.reason.value), resolved_ticket_id)
 
 
 class AcceptConfirmView(discord.ui.View):
@@ -9717,13 +9903,14 @@ class StaffInfoView(discord.ui.View):
 
     @discord.ui.button(label="Blacklist applicant", style=discord.ButtonStyle.danger)
     async def blacklist_applicant(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
-            return await interaction.response.send_message("❌ This must be used in the server.", ephemeral=True)
+            return await interaction.followup.send("❌ This must be used in the server.", ephemeral=True)
 
         role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
         if not role:
-            return await interaction.response.send_message("❌ Blacklist role not found. Check MCWV_TICKET_BLACKLIST_ROLE_ID.", ephemeral=True)
+            return await interaction.followup.send("❌ Blacklist role not found. Check MCWV_TICKET_BLACKLIST_ROLE_ID.", ephemeral=True)
 
         member = guild.get_member(self.applicant_id)
         if member is None:
@@ -9733,19 +9920,19 @@ class StaffInfoView(discord.ui.View):
                 member = None
 
         if member is None:
-            return await interaction.response.send_message("❌ Applicant is no longer in the server.", ephemeral=True)
+            return await interaction.followup.send("❌ Applicant is no longer in the server.", ephemeral=True)
 
         try:
             await member.add_roles(role, reason=f"Ticket blacklist by {interaction.user}")
             db_ticket_blacklist_add(member.id, f"Blacklisted from Staff Info by {interaction.user}", interaction.user.id)
             db_ticket_log(self.ticket_id, interaction.user.id, "ticket/blacklist", f"Blacklisted {member} from opening application tickets", {"roleId": str(role.id)})
-            await interaction.response.send_message(f"✅ {member.mention} has been given **{role.name}** and cannot open application tickets.", ephemeral=True)
+            await interaction.followup.send(f"✅ {member.mention} has been given **{role.name}** and cannot open application tickets.", ephemeral=True)
             try:
                 await interaction.channel.send(f"🚫 {member.mention} has been blacklisted from opening MCWV application tickets by {interaction.user.mention}.")
             except Exception:
                 pass
         except Exception as exc:
-            await interaction.response.send_message(f"❌ Failed to add blacklist role: `{exc}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Failed to add blacklist role: `{exc}`", ephemeral=True)
 
 
 class CloseConfirmView(discord.ui.View):
@@ -9768,11 +9955,11 @@ class CloseConfirmView(discord.ui.View):
     @discord.ui.button(label="Continue to close", style=discord.ButtonStyle.danger)
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            row = db_get_ticket_by_ticket_id(self.ticket_id) or find_ticket_in_channel(interaction.channel)
-            if not row:
-                return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-            if str(row[0]) != self.ticket_id:
-                return await interaction.response.send_message("❌ This confirmation does not match this ticket.", ephemeral=True)
+            # A modal response cannot follow a defer. Open it immediately from
+            # the ticket ID already bound to this confirmation; the modal submit
+            # performs the full DB/channel validation after deferring.
+            if not self.ticket_id or self.ticket_id == "persistent":
+                return await interaction.response.send_message("❌ Ticket metadata is missing. Please press Close again.", ephemeral=True)
             await interaction.response.send_modal(CloseTicketModal(self.ticket_id, self.control_channel_id, self.control_message_id))
             self.stop()
         except discord.HTTPException as http_exc:
@@ -9831,16 +10018,17 @@ class ApplicationReviewView(discord.ui.View):
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="mcwv_ticket_accept")
     async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         if not self.staff_ok(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return await interaction.followup.send("❌ Staff only.", ephemeral=True)
         ticket_id = self.resolved_ticket_id(interaction)
         row = db_get_ticket_by_ticket_id(ticket_id) or find_ticket_in_channel(interaction.channel)
         if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
+            return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
         if str(row[6] or "").lower() == "accepted":
-            return await interaction.response.send_message("This application is already accepted.", ephemeral=True)
+            return await interaction.followup.send("This application is already accepted.", ephemeral=True)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             (
                 "⚠️ **Are you sure you want to accept this applicant?**\n\n"
                 "Before confirming, make sure you have checked:\n"
@@ -9855,13 +10043,13 @@ class ApplicationReviewView(discord.ui.View):
 
     @discord.ui.button(label="Staff Info", style=discord.ButtonStyle.primary, custom_id="mcwv_ticket_staff_info")
     async def staff_info_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         if not self.staff_ok(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return await interaction.followup.send("❌ Staff only.", ephemeral=True)
         ticket_id = self.resolved_ticket_id(interaction)
         row = db_get_ticket_by_ticket_id(ticket_id) or find_ticket_in_channel(interaction.channel)
         if not row:
-            return await interaction.response.send_message("❌ Ticket record not found.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
+            return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
         embed = await build_staff_info_embed(row)
         await interaction.followup.send(embed=embed, view=StaffInfoView(row[0], row[3]), ephemeral=True)
 
@@ -11540,16 +11728,14 @@ async def checkplayer_autocomplete(interaction: discord.Interaction, current: st
         if not current_lower or current_lower in name.lower():
             choices.append(app_commands.Choice(name=name, value=name))
 
-    # Tracked members from DB
-    try:
-        users = db_get_all_tracked()
-        for row in users:
-            username = str(row[2]) if len(row) > 2 and row[2] else str(row[0])
-            if not current_lower or current_lower in username.lower():
-                if not any(c.value == username for c in choices):
-                    choices.append(app_commands.Choice(name=username, value=username))
-    except Exception:
-        pass
+    # Tracked members from the worker-refreshed snapshot (never query on a keystroke).
+    with _interaction_cache_lock:
+        users = list(_tracked_user_choice_cache)
+    for row in users:
+        username = str(row[2]) if len(row) > 2 and row[2] else str(row[0])
+        if not current_lower or current_lower in username.lower():
+            if not any(c.value == username for c in choices):
+                choices.append(app_commands.Choice(name=username, value=username))
 
     return choices[:25]
 
@@ -13905,8 +14091,9 @@ async def cachewar(interaction: discord.Interaction, battle_id: str):
 @bot.tree.command(name="cachedbstats", description="Show stats for the cross-clan history cache", guild=guild_obj)
 @require_role()
 async def cachedbstats(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     if not db_enabled():
-        return await interaction.response.send_message("Database is not available.", ephemeral=True)
+        return await interaction.followup.send("Database is not available.", ephemeral=True)
 
     ensure_cross_clan_history_table()
     try:
@@ -13945,11 +14132,11 @@ async def cachedbstats(interaction: discord.Interaction):
             embed.add_field(name="Recent Cached Battles", value="\n".join(lines), inline=False)
 
         embed.set_footer(text="Use /backfill_history to cache more battles")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         pass  # keep connection alive
 
     except Exception as e:
-        await interaction.response.send_message(f"Error: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"Error: `{e}`", ephemeral=True)
 
 
 
@@ -13971,11 +14158,12 @@ async def ticket_panel_send(
     hex_color: str = None,
     thumbnail_url: str = None,
 ):
+    await interaction.response.defer(ephemeral=True)
     if not has_mcwv_ticket_staff_permission(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return await interaction.followup.send("❌ Staff only.", ephemeral=True)
     target_channel = channel or interaction.guild.get_channel(MCWV_TICKET_PANEL_CHANNEL_ID)
     if not isinstance(target_channel, discord.TextChannel):
-        return await interaction.response.send_message("❌ Ticket panel channel is not configured correctly.", ephemeral=True)
+        return await interaction.followup.send("❌ Ticket panel channel is not configured correctly.", ephemeral=True)
     settings_panel = get_mcwv_ticket_settings().get("panel", {})
     embed = discord.Embed(
         title=str(title or "MCWV Applications")[:256],
@@ -13988,7 +14176,7 @@ async def ticket_panel_send(
         embed.set_thumbnail(url=thumbnail)
     embed.set_footer(text="MCWV Applications")
     await target_channel.send(embed=embed, view=MCWVTicketPanelView(button_label))
-    await interaction.response.send_message(f"✅ Ticket panel sent in {target_channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Ticket panel sent in {target_channel.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="ticket_review_restore", description="Re-send any missing application review cards into their ticket channels", guild=guild_obj)
@@ -14003,10 +14191,11 @@ async def ticket_review_restore(interaction: discord.Interaction):
 @bot.tree.command(name="reject", description="Reject this application and close the ticket", guild=guild_obj)
 @app_commands.describe(reason="Why the application is being rejected (optional — defaults to 'Rejected')")
 async def reject_application(interaction: discord.Interaction, reason: str = None):
+    await interaction.response.defer(ephemeral=True)
     if not interaction.guild:
-        return await interaction.response.send_message("❌ This can only be used in the server.", ephemeral=True)
+        return await interaction.followup.send("❌ This can only be used in the server.", ephemeral=True)
     if not has_mcwv_ticket_staff_permission(interaction.user):
-        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return await interaction.followup.send("❌ Staff only.", ephemeral=True)
 
     channel = interaction.channel
     channel_id = channel.id
@@ -14052,17 +14241,16 @@ async def reject_application(interaction: discord.Interaction, reason: str = Non
 
     if not row:
         print(f"[reject] no ticket found for channel_id={channel_id} or in topic={topic!r}")
-        return await interaction.response.send_message("❌ Run this command inside an application ticket channel.", ephemeral=True)
+        return await interaction.followup.send("❌ Run this command inside an application ticket channel.", ephemeral=True)
     status = str(row[6] or "").lower()
     if status == "accepted":
-        return await interaction.response.send_message("❌ This application is already accepted.", ephemeral=True)
+        return await interaction.followup.send("❌ This application is already accepted.", ephemeral=True)
     if status in ("rejected", "closed"):
-        return await interaction.response.send_message(f"❌ This application is already {status}.", ephemeral=True)
+        return await interaction.followup.send(f"❌ This application is already {status}.", ephemeral=True)
 
     final_reason = (reason or "").strip() or "Rejected"
     ticket_id = str(row[0])
     opener_id = int(row[3]) if row[3] else None
-    await interaction.response.defer(ephemeral=True)
 
     now = datetime.now(timezone.utc)
     reject_embed = discord.Embed(
@@ -14128,15 +14316,16 @@ async def broadcast_ticket_link(
     member: discord.Member,
     channel: discord.TextChannel = None,
 ):
+    await interaction.response.defer(ephemeral=True)
     if not has_broadcast_permission(interaction.user):
-        return await interaction.response.send_message("❌ You do not have permission to link broadcast tickets.", ephemeral=True)
+        return await interaction.followup.send("❌ You do not have permission to link broadcast tickets.", ephemeral=True)
 
     target_channel = channel or interaction.channel
     if not isinstance(target_channel, discord.TextChannel):
-        return await interaction.response.send_message("❌ Please run this in a ticket text channel or choose a text channel.", ephemeral=True)
+        return await interaction.followup.send("❌ Please run this in a ticket text channel or choose a text channel.", ephemeral=True)
 
     if getattr(member, "bot", False):
-        return await interaction.response.send_message("❌ Pick the clan member, not a bot.", ephemeral=True)
+        return await interaction.followup.send("❌ Pick the clan member, not a bot.", ephemeral=True)
 
     if db_set_ticket_channel(member.id, target_channel.id):
         actor_name = broadcast_actor_name(interaction)
@@ -14152,12 +14341,12 @@ async def broadcast_ticket_link(
                 "channelName": target_channel.name,
             },
         )
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             f"✅ Saved {target_channel.mention} as the broadcast ticket for {member.mention}.",
             ephemeral=True,
         )
 
-    return await interaction.response.send_message(
+    return await interaction.followup.send(
         f"⚠️ {member.mention} is not linked in the bot database yet. Accept/link them first, then try again.",
         ephemeral=True,
     )
@@ -14177,10 +14366,10 @@ async def broadcast_ticket_sync(
     send_menus: bool = True,
     name_fallback: bool = False,
 ):
-    if not has_broadcast_permission(interaction.user):
-        return await interaction.response.send_message("❌ You do not have permission to sync broadcast tickets.", ephemeral=True)
-
     await interaction.response.defer(ephemeral=True)
+    if not has_broadcast_permission(interaction.user):
+        return await interaction.followup.send("❌ You do not have permission to sync broadcast tickets.", ephemeral=True)
+
 
     guild = interaction.guild
     if not guild:
@@ -14475,17 +14664,17 @@ async def list_users(interaction: discord.Interaction):
 
     except Exception as e:
         print("[LIST ERROR]", repr(e))
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "❌ List command failed.",
-                ephemeral=True
-            )
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ List command failed.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ List command failed.", ephemeral=True)
             
 @bot.tree.command(name="offlinelist", description="Show only currently offline users and how long they've been offline", guild=guild_obj)
 @require_role()
 async def offlinelist(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     if not offline_since:
-        return await interaction.response.send_message("✅ No tracked users are currently offline.", ephemeral=True)
+        return await interaction.followup.send("✅ No tracked users are currently offline.", ephemeral=True)
 
     users = db_get_all()
     lines = []
@@ -14498,7 +14687,7 @@ async def offlinelist(interaction: discord.Interaction):
         lines.append(f"⚫ <@{info[1]}> — **{info[2]}** (offline for **{duration}**)")
 
     if not lines:
-        return await interaction.response.send_message("✅ No tracked users are currently offline.", ephemeral=True)
+        return await interaction.followup.send("✅ No tracked users are currently offline.", ephemeral=True)
 
     embed = discord.Embed(
         title="⚫ Offline Users",
@@ -14506,7 +14695,7 @@ async def offlinelist(interaction: discord.Interaction):
         color=discord.Color.dark_gray()
     )
     embed.set_footer(text=f"{len(lines)} user(s) offline")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="toggleoffline", description="Toggle offline ping alerts on/off", guild=guild_obj)
 @require_role()
@@ -14521,9 +14710,10 @@ async def toggleoffline(interaction: discord.Interaction):
 @bot.tree.command(name="setreminderinterval", description="Set how often (in minutes) offline reminders are sent", guild=guild_obj)
 @require_role()
 async def setreminderinterval(interaction: discord.Interaction, minutes: int):
+    await interaction.response.defer(ephemeral=True)
     global reminder_interval
     if minutes < 5:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             "❌ Minimum interval is 5 minutes.", ephemeral=True
         )
     reminder_interval = minutes
@@ -14531,17 +14721,18 @@ async def setreminderinterval(interaction: discord.Interaction, minutes: int):
     reminder_loop.change_interval(minutes=minutes)
     if reminder_loop.is_running():
         reminder_loop.restart()
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"⏱️ Offline reminders will now be sent every **{minutes} minute(s)**.", ephemeral=True
     )
 
 @bot.tree.command(name="setreminderchannel", description="Set the channel where offline reminders are sent", guild=guild_obj)
 @require_role()
 async def setreminderchanel(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     global reminder_channel_id
     reminder_channel_id = channel.id
     db_set_setting("reminder_channel_id", channel.id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"📢 Offline reminders will now be sent to {channel.mention}.", ephemeral=True
     )
 
@@ -15442,6 +15633,7 @@ class ProfileView(discord.ui.View):
 
     @discord.ui.button(label="🔧 Debug", style=discord.ButtonStyle.red)
     async def debug_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         try:
             import json
 
@@ -15454,7 +15646,7 @@ class ProfileView(discord.ui.View):
             pretty = json.dumps(data, indent=2, ensure_ascii=False)
             chunks = self._split_text(pretty, 1800)
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"```json\n{chunks[0]}\n```",
                 ephemeral=True
             )
@@ -15467,7 +15659,7 @@ class ProfileView(discord.ui.View):
 
         except Exception as e:
             if not interaction.response.is_done():
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"❌ Debug failed: `{e}`",
                     ephemeral=True
                 )
@@ -16307,7 +16499,8 @@ def clear_tracking_for_roblox_id(roblox_id: str):
 
 
 async def cleanup_autocomplete(interaction: discord.Interaction, current: str):
-    users = db_get_all()
+    with _interaction_cache_lock:
+        users = list(_tracked_user_choice_cache)
     results = []
     current_lower = current.lower().strip()
 
@@ -17904,10 +18097,16 @@ class ClanReviewView(discord.ui.View):
         except Exception as e:
             print("Approve button error:", e)
             try:
-                await interaction.response.send_message(
-                    "❌ Something went wrong while processing this.",
-                    ephemeral=True
-                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "❌ Something went wrong while processing this.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "❌ Something went wrong while processing this.",
+                        ephemeral=True,
+                    )
             except Exception:
                 pass
 
@@ -20801,12 +21000,42 @@ def start_bot_loops():
     if not db_keeper_loop.is_running():
         db_keeper_loop.start()
 
+    if not interaction_cache_refresh_loop.is_running():
+        interaction_cache_refresh_loop.start()
+
+    if not event_loop_watchdog.is_running():
+        event_loop_watchdog.start()
+
     # ---------------- WAR CACHE WINDOW LOOP ----------------
     if not war_cache_window_loop.is_running():
         war_cache_window_loop.start()
 
 
 # ---------------- LOOP HEALTH MONITOR + DB HEALTH ----------------
+
+_bot_event_loop_lag = 0.0
+_bot_watchdog_last = None
+
+
+@tasks.loop(seconds=2)
+async def event_loop_watchdog():
+    global _bot_event_loop_lag, _bot_watchdog_last
+    now = asyncio.get_running_loop().time()
+    if _bot_watchdog_last is not None:
+        _bot_event_loop_lag = max(0.0, now - _bot_watchdog_last - 2.0)
+        if _bot_event_loop_lag >= 1.0:
+            print(f"[timeout-watchdog] event loop lag {_bot_event_loop_lag:.3f}s")
+    _bot_watchdog_last = now
+
+
+@tasks.loop(minutes=1)
+async def interaction_cache_refresh_loop():
+    await refresh_interaction_caches()
+
+
+@interaction_cache_refresh_loop.before_loop
+async def before_interaction_cache_refresh_loop():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(minutes=1)
@@ -20853,6 +21082,8 @@ ALL_LOOPS = [
     ("Broadcast", "broadcast_scheduler_loop"),
     ("Giveaway", "check_giveaway_event"),
     ("DB Keeper", "db_keeper_loop"),
+    ("Interaction Cache", "interaction_cache_refresh_loop"),
+    ("Event Loop Watchdog", "event_loop_watchdog"),
     ("War Cache", "war_cache_window_loop"),
 ]
 
@@ -21114,7 +21345,7 @@ async def setwartime_cmd(interaction: discord.Interaction, battle_id: str, start
 # ---------------- READY ----------------
 @bot.event
 async def on_ready():
-    global session, reminder_interval, reminder_channel_id
+    global session, reminder_interval, reminder_channel_id, _database_initializing
 
     print("🚀 ON_READY HIT")
 
@@ -21141,6 +21372,27 @@ async def on_ready():
         print("✅ DB schema initialized")
     except Exception as e:
         print(f"❌ DB schema init error: {e}")
+    finally:
+        _database_initializing = False
+        try:
+            if conn is not None and conn.closed == 0:
+                with conn.cursor() as cur:
+                    cur.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
+                    cur.execute(f"SET lock_timeout = {DB_LOCK_TIMEOUT_MS}")
+                    cur.execute("SET idle_in_transaction_session_timeout = 10000")
+        except Exception as timeout_exc:
+            print(f"⚠️ Could not apply runtime DB limits: {type(timeout_exc).__name__}")
+
+    # ---------------- PREWARM INTERACTION SETTINGS ----------------
+    # Modal constructors and permission checks cannot wait on PostgreSQL before
+    # acknowledging Discord, so retain these values in the process cache.
+    try:
+        db_get_setting("broadcast_allowed_user_ids", "")
+        db_get_setting("mcwv_ticket_settings", "")
+        ensure_broadcast_feature_tables()
+        await refresh_interaction_caches()
+    except Exception as e:
+        print(f"⚠️ Failed to prewarm interaction settings: {type(e).__name__}")
 
     # ---------------- LOAD SAVED SETTINGS ----------------
     try:
