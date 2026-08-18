@@ -52,14 +52,19 @@ def health():
     database_ready = bool(probe and probe())
     bot_obj = globals().get("bot")
     discord_ready = bool(bot_obj and bot_obj.is_ready())
+    guilds = list(bot_obj.guilds) if bot_obj else []
+    members_intent = bool(bot_obj and getattr(bot_obj.intents, "members", False))
+    member_cache_ready = bool(guilds and all(getattr(guild, "chunked", False) for guild in guilds))
     healthy = database_ready and discord_ready
     return jsonify({
         "service": "MCWV BOT",
         "status": "ok" if healthy else "degraded",
         "database_ready": database_ready,
         "discord_ready": discord_ready,
+        "members_intent": members_intent,
+        "member_cache_ready": member_cache_ready,
         "event_loop_lag_ms": round(float(globals().get("_bot_event_loop_lag", 0.0)) * 1000, 1),
-        "guilds": len(bot_obj.guilds) if bot_obj else 0,
+        "guilds": len(guilds),
     }), 200 if healthy else 503
 
 
@@ -71,6 +76,7 @@ ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
 HUB_BASE_URL = (os.environ.get("MCWV_HUB_URL") or os.environ.get("HUB_URL") or "https://mcwv-hub.vercel.app").rstrip("/")
 WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "")
 WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "1") or "1"))
+BADGE_ROLE_SYNC_INTERVAL_MINUTES = max(5, int(os.environ.get("BADGE_ROLE_SYNC_INTERVAL_MINUTES", "20") or "20"))
 OFFICER_GUIDE_ROLE_ID = int(os.environ.get("OFFICER_GUIDE_ROLE_ID", "1501986357516701827"))
 STARTED_AT = time.time()
 LAST_HEARTBEAT = datetime.now(timezone.utc).isoformat()
@@ -360,10 +366,119 @@ def admin_channels():
         return jsonify({"error": str(exc), "channels": []}), 500
 
 
+# Member-role snapshots are read from Discord's gateway-populated member cache,
+# never from one REST GET per member. Role changes invalidate entries through
+# the listeners registered after the bot is constructed.
+MEMBER_ROLE_CACHE_TTL_SECONDS = max(
+    30,
+    int(os.environ.get("MEMBER_ROLE_CACHE_TTL_SECONDS", "120") or "120"),
+)
+_MEMBER_ROLE_CACHE = {}
+_MEMBER_CHUNK_LOCK = None
+
+
+def _invalidate_member_role_cache(member_id):
+    try:
+        _MEMBER_ROLE_CACHE.pop(int(member_id), None)
+    except Exception:
+        pass
+
+
+async def _ensure_guild_member_cache(guild):
+    """Best-effort gateway chunk; never falls back to REST member fetches."""
+    global _MEMBER_CHUNK_LOCK
+    if guild is None or getattr(guild, "chunked", False):
+        return bool(guild and getattr(guild, "chunked", False))
+    if _MEMBER_CHUNK_LOCK is None:
+        _MEMBER_CHUNK_LOCK = asyncio.Lock()
+    async with _MEMBER_CHUNK_LOCK:
+        if getattr(guild, "chunked", False):
+            return True
+        try:
+            await asyncio.wait_for(guild.chunk(cache=True), timeout=15)
+        except Exception as exc:
+            print(f"[member-role-cache] gateway chunk unavailable: {type(exc).__name__}")
+    return bool(getattr(guild, "chunked", False))
+
+
+async def _member_role_snapshot(discord_ids):
+    guild = broadcast_primary_guild()
+    if not guild:
+        raise ValueError("Discord guild is not available yet.")
+
+    cache_complete = await _ensure_guild_member_cache(guild)
+    now = time.monotonic()
+    members = {}
+    for user_id in discord_ids:
+        cached = _MEMBER_ROLE_CACHE.get(user_id)
+        if cached and cached[0] > now:
+            members[str(user_id)] = cached[1]
+            continue
+
+        member = guild.get_member(user_id)
+        if member is not None:
+            payload = {
+                "found": True,
+                "certain": True,
+                "roles": [str(role.id) for role in member.roles],
+            }
+        elif cache_complete:
+            payload = {"found": False, "certain": True, "roles": []}
+        else:
+            # Preserve the user's current badges when the gateway cache is not
+            # complete; an uncertain absence must never be treated as a removal.
+            payload = {"found": False, "certain": False, "roles": []}
+
+        if payload["certain"]:
+            _MEMBER_ROLE_CACHE[user_id] = (
+                now + MEMBER_ROLE_CACHE_TTL_SECONDS,
+                payload,
+            )
+        members[str(user_id)] = payload
+
+    return {
+        "success": True,
+        "source": "discord-member-cache",
+        "cacheComplete": cache_complete,
+        "members": members,
+    }
+
+
+@app.route("/admin/members/roles", methods=["POST"])
+@require_admin_api_key
+def admin_member_roles():
+    body = request.get_json(silent=True) or {}
+    raw_ids = body.get("discord_ids") or body.get("discordIds") or []
+    if not isinstance(raw_ids, list):
+        return jsonify({"error": "discord_ids must be a list"}), 400
+    if len(raw_ids) > 500:
+        return jsonify({"error": "A maximum of 500 discord_ids is allowed"}), 400
+
+    discord_ids = []
+    for value in raw_ids:
+        try:
+            user_id = int(value)
+        except Exception:
+            return jsonify({"error": "Every discord_id must be numeric"}), 400
+        if user_id > 0 and user_id not in discord_ids:
+            discord_ids.append(user_id)
+
+    try:
+        future = _run_on_bot_loop(_member_role_snapshot(discord_ids))
+        return jsonify(future.result(timeout=20))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 async def _admin_roles_payload():
     bot_obj = globals().get("bot")
     if bot_obj is None or not getattr(bot_obj, "is_ready", lambda: False)():
         return []
+
+    for guild in bot_obj.guilds:
+        await _ensure_guild_member_cache(guild)
 
     roles = []
 
@@ -2319,10 +2434,11 @@ async def ensure_db_connection_async():
 _interaction_cache_lock = _threading.RLock()
 _broadcast_template_choice_cache = []
 _tracked_user_choice_cache = []
+_battle_schedule_cache = {}
 
 
 def refresh_interaction_caches_sync():
-    global _broadcast_template_choice_cache, _tracked_user_choice_cache
+    global _broadcast_template_choice_cache, _tracked_user_choice_cache, _battle_schedule_cache
     if not DATABASE_URL:
         return False
     worker = None
@@ -2336,6 +2452,7 @@ def refresh_interaction_caches_sync():
         worker.autocommit = True
         templates = []
         users = []
+        battle_schedules = None
         with worker.cursor() as cur:
             try:
                 cur.execute("SELECT id, name, audience FROM broadcast_templates ORDER BY LOWER(name) LIMIT 100")
@@ -2353,9 +2470,35 @@ def refresh_interaction_caches_sync():
                 (str(row[0]), int(row[1]) if row[1] is not None else 0, str(row[2] or row[0]))
                 for row in cur.fetchall()
             ]
+            try:
+                cur.execute("""
+                    SELECT battle_id, battle_name,
+                           EXTRACT(EPOCH FROM start_time)::bigint,
+                           EXTRACT(EPOCH FROM end_time)::bigint,
+                           COALESCE(manually_edited, FALSE)
+                    FROM battles
+                    WHERE start_time IS NOT NULL OR end_time IS NOT NULL
+                """)
+                battle_schedules = {
+                    normalize_hourly_battle_key(str(row[0] or "")): {
+                        "battle_id": row[0],
+                        "battle_name": row[1],
+                        "start": int(row[2]) if row[2] is not None else None,
+                        "finish": int(row[3]) if row[3] is not None else None,
+                        "manually_edited": bool(row[4]),
+                    }
+                    for row in cur.fetchall()
+                    if normalize_hourly_battle_key(str(row[0] or ""))
+                }
+            except Exception:
+                # The existing snapshot remains authoritative until a later
+                # refresh succeeds; hot Discord loops never query this table.
+                battle_schedules = None
         with _interaction_cache_lock:
             _broadcast_template_choice_cache = templates
             _tracked_user_choice_cache = users
+            if battle_schedules is not None:
+                _battle_schedule_cache = battle_schedules
         return True
     except Exception as exc:
         print(f"[interaction-cache] refresh failed: {type(exc).__name__}")
@@ -2373,9 +2516,12 @@ async def refresh_interaction_caches():
 
 
 def database_probe_sync():
-    """Bounded real database probe used only by the Flask health thread."""
+    """Health check without allocating a new session when the bot already has one."""
     if not DATABASE_URL:
         return False
+    existing = globals().get("conn")
+    if existing is not None and getattr(existing, "closed", 1) == 0:
+        return True
     worker = None
     try:
         worker = psycopg2.connect(
@@ -2600,41 +2746,15 @@ def db_list_active_loas():
 
 
 def get_battles_war_state():
-    """Latest battle from the `battles` table (War Schedule editor, /setwartime,
-    auto backfill). Returns dict(battle_id, battle_name, start, finish,
-    manually_edited) or None. This is the single source of truth for manually
-    scheduled war dates."""
-    if not db_enabled():
+    """Latest worker-cached battle schedule without event-loop PostgreSQL I/O."""
+    with _interaction_cache_lock:
+        rows = [dict(row) for row in _battle_schedule_cache.values()]
+    if not rows:
         return None
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT battle_id, battle_name,
-                       EXTRACT(EPOCH FROM start_time)::bigint,
-                       EXTRACT(EPOCH FROM end_time)::bigint,
-                       COALESCE(manually_edited, FALSE)
-                FROM battles
-                WHERE start_time IS NOT NULL OR end_time IS NOT NULL
-                ORDER BY COALESCE(end_time, start_time) DESC
-                LIMIT 1
-            """)
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "battle_id": row[0],
-                "battle_name": row[1],
-                "start": int(row[2]) if row[2] is not None else None,
-                "finish": int(row[3]) if row[3] is not None else None,
-                "manually_edited": bool(row[4]),
-            }
-    except Exception as e:
-        print("get_battles_war_state error:", e)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return None
+    return max(
+        rows,
+        key=lambda row: int(row.get("finish") or row.get("start") or 0),
+    )
 
 
 def battles_match(battle_id_a, battle_id_b):
@@ -2646,41 +2766,17 @@ def battles_match(battle_id_a, battle_id_b):
 
 
 def get_battles_row_for(battle_id):
-    """The battles-table row matching battle_id (by normalized key), regardless
-    of whether a newer row exists. Used for war-state overrides so a
-    pre-announced next war can never shadow the current one."""
-    if not db_enabled():
-        return None
+    """Read a worker-refreshed schedule snapshot without blocking Discord.
+
+    The cache refreshes once a minute on a worker thread. Hot war/placement
+    loops must never run synchronous psycopg2 queries on the event loop.
+    """
     target = normalize_hourly_battle_key(str(battle_id or ""))
     if not target:
         return None
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT battle_id, battle_name,
-                       EXTRACT(EPOCH FROM start_time)::bigint,
-                       EXTRACT(EPOCH FROM end_time)::bigint,
-                       COALESCE(manually_edited, FALSE)
-                FROM battles
-                WHERE start_time IS NOT NULL OR end_time IS NOT NULL
-            """)
-            for row in cur.fetchall():
-                if normalize_hourly_battle_key(str(row[0] or "")) == target:
-                    return {
-                        "battle_id": row[0],
-                        "battle_name": row[1],
-                        "start": int(row[2]) if row[2] is not None else None,
-                        "finish": int(row[3]) if row[3] is not None else None,
-                        "manually_edited": bool(row[4]),
-                    }
-            return None
-    except Exception as e:
-        print("get_battles_row_for error:", e)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return None
+    with _interaction_cache_lock:
+        row = _battle_schedule_cache.get(target)
+        return dict(row) if row else None
 
 
 async def perform_loa_revert(guild, record, actor, end_notes=""):
@@ -3483,7 +3579,24 @@ guild_obj = discord.Object(id=GUILD_ID)
 # ---------------- BOT ----------------
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!!", intents=intents)
+
+
+@bot.listen("on_member_update")
+async def invalidate_member_role_cache_on_update(before, after):
+    _invalidate_member_role_cache(after.id)
+
+
+@bot.listen("on_member_join")
+async def invalidate_member_role_cache_on_join(member):
+    _invalidate_member_role_cache(member.id)
+
+
+@bot.listen("on_member_remove")
+async def invalidate_member_role_cache_on_remove(member):
+    _invalidate_member_role_cache(member.id)
+
 
 @bot.listen("on_app_command_completion")
 async def track_admin_command_completion(interaction: discord.Interaction, command: app_commands.Command):
@@ -6250,12 +6363,8 @@ async def _admin_broadcast_access_from_body(discord_id):
     except Exception:
         raise ValueError("discord_id must be numeric")
 
+    await _ensure_guild_member_cache(guild)
     member = guild.get_member(discord_id_int)
-    if member is None:
-        try:
-            member = await guild.fetch_member(discord_id_int)
-        except Exception:
-            member = None
 
     if member is None:
         return {"success": True, "allowed": False, "reason": "Member not found in Discord server"}
@@ -17832,13 +17941,15 @@ async def war_poll_loop():
 
             data = await r.json()
 
-        print("📦 War API response:", data)
-
         config = data.get("data", {}).get("configData", {})
         PS99_CURRENT_WAR_NAME = config.get("Title") or config.get("configName") or data.get("data", {}).get("configName")
         start = config.get("StartTime")
         finish = config.get("FinishTime")
         now = datetime.now(timezone.utc).timestamp()
+        print(
+            f"[war poll] battle={PS99_CURRENT_WAR_NAME or 'unknown'} "
+            f"start={start or 'unknown'} finish={finish or 'unknown'}"
+        )
 
         currently_active = (
             isinstance(start, (int, float)) and
@@ -17854,10 +17965,8 @@ async def war_poll_loop():
         if currently_active and st:
             if st.get("finish") and float(st["finish"]) <= now:
                 currently_active = False
-                print(f"[war poll] war schedule override: {st['battle_id']} end_time passed — forcing peacetime")
             elif st.get("start") and float(st["start"]) > now:
                 currently_active = False
-                print(f"[war poll] war schedule override: {st['battle_id']} start_time not reached — holding peacetime")
 
         if ps99_first_check:
             ps99_first_check = False
@@ -17879,6 +17988,8 @@ async def war_poll_loop():
                 return
 
             if currently_active:
+                if hub_war_collect_loop.is_running():
+                    hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
                 await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
                 print("War started (state synced)")
                 await run_initial_presence_check()
@@ -18527,7 +18638,12 @@ async def get_big_games_index_clan_overview():
         return None
 
 
+_placement_poll_slow = False
+_placement_last_skip_key = None
+
+
 async def get_active_battle_id_for_placement():
+    global _placement_poll_slow
     # Prefer the v1 endpoint used by the Hub, then fall back to the legacy active battle endpoint.
     for url in (f"{PS99_API}/v1/clans/players", ACTIVE_BATTLE_API):
         payload = await fetch_json_for_placement(url)
@@ -18539,14 +18655,18 @@ async def get_active_battle_id_for_placement():
             continue
 
         if not battle_is_live(payload):
+            _placement_poll_slow = True
             return None
 
+        _placement_poll_slow = False
         return battle_id
 
+    _placement_poll_slow = True
     return None
 
 
 async def get_mcwv_placement_snapshot():
+    global _placement_poll_slow, _placement_last_skip_key
     battle_id = await get_active_battle_id_for_placement()
     if not battle_id:
         return None
@@ -18558,11 +18678,22 @@ async def get_mcwv_placement_snapshot():
     if st:
         now = time.time()
         if st.get("finish") and float(st["finish"]) <= now:
-            print(f"[placement] war schedule: {st['battle_id']} ended — snapshot skipped")
+            _placement_poll_slow = True
+            skip_key = f"ended:{st['battle_id']}"
+            if _placement_last_skip_key != skip_key:
+                print(f"[placement] war schedule: {st['battle_id']} ended — polling reduced")
+                _placement_last_skip_key = skip_key
             return None
         if st.get("start") and float(st["start"]) > now:
-            print(f"[placement] war schedule: {st['battle_id']} not started — snapshot skipped")
+            _placement_poll_slow = True
+            skip_key = f"future:{st['battle_id']}"
+            if _placement_last_skip_key != skip_key:
+                print(f"[placement] war schedule: {st['battle_id']} not started — polling reduced")
+                _placement_last_skip_key = skip_key
             return None
+
+    _placement_poll_slow = False
+    _placement_last_skip_key = None
 
     # Same primary source as the website: db.biggames.io overview.
     index_overview = await get_big_games_index_clan_overview()
@@ -20859,6 +20990,10 @@ async def placement_alert_loop():
     if not placement_alerts_enabled():
         return
     snapshot = await get_mcwv_placement_snapshot()
+    if _placement_poll_slow:
+        placement_alert_loop.change_interval(minutes=5)
+    else:
+        placement_alert_loop.change_interval(seconds=30)
     if not snapshot:
         return
     battle_id = snapshot["battleId"]
@@ -20872,7 +21007,6 @@ async def placement_alert_loop():
     old_rank = int(previous.get("rank") or rank)
     last_announced = float(previous.get("lastAnnouncedAt") or 0)
     if rank == old_rank:
-        save_placement_state(battle_id, rank, points, announced=False)
         return
     if time.time() - last_announced < MCWV_PLACEMENT_MIN_SECONDS:
         save_placement_state(battle_id, rank, points, announced=False)
@@ -20902,9 +21036,12 @@ async def before_placement_alert_loop():
 
 
 # ---------------- HUB WAR COLLECTOR LOOP ----------------
+_hub_collector_last_state = None
+
+
 @tasks.loop(minutes=WAR_COLLECT_INTERVAL_MINUTES)
 async def hub_war_collect_loop():
-    global session
+    global session, _hub_collector_last_state
 
     if not HUB_BASE_URL:
         return
@@ -20931,10 +21068,16 @@ async def hub_war_collect_loop():
 
             if data.get("success"):
                 if data.get("active"):
+                    hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
                     clan = data.get("clan") or {}
+                    _hub_collector_last_state = f"active:{data.get('battleId')}"
                     print(f"[hub war collector] saved {data.get('battleId')} rank={clan.get('rank')} points={clan.get('points')}")
                 else:
-                    print("[hub war collector] no active battle")
+                    hub_war_collect_loop.change_interval(minutes=max(5, WAR_COLLECT_INTERVAL_MINUTES))
+                    state = f"inactive:{data.get('battleId') or 'none'}"
+                    if _hub_collector_last_state != state:
+                        print(f"[hub war collector] inactive: {data.get('message') or 'no active battle'}")
+                    _hub_collector_last_state = state
             else:
                 print(f"[hub war collector] failed: {data or text[:300]}")
     except Exception as exc:
@@ -20944,6 +21087,46 @@ async def hub_war_collect_loop():
 
 @hub_war_collect_loop.before_loop
 async def before_hub_war_collect_loop():
+    await bot.wait_until_ready()
+
+
+# Trigger the Hub's atomic, stale-gated badge sync from this one long-running
+# service. This avoids user-request hooks and Vercel Hobby's daily cron limit.
+@tasks.loop(minutes=BADGE_ROLE_SYNC_INTERVAL_MINUTES)
+async def hub_badge_role_sync_loop():
+    global session
+    if not HUB_BASE_URL:
+        return
+    api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+    if not api_key:
+        return
+
+    try:
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        endpoint = f"{HUB_BASE_URL}/api/internal/badge-role-sync"
+        async with session.post(
+            endpoint,
+            headers={"X-Admin-API-Key": api_key, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=55),
+        ) as response:
+            data = await response.json(content_type=None)
+            if response.status != 200:
+                print(f"[badge role sync] Hub HTTP {response.status}: {str(data)[:200]}")
+                return
+            if data.get("ran"):
+                stats = data.get("stats") or {}
+                print(
+                    f"[badge role sync] checked={stats.get('usersChecked', 0)} "
+                    f"skipped={stats.get('usersSkipped', 0)} "
+                    f"grants={stats.get('grants', 0)} removals={stats.get('removals', 0)}"
+                )
+    except Exception as exc:
+        print(f"[badge role sync] Hub trigger failed: {type(exc).__name__}")
+
+
+@hub_badge_role_sync_loop.before_loop
+async def before_hub_badge_role_sync_loop():
     await bot.wait_until_ready()
 
 
@@ -20984,6 +21167,11 @@ def start_bot_loops():
         print(f"✅ Hub war collector loop started ({WAR_COLLECT_INTERVAL_MINUTES}m) -> {HUB_BASE_URL}")
     elif not HUB_BASE_URL:
         print("⚠️ Hub war collector loop not started: HUB_BASE_URL is empty")
+
+    if HUB_BASE_URL and not hub_badge_role_sync_loop.is_running():
+        hub_badge_role_sync_loop.change_interval(minutes=BADGE_ROLE_SYNC_INTERVAL_MINUTES)
+        hub_badge_role_sync_loop.start()
+        print(f"✅ Hub badge role sync loop started ({BADGE_ROLE_SYNC_INTERVAL_MINUTES}m)")
 
     if not clan_leave_loop.is_running():
         clan_leave_loop.start()
@@ -21038,28 +21226,29 @@ async def before_interaction_cache_refresh_loop():
     await bot.wait_until_ready()
 
 
-@tasks.loop(minutes=1)
-async def db_keeper_loop():
-    """Ping the shared DB connection every minute. If it's dead, schedule a
-    threaded heal instead of blocking the event loop on a reconnect."""
+def ping_shared_db_connection_sync():
+    """Bounded shared-connection ping; call only through asyncio.to_thread."""
+    current = globals().get("conn")
+    if current is None or getattr(current, "closed", 1) != 0:
+        return False
     try:
-        if not DATABASE_URL:
-            return
-        if conn is None or conn.closed != 0:
-            _schedule_db_heal()
-            return
-        with conn.cursor() as cur:
+        with current.cursor() as cur:
             cur.execute("SELECT 1")
-            cur.fetchone()
+            return bool(cur.fetchone())
     except Exception:
         try:
-            if conn is not None and conn.closed == 0:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            current.close()
         except Exception:
             pass
+        return False
+
+
+@tasks.loop(minutes=1)
+async def db_keeper_loop():
+    """Ping PostgreSQL on a worker so a network stall cannot freeze Discord."""
+    if not DATABASE_URL:
+        return
+    if not await asyncio.to_thread(ping_shared_db_connection_sync):
         _schedule_db_heal()
 
 
@@ -21078,6 +21267,7 @@ ALL_LOOPS = [
     ("Hourly Stats", "hourly_stats_loop"),
     ("Hourly Snapshot", "hourly_player_snapshot_loop"),
     ("Hub Collector", "hub_war_collect_loop"),
+    ("Hub Badge Sync", "hub_badge_role_sync_loop"),
     ("Screenshot", "ticket_screenshot_reminder_loop"),
     ("Broadcast", "broadcast_scheduler_loop"),
     ("Giveaway", "check_giveaway_event"),
@@ -21110,22 +21300,13 @@ async def health_monitor_loop():
     if restarted:
         print(f"[health] Restarted {len(restarted)} loops: {', '.join(restarted)}")
 
-    # 2. DB connection health check
+    # 2. DB connection health check. The actual socket I/O stays off the
+    # Discord event loop so a stalled pooler cannot block heartbeats.
     if DATABASE_URL:
-        try:
-            if conn is None or conn.closed:
-                print("[health] ⚠️ DB connection dead — reconnecting")
-                ensure_db_connection()
-            else:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-        except Exception as exc:
-            print(f"[health] ⚠️ DB health check failed: {exc} — reconnecting")
-            try:
-                ensure_db_connection()
-            except Exception:
-                print("[health] ❌ DB reconnect failed")
+        healthy = await asyncio.to_thread(ping_shared_db_connection_sync)
+        if not healthy:
+            print("[health] ⚠️ DB connection dead — healing in background")
+            _schedule_db_heal()
 
 
 @health_monitor_loop.before_loop
