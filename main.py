@@ -16596,7 +16596,10 @@ import re
 import discord
 from discord import app_commands
 
-STAFF_CHAT_CHANNEL_ID = 1501639281750442114
+STAFF_CHAT_CHANNEL_ID = int(
+    os.environ.get("MCWV_STAFF_CHAT_CHANNEL_ID", "1539244186203717732")
+    or "1539244186203717732"
+)
 CLAN_MEMBER_ROLE_ID = 1501986780667314246
 
 
@@ -18064,7 +18067,7 @@ async def clan_leave_loop():
         if not guild:
             return
 
-        staff_channel = await _get_channel(1501639281750442114)
+        staff_channel = await _get_channel(STAFF_CHAT_CHANNEL_ID)
         if not staff_channel:
             return
 
