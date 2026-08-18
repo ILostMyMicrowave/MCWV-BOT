@@ -2435,10 +2435,19 @@ _interaction_cache_lock = _threading.RLock()
 _broadcast_template_choice_cache = []
 _tracked_user_choice_cache = []
 _battle_schedule_cache = {}
+_broadcast_schedule_cache = []
+_broadcast_schedule_cache_at = 0.0
+_broadcast_conversion_last_check = 0.0
+_giveaway_state_cache = None
+_invite_event_state_cache = None
+_event_state_cache_at = 0.0
 
 
 def refresh_interaction_caches_sync():
-    global _broadcast_template_choice_cache, _tracked_user_choice_cache, _battle_schedule_cache
+    global _broadcast_template_choice_cache, _tracked_user_choice_cache
+    global _battle_schedule_cache, _broadcast_schedule_cache
+    global _broadcast_schedule_cache_at, _broadcast_conversion_last_check
+    global _giveaway_state_cache, _invite_event_state_cache, _event_state_cache_at
     if not DATABASE_URL:
         return False
     worker = None
@@ -2453,6 +2462,9 @@ def refresh_interaction_caches_sync():
         templates = []
         users = []
         battle_schedules = None
+        broadcast_schedules = None
+        giveaway_state = None
+        invite_event_state = None
         with worker.cursor() as cur:
             try:
                 cur.execute("SELECT id, name, audience FROM broadcast_templates ORDER BY LOWER(name) LIMIT 100")
@@ -2494,11 +2506,40 @@ def refresh_interaction_caches_sync():
                 # The existing snapshot remains authoritative until a later
                 # refresh succeeds; hot Discord loops never query this table.
                 battle_schedules = None
+
+        try:
+            with worker.cursor(cursor_factory=RealDictCursor) as state_cur:
+                state_cur.execute("SELECT * FROM giveaway_events WHERE id = 1")
+                giveaway_state = state_cur.fetchone()
+                state_cur.execute("SELECT * FROM invite_events WHERE id = 1")
+                invite_event_state = state_cur.fetchone()
+        except Exception:
+            giveaway_state = None
+            invite_event_state = None
+
+        # The broadcast scheduler consumes this worker-refreshed snapshot. Its
+        # former synchronous queries blocked Discord for 5-9 seconds per tick.
+        try:
+            broadcast_schedules = db_get_enabled_broadcast_schedules(db_conn=worker)
+        except Exception:
+            broadcast_schedules = None
+
+        now = time.time()
+        if now - _broadcast_conversion_last_check >= 600:
+            db_run_broadcast_conversion_checks(db_conn=worker)
+            _broadcast_conversion_last_check = now
+
         with _interaction_cache_lock:
             _broadcast_template_choice_cache = templates
             _tracked_user_choice_cache = users
             if battle_schedules is not None:
                 _battle_schedule_cache = battle_schedules
+            if broadcast_schedules is not None:
+                _broadcast_schedule_cache = broadcast_schedules
+                _broadcast_schedule_cache_at = now
+            _giveaway_state_cache = dict(giveaway_state) if giveaway_state else None
+            _invite_event_state_cache = dict(invite_event_state) if invite_event_state else None
+            _event_state_cache_at = now
         return True
     except Exception as exc:
         print(f"[interaction-cache] refresh failed: {type(exc).__name__}")
@@ -5470,8 +5511,11 @@ async def giveaway_end(interaction: discord.Interaction):
 
 @tasks.loop(seconds=30)
 async def check_giveaway_event():
-    giveaway = get_giveaway_row()
-    if not giveaway:
+    with _interaction_cache_lock:
+        giveaway = dict(_giveaway_state_cache) if _giveaway_state_cache else None
+        invite_event = dict(_invite_event_state_cache) if _invite_event_state_cache else None
+        cache_age = time.time() - float(_event_state_cache_at or 0)
+    if cache_age > 180 or not giveaway:
         return
 
     if int(giveaway["active"] or 0) != 1:
@@ -5481,7 +5525,6 @@ async def check_giveaway_event():
         await finish_giveaway("auto end")
         return
 
-    invite_event = get_active_event()
     if not invite_event or not invite_event["active"]:
         await finish_giveaway("invite event ended")
         return
@@ -5826,14 +5869,17 @@ async def inviteleaderboard(interaction: discord.Interaction):
 
 @tasks.loop(seconds=30)
 async def check_invite_event():
-    event = get_active_event()
-    if not event or not event["active"]:
+    with _interaction_cache_lock:
+        event = dict(_invite_event_state_cache) if _invite_event_state_cache else None
+        cache_age = time.time() - float(_event_state_cache_at or 0)
+    if cache_age > 180 or not event or not event["active"]:
         return
 
     if int(time.time()) < event["end_time"]:
         return
 
-    db_exec("UPDATE invite_events SET active = 0 WHERE id = 1")
+    # This write occurs only once at the actual event boundary.
+    await asyncio.to_thread(db_exec, "UPDATE invite_events SET active = 0 WHERE id = 1")
     print("Invite event auto-ended")
 
 
@@ -7002,15 +7048,19 @@ async def get_broadcast_war_context(force=False):
 
 # ---------------- BROADCAST CONVERSION CHECKS ----------------
 
-def db_run_broadcast_conversion_checks(limit=5):
-    """24h after a send, measure: zero-at-send recipients who scored, and points gained."""
-    ensure_broadcast_feature_tables()
-    if not db_enabled():
+def db_run_broadcast_conversion_checks(limit=5, db_conn=None):
+    """Measure 24h broadcast conversion using the supplied worker connection."""
+    if db_conn is None:
+        ensure_broadcast_feature_tables()
+        if not db_enabled():
+            return
+        ensure_db_connection()
+    active_conn = db_conn or conn
+    if active_conn is None:
         return
 
     try:
-        ensure_db_connection()
-        with conn.cursor() as cur:
+        with active_conn.cursor() as cur:
             cur.execute("""
                 SELECT id, battle_key
                 FROM broadcast_sends
@@ -7060,10 +7110,10 @@ def db_run_broadcast_conversion_checks(limit=5):
                         conversion_points = %s
                     WHERE id = %s
                 """, (send_id, int(row[0] or 0), int(row[1] or 0)))
-        conn.commit()
+        active_conn.commit()
     except Exception as exc:
         try:
-            conn.rollback()
+            active_conn.rollback()
         except Exception:
             pass
         print(f"[broadcast] conversion check failed: {exc}")
@@ -7071,12 +7121,16 @@ def db_run_broadcast_conversion_checks(limit=5):
 
 # ---------------- BROADCAST SCHEDULER ----------------
 
-def db_get_enabled_broadcast_schedules():
-    if not db_enabled():
+def db_get_enabled_broadcast_schedules(db_conn=None):
+    if db_conn is None:
+        if not db_enabled():
+            return []
+        ensure_db_connection()
+    active_conn = db_conn or conn
+    if active_conn is None:
         return []
     try:
-        ensure_db_connection()
-        with conn.cursor() as cur:
+        with active_conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name, kind, audience, value, delivery, style, message,
                        top_n, hours_before_end, run_at, last_fired_at, last_fired_battle
@@ -7087,7 +7141,7 @@ def db_get_enabled_broadcast_schedules():
             rows = cur.fetchall()
     except Exception as exc:
         try:
-            conn.rollback()
+            active_conn.rollback()
         except Exception:
             pass
         print(f"[broadcast] schedule list failed: {exc}")
@@ -7298,16 +7352,12 @@ async def get_ended_battle_key_for_congrats():
 
 @tasks.loop(seconds=60)
 async def broadcast_scheduler_loop():
-    if not db_enabled():
-        return
-
-    ensure_broadcast_feature_tables()
-
-    # Conversion checks run every tick (cheap, age-gated per send).
-    db_run_broadcast_conversion_checks()
-
-    rows = db_get_enabled_broadcast_schedules()
-    if not rows:
+    # Database work is refreshed by interaction_cache_refresh_loop on a worker
+    # thread. Never make synchronous psycopg2 calls from the Discord loop.
+    with _interaction_cache_lock:
+        rows = [dict(row) for row in _broadcast_schedule_cache]
+        cache_age = time.time() - float(_broadcast_schedule_cache_at or 0)
+    if not rows or cache_age > 180:
         return
 
     context = await get_broadcast_war_context()
@@ -17700,7 +17750,8 @@ async def _roblox_presence_request(user_ids: list[int]):
 # ---------------- INITIAL PRESENCE SYNC ----------------
 async def run_initial_presence_check():
     try:
-        users = db_get_all_tracked()
+        with _interaction_cache_lock:
+            users = list(_tracked_user_choice_cache)
         if not users:
             return
 
@@ -17743,7 +17794,8 @@ async def check_loop():
     if not bot_enabled:
         return
 
-    users = db_get_all_tracked()
+    with _interaction_cache_lock:
+        users = list(_tracked_user_choice_cache)
     if not users:
         return
 
@@ -17856,7 +17908,8 @@ async def reminder_loop():
             print("Reminder loop: could not fetch channel")
             return
 
-        users = db_get_all_tracked()
+        with _interaction_cache_lock:
+            users = list(_tracked_user_choice_cache)
         if not users:
             return
 
@@ -17906,10 +17959,8 @@ async def update_bot_presence():
                 ),
             )
         else:
-            try:
-                count = len(db_get_all_tracked())
-            except Exception:
-                count = 0
+            with _interaction_cache_lock:
+                count = len(_tracked_user_choice_cache)
             await bot.change_presence(
                 status=discord.Status.online,
                 activity=discord.Activity(
@@ -18031,7 +18082,8 @@ async def war_poll_loop():
 @tasks.loop(minutes=10)
 async def clan_leave_loop():
     try:
-        users = db_get_all_tracked()
+        with _interaction_cache_lock:
+            users = list(_tracked_user_choice_cache)
         if not users:
             return
 
@@ -21206,16 +21258,18 @@ def start_bot_loops():
 
 _bot_event_loop_lag = 0.0
 _bot_watchdog_last = None
+_bot_watchdog_last_log = 0.0
 
 
 @tasks.loop(seconds=2)
 async def event_loop_watchdog():
-    global _bot_event_loop_lag, _bot_watchdog_last
+    global _bot_event_loop_lag, _bot_watchdog_last, _bot_watchdog_last_log
     now = asyncio.get_running_loop().time()
     if _bot_watchdog_last is not None:
         _bot_event_loop_lag = max(0.0, now - _bot_watchdog_last - 2.0)
-        if _bot_event_loop_lag >= 1.0:
+        if _bot_event_loop_lag >= 1.0 and now - _bot_watchdog_last_log >= 30:
             print(f"[timeout-watchdog] event loop lag {_bot_event_loop_lag:.3f}s")
+            _bot_watchdog_last_log = now
     _bot_watchdog_last = now
 
 
@@ -21573,6 +21627,7 @@ async def on_ready():
     try:
         db_get_setting("broadcast_allowed_user_ids", "")
         db_get_setting("mcwv_ticket_settings", "")
+        db_get_setting("offline_tracking", "false")
         ensure_broadcast_feature_tables()
         await refresh_interaction_caches()
     except Exception as e:
