@@ -6417,12 +6417,24 @@ async def resolve_broadcast_recipients(interaction, audience, value=None, role=N
     return deduped
 
 
+_BROADCAST_EMOJI_RE = re.compile(r"\{emoji:([a-zA-Z0-9_]+)\}")
+
+
+def _broadcast_emoji_repl(match):
+    """Turn a friendly `{emoji:key}` token into the custom emoji (or a unicode
+    fallback / the raw key if unknown) so staff don't have to memorise IDs."""
+    key = match.group(1).lower()
+    return mcwv_emoji(key, f"⚪:{key}")
+
+
 def render_broadcast_message(template, recipient):
     discord_id = recipient.get("discord_id") or ""
     ping = f"<@{discord_id}>" if discord_id else ""
     ticket_channel_id = recipient.get("ticket_channel_id")
     ticket = f"<#{ticket_channel_id}>" if ticket_channel_id else "—"
-    return str(template or "").replace("{username}", str(recipient.get("username") or "")) \
+    text = str(template or "")
+    text = _BROADCAST_EMOJI_RE.sub(_broadcast_emoji_repl, text)
+    return text.replace("{username}", str(recipient.get("username") or "")) \
         .replace("{points}", str(recipient.get("points", 0))) \
         .replace("{rank}", str(recipient.get("rank") or "—")) \
         .replace("{ping}", ping) \
@@ -14797,6 +14809,47 @@ async def refreshprofile(interaction: discord.Interaction, roblox_id: str):
 @require_role()
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
+
+
+_EMOJI_SHEET_GROUPS = [
+    ("Pet rarities", ["titanic", "huge", "gargantuan", "ultimate", "normal"]),
+    ("Items", ["egg", "enchant", "charm", "potions", "inventory", "hoverboard", "booth", "giftbag", "upgradecard"]),
+    ("Gamepasses", ["gp_lucky", "gp_ultralucky", "gp_vip", "gp_magiceggs", "gp_15pets",
+                    "gp_hugehunter", "gp_autofarm", "gp_autotap", "gp_daycareslots",
+                    "gp_15eggs", "gp_superdrops", "gp_doublestars", "gp_supershinyhunter"]),
+]
+
+
+def build_emoji_sheet_text():
+    """Cheat sheet for every custom emoji, grouped, using {emoji:key} tokens."""
+    groups = []
+    for title, keys in _EMOJI_SHEET_GROUPS:
+        lines = []
+        for key in keys:
+            name, _eid = MCWV_CUSTOM_EMOJI.get(key, ("", ""))
+            token = f"{{emoji:{key}}}"
+            lines.append(f"{mcwv_emoji(key, '⚪')} `{token}`  ·  {name}")
+        groups.append((title, "\n".join(lines)))
+    return groups
+
+
+@bot.tree.command(name="emojis", description="Show the emoji keys you can use in broadcasts", guild=guild_obj)
+@require_role()
+async def emojis(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        groups = build_emoji_sheet_text()
+        for title, body in groups:
+            embed = discord.Embed(
+                title=f"😀 MCWV Emojis — {title}",
+                description=body or "_No emojis in this group yet._",
+                color=discord.Color(MCWV_BRAND_COLOR),
+            )
+            embed.set_footer(text="Paste {emoji:key} into a /broadcast template to use it.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        print(f"[emojis] failed: {exc}")
+        await interaction.followup.send(f"❌ Couldn't build the emoji sheet: `{type(exc).__name__}`", ephemeral=True)
 
 @bot.tree.command(name="add", description="Link Roblox user", guild=guild_obj)
 @require_role()
