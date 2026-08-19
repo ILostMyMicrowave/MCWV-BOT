@@ -5992,9 +5992,9 @@ MCWV_CUSTOM_EMOJI = {
     "titanic": ("Titanic", "1539559935896068238"),
     "huge": ("Huge", "1539559902559862855"),
     "gargantuan": ("Gargantuan", "1539559980687036456"),
-    "ultimate": ("Ultimate", "1539560868583440434"),
     "normal": ("Normal", "1539559864974704691"),
     # item / feature icons
+    "ultimate": ("Ultimate", "1539560868583440434"),
     "egg": ("Egg", "1539560979153555540"),
     "enchant": ("Enchant", "1539560825231245352"),
     "charm": ("Charm", "1539561019175870485"),
@@ -14812,8 +14812,8 @@ async def ping(interaction: discord.Interaction):
 
 
 _EMOJI_SHEET_GROUPS = [
-    ("Pet rarities", ["titanic", "huge", "gargantuan", "ultimate", "normal"]),
-    ("Items", ["egg", "enchant", "charm", "potions", "inventory", "hoverboard", "booth", "giftbag", "upgradecard"]),
+    ("Pet rarities", ["titanic", "huge", "gargantuan", "normal"]),
+    ("Items", ["egg", "enchant", "charm", "potions", "inventory", "hoverboard", "booth", "giftbag", "upgradecard", "ultimate"]),
     ("Gamepasses", ["gp_lucky", "gp_ultralucky", "gp_vip", "gp_magiceggs", "gp_15pets",
                     "gp_hugehunter", "gp_autofarm", "gp_autotap", "gp_daycareslots",
                     "gp_15eggs", "gp_superdrops", "gp_doublestars", "gp_supershinyhunter"]),
@@ -15855,11 +15855,11 @@ class ProfileView(discord.ui.View):
             color=discord.Color.blue()
         )
 
-        embed.add_field(name="🐾 Equipped Pets", value=pets_text[:1024], inline=False)
-        embed.add_field(name="⚡ Equipped Enchants", value=enchants_text[:1024], inline=False)
-        embed.add_field(name="🛹 Hoverboard", value=hoverboard_name, inline=True)
-        embed.add_field(name="⚡ Ultimate", value=ultimate_name, inline=True)
-        embed.add_field(name="🏪 Booth", value=booth_name, inline=True)
+        embed.add_field(name=f"{mcwv_emoji('pets', '🐾')} Equipped Pets", value=pets_text[:1024], inline=False)
+        embed.add_field(name=f"{mcwv_emoji('enchant', '⚡')} Equipped Enchants", value=enchants_text[:1024], inline=False)
+        embed.add_field(name=f"{mcwv_emoji('hoverboard', '🛹')} Hoverboard", value=hoverboard_name, inline=True)
+        embed.add_field(name=f"{mcwv_emoji('ultimate', '⚡')} Ultimate", value=ultimate_name, inline=True)
+        embed.add_field(name=f"{mcwv_emoji('booth', '🏪')} Booth", value=booth_name, inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
