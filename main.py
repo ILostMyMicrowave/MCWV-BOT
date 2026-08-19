@@ -17863,9 +17863,10 @@ async def rosterhealth(interaction: discord.Interaction):
             except Exception:
                 continue
             perm = int(member.get("PermissionLevel") or 0)
+            # PS99 clan data: 50 = regular member, 90 = officer. 100 = owner.
             in_game[rid] = {
                 "username": str(member.get("Username") or rid),
-                "officer": perm >= 50 or rid == owner_id,
+                "officer": perm >= 90 or rid == owner_id,
             }
         if owner_id and owner_id not in in_game:
             in_game[owner_id] = {"username": "Owner", "officer": True}
@@ -17973,7 +17974,7 @@ async def rosterhealth(interaction: discord.Interaction):
             "\n".join(f"• {un} (`{rid}`)" for un, rid in loa_lines[:25]) or None,
         )
 
-        embed.set_footer(text="In-game officer ≈ PermissionLevel ≥ 50 · source: PS99 + Discord + Hub")
+        embed.set_footer(text="In-game officer ≈ PermissionLevel ≥ 90 · source: PS99 + Discord + Hub")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as exc:
         print(f"[rosterhealth] error: {exc}")
