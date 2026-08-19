@@ -21430,9 +21430,6 @@ async def before_hub_war_collect_loop():
     await bot.wait_until_ready()
 
 
-# Trigger the Hub's atomic, stale-gated badge sync from this one long-running
-# service. This avoids user-request hooks and Vercel Hobby's daily cron limit.
-@tasks.loop(minutes=BADGE_ROLE_SYNC_INTERVAL_MINUTES)
 async def fetch_website_roles():
     """Best-effort: pull website users + roles from the Hub internal endpoint.
     Returns a dict: discord_id -> role, roblox_id -> role. Empty on failure."""
@@ -21470,6 +21467,9 @@ async def fetch_website_roles():
     return result
 
 
+# Trigger the Hub's atomic, stale-gated badge sync from this one long-running
+# service. This avoids user-request hooks and Vercel Hobby's daily cron limit.
+@tasks.loop(minutes=BADGE_ROLE_SYNC_INTERVAL_MINUTES)
 async def hub_badge_role_sync_loop():
     global session
     if not HUB_BASE_URL:
