@@ -5049,10 +5049,10 @@ def build_giveaway_embed(giveaway_row):
     end_time = int(giveaway_row["end_time"] or 0)
 
     embed = discord.Embed(
-        title="🎁 Giveaway Event",
+        title=f"{mcwv_emoji('giftbag', '🎁')} Giveaway Event",
         description=(
             "This giveaway is running during the active invite event.\n\n"
-            f"🏆 **Prize:** {prize}\n"
+            f"{mcwv_emoji('giftbag', '🏆')} **Prize:** {prize}\n"
             f"👑 **Winners:** {winners}\n"
             f"🔁 **Entry rate:** {invites_per_entry} invites = 1 entry\n"
             f"⏳ **Ends:** <t:{end_time}:R>\n"
@@ -5981,6 +5981,73 @@ PS99_GAMEPASS_UNIVERSE_ID = int(os.environ.get("PS99_GAMEPASS_UNIVERSE_ID", "331
 # ends on/after this date. Used for the "data may be incomplete" notes.
 MCWV_HISTORY_ACCURATE_SINCE = os.environ.get("MCWV_HISTORY_ACCURATE_SINCE", "2026-08-16")
 MCWV_HISTORY_INCOMPLETE_NOTE = f"Wars before {MCWV_HISTORY_ACCURATE_SINCE} may be incomplete"
+# ============================================================
+# CUSTOM EMOJIS — real PS99 icons uploaded to the MCWV Bot app.
+# Each entry is (emoji_name, emoji_id). Application-owned emojis
+# render in any server the bot is in. mcwv_emoji() falls back to a
+# unicode icon when a key has no custom emoji (or it was deleted).
+# ============================================================
+MCWV_CUSTOM_EMOJI = {
+    # PS99 pet rarities / tiers
+    "titanic": ("Titanic", "1539559935896068238"),
+    "huge": ("Huge", "1539559902559862855"),
+    "gargantuan": ("Gargantuan", "1539559980687036456"),
+    "ultimate": ("Ultimate", "1539560868583440434"),
+    "normal": ("Normal", "1539559864974704691"),
+    # item / feature icons
+    "egg": ("Egg", "1539560979153555540"),
+    "enchant": ("Enchant", "1539560825231245352"),
+    "charm": ("Charm", "1539561019175870485"),
+    "potions": ("Potions", "1539560778716418119"),
+    "inventory": ("Inventory", "1539560674215067719"),
+    "hoverboard": ("Hoverboard", "1539560931103875132"),
+    "booth": ("Booth", "1539561059051114586"),
+    "giftbag": ("Giftbag", "1539560728338374666"),
+    "upgradecard": ("Upgradecard", "1539560022365970532"),
+    # gamepasses
+    "gp_lucky": ("gp_lucky", "1539561418116825098"),
+    "gp_ultralucky": ("gp_ultralucky", "1539561563457978388"),
+    "gp_vip": ("gp_VIP", "1539561696836976640"),
+    "gp_magiceggs": ("gp_magiceggs", "1539561490741330034"),
+    "gp_15pets": ("gp_15pets", "1539561258380951592"),
+    "gp_hugehunter": ("gp_hugehunter", "1539562060395061338"),
+    "gp_autofarm": ("gp_autofarm", "1539561190211063870"),
+    "gp_autotap": ("gp_autotap", "1539561111194443836"),
+    "gp_daycareslots": ("gp_daycareslots", "1539561958704160839"),
+    "gp_15eggs": ("gp_15eggs", "1539561902227595345"),
+    "gp_superdrops": ("gp_superdrops", "1539561631745441843"),
+    "gp_doublestars": ("gp_doublestars", "1539561847349452830"),
+    "gp_supershinyhunter": ("gp_supershinyhunter", "1539561757927018556"),
+}
+
+
+def mcwv_emoji(key, fallback=""):
+    """Resolve a semantic emoji key to a Discord custom emoji when available,
+    otherwise to the unicode `fallback`. Never raises."""
+    name, eid = MCWV_CUSTOM_EMOJI.get(key, ("", ""))
+    if name and eid and eid.isdigit():
+        return f"<:{name}:{eid}>"
+    return fallback
+
+
+# gamepass label -> emoji key, so pass icons render next to their names
+GAMEPASS_EMOJI = {
+    "Lucky": "gp_lucky",
+    "Ultra Lucky": "gp_ultralucky",
+    "VIP": "gp_vip",
+    "Magic Eggs": "gp_magiceggs",
+    "+15 Pets": "gp_15pets",
+    "Huge Hunter": "gp_hugehunter",
+    "Auto Farm": "gp_autofarm",
+    "Auto Tap": "gp_autotap",
+    "Daycare Slots": "gp_daycareslots",
+    "+15 Eggs": "gp_15eggs",
+    "Super Drops": "gp_superdrops",
+    "Double Stars": "gp_doublestars",
+    "Super Shiny Hunter": "gp_supershinyhunter",
+}
+
+
 # Full official PS99 store gamepass list (id -> clean label). The runtime map
 # is refreshed daily from Roblox's store page by _get_ps99_gamepass_map() and
 # falls back to this baked copy when Roblox refuses to play nice.
@@ -8503,7 +8570,11 @@ def format_gamepass_results(results):
     missing = [r["label"] for r in results if not r.get("owned") and not r.get("unknown")]
     unknown = [r["label"] for r in results if r.get("unknown")]
     lines = [f"**Owns {len(owned)}/{len(results)} PS99 passes** 🎫"]
-    lines += [f"✅ **{r['label']}**" for r in owned]
+
+    def _gp(label):
+        return mcwv_emoji(GAMEPASS_EMOJI.get(label, ""), "✅")
+
+    lines += [f"{_gp(r['label'])} **{r['label']}**" for r in owned]
     if missing:
         lines.append("")
         lines.append(f"❌ Missing ({len(missing)}): {', '.join(missing)}")
@@ -15676,7 +15747,7 @@ class ProfileView(discord.ui.View):
         embed.add_field(name="💸 Robux Spent", value=self._fmt(robux_spent), inline=True)
         embed.add_field(
             name="🎟️ Gamepasses",
-            value="\n".join(f"✔ {g}" for g in owned_passes) or "None",
+            value="\n".join(f"{mcwv_emoji(GAMEPASS_EMOJI.get(g, ''), '✔')} {g}" for g in owned_passes) or "None",
             inline=False
         )
         embed.add_field(
