@@ -2767,6 +2767,30 @@ def db_end_loa(record_id, ended_by, end_notes=""):
         return False, f"{type(e).__name__}: {e}"
 
 
+def db_get_all_linked():
+    """All main-linked accounts: roblox_id, discord_id, username, role (if any)."""
+    if not db_enabled():
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT roblox_id, discord_id, username, COALESCE(role, 'member') AS role
+                FROM users
+                WHERE roblox_id IS NOT NULL
+                  AND TRIM(CAST(roblox_id AS TEXT)) <> ''
+                ORDER BY username ASC
+            """)
+            rows = cur.fetchall()
+        return [
+            (str(r[0]).strip(), int(r[1]) if r[1] is not None else 0, str(r[2] or r[0]), str(r[3] or 'member'))
+            for r in rows
+        ]
+    except Exception as e:
+        conn.rollback()
+        print("db_get_all_linked error:", e)
+        return []
+
+
 def db_list_active_loas():
     """All active LOAs, newest first."""
     if not db_enabled():
@@ -17820,6 +17844,143 @@ async def botstats(interaction: discord.Interaction):
         await interaction.followup.send(f"Stats failed: `{type(e).__name__}`", ephemeral=True)
 
 
+# ---------------- ROSTER HEALTH ----------------
+
+@bot.tree.command(name="rosterhealth", description="Staff debug: clan/link/officer/alt/LOA inconsistencies", guild=guild_obj)
+@require_role()
+async def rosterhealth(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # 1. In-game roster + officer ranks (PermissionLevel high = officer/owner).
+        clan_data = await _fetch_clan_data(CLAN_NAME) or {}
+        in_game = {}  # roblox_id -> {"username", "officer"}
+        owner_id = get_clan_owner_id_from_data(clan_data)
+        for member in clan_data.get("Members", []) if isinstance(clan_data, dict) else []:
+            if not isinstance(member, dict):
+                continue
+            try:
+                rid = str(int(member.get("UserID")))
+            except Exception:
+                continue
+            perm = int(member.get("PermissionLevel") or 0)
+            in_game[rid] = {
+                "username": str(member.get("Username") or rid),
+                "officer": perm >= 50 or rid == owner_id,
+            }
+        if owner_id and owner_id not in in_game:
+            in_game[owner_id] = {"username": "Owner", "officer": True}
+
+        # 2. Linked accounts + Discord membership + website roles.
+        linked = db_get_all_linked() or []                     # (roblox, discord, username, role)
+        alts = db_get_all_alts() or []                          # (discord, roblox, username)
+        active_loas = db_list_active_loas() or []               # (id, roblox, username, discord, ...)
+        website = await fetch_website_roles()                   # by_discord / by_roblox
+
+        guild = broadcast_primary_guild()
+        if guild is None:
+            return await interaction.followup.send("❌ Discord guild isn't available yet.", ephemeral=True)
+
+        OWNER_RID = 1501985344843813038
+        OFFICER_RID = 1501986357516701827
+        MEMBER_RID = 1501986780667314246
+
+        def discord_role_of(member):
+            if member is None:
+                return None
+            ids = {r.id for r in member.roles}
+            if OWNER_RID in ids:
+                return "owner"
+            if OFFICER_RID in ids:
+                return "officer"
+            if MEMBER_RID in ids:
+                return "member"
+            return None
+
+        in_game_ids = set(in_game.keys())
+        linked_ids = {r[0] for r in linked}
+
+        # A. In clan but not linked
+        unlinked = sorted(
+            [(rid, in_game[rid]["username"]) for rid in in_game_ids - linked_ids],
+            key=lambda x: x[1].lower(),
+        )
+
+        # B. Linked but not in clan
+        linked_not_clan = sorted(
+            [(rid, un, discord_role_of(guild.get_member(did))) for rid, did, un, _r in linked if rid not in in_game_ids],
+            key=lambda x: x[1].lower(),
+        )
+
+        # C. Officer mismatches
+        officer_issues = []  # (roblox, username, in_game, discord, website)
+        linked_by_rid = {r[0]: (r[1], r[2]) for r in linked}
+        for rid, info in in_game.items():
+            if not info["officer"]:
+                continue
+            did, un = linked_by_rid.get(rid, (0, info["username"]))
+            discord_role = discord_role_of(guild.get_member(did)) if did else None
+            site_role = website["by_roblox"].get(rid) or website["by_discord"].get(str(did) if did else "")
+            if discord_role != "owner" and discord_role != "officer":
+                officer_issues.append((rid, un, "in-game officer", f"Discord: {discord_role or 'none'}", f"Site: {site_role or 'none'}"))
+
+        # D. Alts
+        alts_by_discord = {}
+        for did, rid, un in alts:
+            alts_by_discord.setdefault(int(did), []).append(un or rid)
+        alt_lines = sorted(
+            [(did, names) for did, names in alts_by_discord.items()],
+            key=lambda x: -len(x[1]),
+        )
+
+        # E. LOAs
+        loa_lines = [
+            (str(rec[2] or rec[1]), rec[1])
+            for rec in active_loas
+        ]
+
+        # Build embed
+        embed = discord.Embed(
+            title="🩺 Roster Health",
+            description=f"Clan: **{CLAN_NAME}** · {len(in_game_ids)} in game · {len(linked_ids)} linked",
+            color=discord.Color(MCWV_BRAND_COLOR),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        def sec(name, body):
+            if body:
+                embed.add_field(name=name, value=body[:1024], inline=False)
+            else:
+                embed.add_field(name=name, value="✅ All clear", inline=False)
+
+        sec(
+            f"⚠️ In clan, not linked ({len(unlinked)})",
+            "\n".join(f"• `{rid}` · {un}" for rid, un in unlinked[:25]) or None,
+        )
+        sec(
+            f"🕳️ Linked, not in clan ({len(linked_not_clan)})",
+            "\n".join(f"• `{rid}` · {un}" + (f" · {dr or ''}" if dr else "") for rid, un, dr in linked_not_clan[:25]) or None,
+        )
+        sec(
+            f"🎖️ Officer mismatches ({len(officer_issues)})",
+            "\n".join(f"• `{rid}` · {un} — {ig}, {dc}, {st}" for rid, un, ig, dc, st in officer_issues[:25]) or None,
+        )
+        sec(
+            f"🔁 Accounts with alts ({len(alt_lines)})",
+            "\n".join(f"• <@{did}> — {len(names)} alts: {', '.join(names[:4])}" for did, names in alt_lines[:15]) or None,
+        )
+        sec(
+            f"🏝️ Active LOAs ({len(loa_lines)})",
+            "\n".join(f"• {un} (`{rid}`)" for un, rid in loa_lines[:25]) or None,
+        )
+
+        embed.set_footer(text="In-game officer ≈ PermissionLevel ≥ 50 · source: PS99 + Discord + Hub")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        print(f"[rosterhealth] error: {exc}")
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Roster health failed: `{type(exc).__name__}`", ephemeral=True)
+
+
 # ---------------- AUTO-RECONNECT ----------------
 
 @bot.event
@@ -21272,6 +21433,43 @@ async def before_hub_war_collect_loop():
 # Trigger the Hub's atomic, stale-gated badge sync from this one long-running
 # service. This avoids user-request hooks and Vercel Hobby's daily cron limit.
 @tasks.loop(minutes=BADGE_ROLE_SYNC_INTERVAL_MINUTES)
+async def fetch_website_roles():
+    """Best-effort: pull website users + roles from the Hub internal endpoint.
+    Returns a dict: discord_id -> role, roblox_id -> role. Empty on failure."""
+    result = {"by_discord": {}, "by_roblox": {}}
+    if not HUB_BASE_URL:
+        return result
+    api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+    if not api_key:
+        return result
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        endpoint = f"{HUB_BASE_URL}/api/internal/website-roles"
+        async with session.get(
+            endpoint,
+            headers={"X-Admin-API-Key": api_key, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as res:
+            if res.status != 200:
+                return result
+            data = await res.json(content_type=None)
+        for u in (data or {}).get("users", []) or []:
+            if not isinstance(u, dict):
+                continue
+            role = str(u.get("role") or "member")
+            did = str(u.get("discordId") or "").strip()
+            rid = str(u.get("robloxId") or "").strip()
+            if did:
+                result["by_discord"][did] = role
+            if rid:
+                result["by_roblox"][rid] = role
+    except Exception as exc:
+        print(f"[rosterhealth] website roles fetch failed: {type(exc).__name__}")
+    return result
+
+
 async def hub_badge_role_sync_loop():
     global session
     if not HUB_BASE_URL:
