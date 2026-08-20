@@ -9807,14 +9807,7 @@ class ApplicationModal(discord.ui.Modal):
         bg_connected = await hub_biggames_connected(interaction.user.id)
         if bg_connected is False:
             connect_url = _biggames_connect_url(interaction.user.id)
-            try:
-                await interaction.user.send(
-                    f"**MCWV — Authorise the app to apply**\n\n"
-                    f"Click the link below to connect your PS99 account. It only reads your "
-                    f"stats — we never see your password.\n\n{connect_url}"
-                )
-            except Exception:
-                pass
+            await _send_biggames_connect_dm(interaction.user.id, reason="apply")
             return await interaction.followup.send(
                 "❌ Before you can apply, you must **connect your PS99 account** so MCWV can verify your profile.\n\n"
                 f"👉 **Click here to authorise:** {connect_url}\n\n"
@@ -10435,14 +10428,7 @@ class MCWVTicketPanelView(discord.ui.View):
 
             if bg_connected is False:
                 connect_url = _biggames_connect_url(interaction.user.id)
-                try:
-                    await interaction.user.send(
-                        f"**MCWV — Authorise the app to apply**\n\n"
-                        f"Click the link below to connect your PS99 account. It only reads your "
-                        f"stats — we never see your password.\n\n{connect_url}"
-                    )
-                except Exception:
-                    pass
+                await _send_biggames_connect_dm(interaction.user.id, reason="apply")
                 return await interaction.response.send_message(
                     "❌ **You need to authorise the MCWV app before making a ticket.**\n\n"
                     "The **Open Application** button won't work until you've done this — and "
@@ -21521,6 +21507,62 @@ def _biggames_connect_url(discord_id):
     return f"{HUB_BASE_URL}/api/biggames/connect?discord={discord_id}"
 
 
+async def _send_biggames_connect_dm(discord_id, *, reason="connect", username=None):
+    """Send a styled, branded DM asking a member to connect their PS99 account.
+
+    reason: 'connect' (first-time / /connect_dm), 'reconnect' (revoked/expired),
+            'apply' (blocked from opening an application ticket).
+    Returns True on success, False if it could not be delivered."""
+    try:
+        user = await bot.fetch_user(int(discord_id))
+    except Exception:
+        return False
+    connect_url = _biggames_connect_url(discord_id)
+
+    title = "Connect your PS99 account"
+    intro = (
+        "All MCWV members are required to authorise the **MCWV Bot** app so we "
+        "can verify your stats and keep the clan fair."
+    )
+    if reason == "reconnect":
+        title = "Reconnect your PS99 account"
+        intro = (
+            "Your BIG Games access was revoked or expired, so the site and "
+            "applications are locked until you reconnect."
+        )
+    elif reason == "apply":
+        title = "Authorise before you apply"
+        intro = (
+            "You need to connect your PS99 account before opening an application "
+            "ticket, so we can verify your profile."
+        )
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"{intro}\n\n"
+            "It only **reads** your stats — we never see your password.\n"
+            "Takes about 10 seconds."
+        ),
+        color=discord.Color.from_rgb(147, 110, 255),
+    )
+    if username:
+        embed.set_author(name=username)
+    embed.add_field(
+        name="🔗 Click here to connect",
+        value=connect_url,
+        inline=False,
+    )
+    embed.set_footer(text="⚔ FORGED FOR WAR · MCWV")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    try:
+        await user.send(embed=embed)
+        return True
+    except Exception:
+        return False
+
+
 async def hub_biggames_connected(discord_id):
     """Whether a user has a valid BIG Games (PS99) connection — required before
     opening an application ticket.
@@ -21870,17 +21912,7 @@ async def _alert_biggames_revoke(guild, staff_channel, t):
             print(f"[biggames-revoke] staff alert send failed: {exc}")
 
     if member_id:
-        try:
-            user = await bot.fetch_user(member_id)
-            connect_url = _biggames_connect_url(member_id)
-            await user.send(
-                "**MCWV — Reconnect the app**\n\n"
-                "Your BIG Games access was revoked or expired, so the site and applications "
-                "are locked until you reconnect. It only reads your stats — we never see your "
-                f"password.\n\n{connect_url}"
-            )
-        except Exception as exc:
-            print(f"[biggames-revoke] member DM failed for {member_id}: {type(exc).__name__}")
+        await _send_biggames_connect_dm(member_id, reason="reconnect")
 
 
 @tasks.loop(minutes=30)
@@ -22080,18 +22112,9 @@ async def connect_dm_cmd(interaction: discord.Interaction):
         )
         sent = 0
         for discord_id, username in missing:
-            try:
-                user = await bot.fetch_user(discord_id)
-                connect_url = _biggames_connect_url(discord_id)
-                await user.send(
-                    "**MCWV — Connect your PS99 account**\n\n"
-                    "All MCWV members are required to authorise the MCWV Bot app so we can "
-                    "verify stats. It only reads your data — we never see your password.\n\n"
-                    f"{connect_url}"
-                )
+            ok = await _send_biggames_connect_dm(discord_id, reason="connect", username=username)
+            if ok:
                 sent += 1
-            except Exception:
-                pass
             await asyncio.sleep(1.2)  # gentle rate limit
 
         await interaction.followup.send(f"✅ Done — DM'd **{sent}/{len(missing)}** member(s).", ephemeral=True)
