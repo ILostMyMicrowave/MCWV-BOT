@@ -21939,10 +21939,12 @@ def _connected_status_map():
     except Exception:
         pass
     for t in _fetch_all_biggames_tokens():
-        if t["roblox_id"]:
-            connected_rids.add(t["roblox_id"])
-        if t["discord_id"]:
-            connected_dids.add(str(t["discord_id"]))
+        rid = str(t["roblox_id"]).strip() if t["roblox_id"] else ""
+        did = str(t["discord_id"]).strip() if t["discord_id"] else ""
+        if rid:
+            connected_rids.add(rid)
+        if did:
+            connected_dids.add(did)
     return connected_rids, connected_dids
 
 
@@ -21954,11 +21956,14 @@ async def connected_cmd(interaction: discord.Interaction):
         linked = await asyncio.to_thread(db_get_all_linked) or []  # (roblox, discord_id, username, role)
         connected_rids, connected_dids = await asyncio.to_thread(_connected_status_map)
         tokens = await asyncio.to_thread(_fetch_all_biggames_tokens)
-        print(f"[connected] DEBUG: {len(tokens)} tokens, rid_set={connected_rids}, did_set={connected_dids}")
+        token_desc = ", ".join(f"{t.get('kind')}:{t.get('roblox_id') or t.get('discord_id')}" for t in tokens)
+        print(f"[connected] DEBUG: {len(tokens)} tokens [{token_desc}] rid_set={connected_rids} did_set={connected_dids}")
         rows = []
         for roblox, discord_id, username, role in linked:
-            is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
-            rows.append((is_con, str(username or roblox), str(discord_id or "")))
+            rid_key = str(roblox).strip()
+            did_key = str(discord_id).strip() if discord_id else ""
+            is_con = (rid_key in connected_rids) or (did_key and did_key in connected_dids)
+            rows.append((is_con, str(username or roblox), did_key))
         connected_count = sum(1 for c, _, _ in rows if c)
         not_count = len(rows) - connected_count
 
