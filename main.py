@@ -21699,6 +21699,288 @@ async def _biggames_connected_direct_db(discord_id):
     )
 
 
+# ---------------------------------------------------------------------------
+# BIG GAMES REVOKE MONITOR + CONNECTED ROSTER
+# ---------------------------------------------------------------------------
+
+def _fetch_all_biggames_tokens():
+    """Return every stored BIG Games token for the revoke monitor.
+
+    Each entry: {kind, key, discord_id, roblox_id, access_token}. Covers both
+    members (big_games_tokens keyed by roblox_id) and applicants
+    (big_games_discord_tokens keyed by discord_id). A user only appears here
+    AFTER they have authorised, which is exactly the "don't monitor anyone who
+    hasn't connected yet" requirement."""
+    out = []
+    if not db_enabled():
+        return out
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT discord_id, roblox_id, access_token FROM big_games_discord_tokens")
+            for discord_id, roblox_id, at in cur.fetchall():
+                if at:
+                    out.append({
+                        "kind": "discord",
+                        "key": f"d:{discord_id}",
+                        "discord_id": str(discord_id),
+                        "roblox_id": str(roblox_id) if roblox_id else None,
+                        "access_token": at,
+                    })
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT t.roblox_id, t.access_token, u.discord_id
+                FROM big_games_tokens t
+                LEFT JOIN users u ON u.roblox_id = t.roblox_id
+            """)
+            for roblox_id, at, discord_id in cur.fetchall():
+                if at:
+                    out.append({
+                        "kind": "member",
+                        "key": f"r:{roblox_id}",
+                        "discord_id": str(discord_id) if discord_id else None,
+                        "roblox_id": str(roblox_id),
+                        "access_token": at,
+                    })
+    except Exception as exc:
+        print(f"[biggames-revoke] fetch tokens failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    return out
+
+
+async def _validate_token_no_cleanup(token):
+    """Validate a token against BIG Games. Returns True (valid), False
+    (revoked/expired), or None (transient API error — leave alone)."""
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        async with session.get(
+            "https://ps99.biggamesapi.io/v1/account/profile",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as res:
+            if res.status == 200:
+                return True
+            if res.status in (401, 403):
+                return False
+            return None
+    except Exception:
+        return None
+
+
+def _delete_token_by_key(t):
+    try:
+        if t["kind"] == "discord":
+            _db_delete("big_games_discord_tokens", "discord_id", t["discord_id"])
+        else:
+            _db_delete("big_games_tokens", "roblox_id", t["roblox_id"])
+    except Exception as exc:
+        print(f"[biggames-revoke] delete failed for {t.get('key')}: {exc}")
+
+
+# Only tokens observed as VALID count toward "previously working". A token that
+# was already stale/expired before we ever monitored it is cleaned up quietly
+# (no alert), so we never spam staff about tokens that were never good.
+_biggames_known_valid = set()
+_biggames_revoke_log = {}  # key -> last alert unix time (spam guard)
+
+
+async def _alert_biggames_revoke(guild, staff_channel, t):
+    key = t["key"]
+    last = _biggames_revoke_log.get(key, 0)
+    if time.time() - last < 3600:
+        return  # already alerted within the last hour
+    _biggames_revoke_log[key] = time.time()
+
+    member_id = int(t["discord_id"]) if (t["discord_id"] and str(t["discord_id"]).isdigit()) else None
+    label = t["roblox_id"] or t["discord_id"] or "unknown"
+
+    embed = discord.Embed(
+        title="🚨 BIG Games Access Revoked",
+        description=f"**{label}** no longer has the MCWV Bot app authorised.",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if member_id:
+        embed.add_field(name="Discord User", value=f"<@{member_id}>", inline=True)
+    embed.add_field(name="Roblox", value=label, inline=True)
+    embed.add_field(
+        name="Action Required",
+        value="Member is blocked from the site/apps until they reconnect the app.",
+        inline=False,
+    )
+
+    if staff_channel:
+        try:
+            await staff_channel.send(embed=embed)
+        except Exception as exc:
+            print(f"[biggames-revoke] staff alert send failed: {exc}")
+
+    if member_id:
+        try:
+            user = await bot.fetch_user(member_id)
+            connect_url = _biggames_connect_url(member_id)
+            await user.send(
+                "**MCWV — Reconnect the app**\n\n"
+                "Your BIG Games access was revoked or expired, so the site and applications "
+                "are locked until you reconnect. It only reads your stats — we never see your "
+                f"password.\n\n{connect_url}"
+            )
+        except Exception as exc:
+            print(f"[biggames-revoke] member DM failed for {member_id}: {type(exc).__name__}")
+
+
+@tasks.loop(minutes=30)
+async def biggames_revoke_loop():
+    """Every 30 min, validate all stored BIG Games tokens. When one that was
+    previously working gets revoked/expired, alert staff and DM the member, then
+    clear the stale token. Users who never authorised are never tracked."""
+    global _biggames_known_valid
+    await bot.wait_until_ready()
+    try:
+        tokens = _fetch_all_biggames_tokens()
+        if not tokens:
+            _biggames_known_valid = set()
+            return
+
+        staff_channel = None
+        try:
+            staff_channel = await _get_channel(STAFF_CHAT_CHANNEL_ID) if STAFF_CHAT_CHANNEL_ID else None
+        except Exception:
+            staff_channel = None
+
+        valid_now = set()
+        for t in tokens:
+            key = t["key"]
+            ok = await _validate_token_no_cleanup(t["access_token"])
+            if ok is True:
+                valid_now.add(key)
+                # Restore + stop alerts: a previously-revoked member reconnected.
+                # Clear their revoke log so (a) no lingering alert state and
+                # (b) a FUTURE revoke alerts fresh instead of being suppressed.
+                _biggames_revoke_log.pop(key, None)
+                continue
+            if ok is False:
+                # Revoked/expired. Only alert if we previously saw it working.
+                was_valid = key in _biggames_known_valid
+                _delete_token_by_key(t)
+                if was_valid:
+                    await _alert_biggames_revoke(bot.get_guild(GUILD_ID) or broadcast_primary_guild(), staff_channel, t)
+            # ok is None -> transient API error, leave it for next run.
+
+        _biggames_known_valid = valid_now
+    except Exception as exc:
+        print(f"[biggames-revoke] loop error: {exc}")
+
+
+@biggames_revoke_loop.before_loop
+async def before_biggames_revoke_loop():
+    await bot.wait_until_ready()
+
+
+def _connected_status_map():
+    """Return (connected_roblox_ids:set, connected_discord_ids:set)."""
+    connected_rids = set()
+    connected_dids = set()
+    for t in _fetch_all_biggames_tokens():
+        if t["roblox_id"]:
+            connected_rids.add(t["roblox_id"])
+        if t["discord_id"]:
+            connected_dids.add(str(t["discord_id"]))
+    return connected_rids, connected_dids
+
+
+@bot.tree.command(name="connected", description="Staff: see who has authorised the BIG Games app", guild=guild_obj)
+@require_role()
+async def connected_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        linked = db_get_all_linked() or []  # (roblox, discord, username, role)
+        connected_rids, connected_dids = _connected_status_map()
+        rows = []
+        for roblox, discord, username, role in linked:
+            is_con = (roblox in connected_rids) or (discord and str(discord) in connected_dids)
+            rows.append((is_con, str(username or roblox), str(discord or "")))
+        connected_count = sum(1 for c, _, _ in rows if c)
+        not_count = len(rows) - connected_count
+
+        ok_lines = [f"✅ **{u}** <@{d}>" for c, u, d in rows if c]
+        missing_lines = [f"⚠️ **{u}** <@{d}>" for c, u, d in rows if not c]
+
+        embed = discord.Embed(
+            title="BIG Games Connection Status",
+            description=f"**{connected_count}** connected · **{not_count}** not connected",
+            color=discord.Color.green() if not_count == 0 else discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        if connected_count:
+            embed.add_field(
+                name=f"✅ Connected ({connected_count})",
+                value="\n".join(ok_lines[:20]) + (f"\n…and {connected_count - 20} more" if connected_count > 20 else ""),
+                inline=False,
+            )
+        if not_count:
+            embed.add_field(
+                name=f"⚠️ Not connected ({not_count})",
+                value="\n".join(missing_lines[:20]) + (f"\n…and {not_count - 20} more" if not_count > 20 else ""),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="🎉", value="Everyone is connected!", inline=False)
+        embed.set_footer(text="Use /connect_dm to DM everyone who hasn't connected.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        print(f"[connected] error: {exc}")
+        traceback.print_exc()
+        await interaction.followup.send("❌ Failed to load connection status.", ephemeral=True)
+
+
+@bot.tree.command(name="connect_dm", description="Staff: DM every member who hasn't authorised the app", guild=guild_obj)
+@require_role()
+async def connect_dm_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        linked = db_get_all_linked() or []
+        connected_rids, connected_dids = _connected_status_map()
+        missing = []
+        for roblox, discord, username, role in linked:
+            is_con = (roblox in connected_rids) or (discord and str(discord) in connected_dids)
+            if not is_con and discord:
+                missing.append((int(discord), str(username or roblox)))
+
+        if not missing:
+            return await interaction.followup.send("✅ Everyone is connected — no DMs needed.", ephemeral=True)
+
+        await interaction.followup.send(
+            f"📨 DMing **{len(missing)}** member(s) who haven't connected…",
+            ephemeral=True,
+        )
+        sent = 0
+        for discord_id, username in missing:
+            try:
+                user = await bot.fetch_user(discord_id)
+                connect_url = _biggames_connect_url(discord_id)
+                await user.send(
+                    "**MCWV — Connect your PS99 account**\n\n"
+                    "All MCWV members are required to authorise the MCWV Bot app so we can "
+                    "verify stats. It only reads your data — we never see your password.\n\n"
+                    f"{connect_url}"
+                )
+                sent += 1
+            except Exception:
+                pass
+            await asyncio.sleep(1.2)  # gentle rate limit
+
+        await interaction.followup.send(f"✅ Done — DM'd **{sent}/{len(missing)}** member(s).", ephemeral=True)
+    except Exception as exc:
+        print(f"[connect_dm] error: {exc}")
+        traceback.print_exc()
+        await interaction.followup.send("❌ Failed to send DMs.", ephemeral=True)
+
+
 async def fetch_website_roles():
     """Best-effort: pull website users + roles from the Hub internal endpoint.
     Returns a dict: discord_id -> role, roblox_id -> role. Empty on failure."""
@@ -21822,6 +22104,10 @@ def start_bot_loops():
     if not clan_leave_loop.is_running():
         clan_leave_loop.start()
 
+    if not biggames_revoke_loop.is_running():
+        biggames_revoke_loop.start()
+        print("✅ BIG Games revoke monitor loop started (30m)")
+
     # ---------------- GIVEAWAY LOOP ----------------
     if not check_giveaway_event.is_running():
         check_giveaway_event.start()
@@ -21910,6 +22196,7 @@ ALL_LOOPS = [
     ("War Poll", "war_poll_loop"),
     ("Reminder", "reminder_loop"),
     ("Clan Leave", "clan_leave_loop"),
+    ("Big Games Revoke", "biggames_revoke_loop"),
     ("Placement", "placement_alert_loop"),
     ("Clan Logs", "clan_log_loop"),
     ("Hourly Stats", "hourly_stats_loop"),
