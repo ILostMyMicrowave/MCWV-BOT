@@ -21953,6 +21953,8 @@ async def connected_cmd(interaction: discord.Interaction):
     try:
         linked = await asyncio.to_thread(db_get_all_linked) or []  # (roblox, discord_id, username, role)
         connected_rids, connected_dids = await asyncio.to_thread(_connected_status_map)
+        tokens = await asyncio.to_thread(_fetch_all_biggames_tokens)
+        print(f"[connected] DEBUG: {len(tokens)} tokens, rid_set={connected_rids}, did_set={connected_dids}")
         rows = []
         for roblox, discord_id, username, role in linked:
             is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
@@ -21983,7 +21985,17 @@ async def connected_cmd(interaction: discord.Interaction):
             )
         else:
             embed.add_field(name="🎉", value="Everyone is connected!", inline=False)
-        embed.set_footer(text="Use /connect_dm to DM everyone who hasn't connected.")
+        # Diagnostic (debug): helps pinpoint why someone reads as not connected.
+        viewer_rid = str(getattr(interaction.user, "id", ""))
+        my_match = ""
+        try:
+            _linked = await asyncio.to_thread(db_get_main_link, interaction.user.id)
+            if _linked:
+                my_rid = str(_linked[0]).strip()
+                my_match = f" | my roblox={my_rid} in_connected={'YES' if my_rid in connected_rids else 'NO'}"
+        except Exception:
+            pass
+        embed.set_footer(text=f"tokens={len(tokens)}{my_match} · /connect_dm to DM the rest")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as exc:
         print(f"[connected] error: {exc}")
