@@ -21935,7 +21935,10 @@ async def connected_cmd(interaction: discord.Interaction):
     except Exception as exc:
         print(f"[connected] error: {exc}")
         traceback.print_exc()
-        await interaction.followup.send("❌ Failed to load connection status.", ephemeral=True)
+        await interaction.followup.send(
+            f"❌ Failed to load connection status: `{type(exc).__name__}: {exc}`",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="connect_dm", description="Staff: DM every member who hasn't authorised the app", guild=guild_obj)
