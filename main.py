@@ -10383,6 +10383,36 @@ class MCWVTicketPanelView(discord.ui.View):
             existing = discord.utils.get(guild.text_channels, topic=f"mcwv-ticket-owner:{interaction.user.id}")
             if existing:
                 return await interaction.response.send_message(f"You already have an open application: {existing.mention}", ephemeral=True)
+
+            # MCWV requires every applicant to authorise the clan app (BIG Games
+            # OAuth) BEFORE they can even open an application ticket. The button
+            # simply won't work until they've connected — no tickets can be made
+            # unless the opener has authorised it. We still double-check at modal
+            # submit time as a second layer of protection.
+            # The check is wrapped in a short timeout so the hub lookup never
+            # pushes us past Discord's ~3s interaction window; if the hub is
+            # briefly unreachable (None) we let the form through rather than
+            # locking someone out, and the submit-time check catches them.
+            try:
+                bg_connected = await asyncio.wait_for(
+                    hub_biggames_connected(interaction.user.id),
+                    timeout=2.5,
+                )
+            except Exception:
+                bg_connected = None
+
+            if bg_connected is False:
+                return await interaction.response.send_message(
+                    "❌ **You need to authorise the MCWV app before making a ticket.**\n\n"
+                    "The **Open Application** button won't work until you've done this — and "
+                    "**no tickets can be opened** unless the opener has authorised it.\n\n"
+                    "1. Go to **https://mcwv-hub.vercel.app/profile/me**\n"
+                    "2. Click **Connect BIG Games** and authorise the app\n"
+                    "3. Come back and press **Open Application** again\n\n"
+                    "This only reads your stats so we can verify your profile — we never see your password.",
+                    ephemeral=True,
+                )
+
             await interaction.response.send_modal(ApplicationModal(interaction.user))
         except discord.HTTPException as http_exc:
             print(f"[ticket] open_application modal failed: {http_exc}")
