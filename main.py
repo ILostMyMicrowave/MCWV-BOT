@@ -21714,6 +21714,41 @@ def _fetch_all_biggames_tokens():
     out = []
     if not db_enabled():
         return out
+    # Self-heal: ensure the BIG Games tables exist so a missing table never
+    # hides the other table's tokens (and never breaks /connected, the revoke
+    # loop, or /connect_dm). Idempotent, mirrors the hub's ensureBigGamesTables.
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS big_games_tokens (
+                    user_id INTEGER PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    roblox_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS big_games_discord_tokens (
+                    discord_id TEXT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    roblox_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    except Exception as exc:
+        print(f"[biggames-revoke] ensure tables failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    # Each table is queried independently so a failure on one never hides the
+    # other's tokens.
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT discord_id, roblox_id, access_token FROM big_games_discord_tokens")
@@ -21726,6 +21761,13 @@ def _fetch_all_biggames_tokens():
                         "roblox_id": str(roblox_id) if roblox_id else None,
                         "access_token": at,
                     })
+    except Exception as exc:
+        print(f"[biggames-revoke] discord-token query failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    try:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT t.roblox_id, t.access_token, u.discord_id
