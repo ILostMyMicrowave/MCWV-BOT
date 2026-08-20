@@ -21898,12 +21898,12 @@ def _connected_status_map():
 async def connected_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        linked = db_get_all_linked() or []  # (roblox, discord, username, role)
+        linked = db_get_all_linked() or []  # (roblox, discord_id, username, role)
         connected_rids, connected_dids = _connected_status_map()
         rows = []
-        for roblox, discord, username, role in linked:
-            is_con = (roblox in connected_rids) or (discord and str(discord) in connected_dids)
-            rows.append((is_con, str(username or roblox), str(discord or "")))
+        for roblox, discord_id, username, role in linked:
+            is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
+            rows.append((is_con, str(username or roblox), str(discord_id or "")))
         connected_count = sum(1 for c, _, _ in rows if c)
         not_count = len(rows) - connected_count
 
@@ -21949,10 +21949,10 @@ async def connect_dm_cmd(interaction: discord.Interaction):
         linked = db_get_all_linked() or []
         connected_rids, connected_dids = _connected_status_map()
         missing = []
-        for roblox, discord, username, role in linked:
-            is_con = (roblox in connected_rids) or (discord and str(discord) in connected_dids)
-            if not is_con and discord:
-                missing.append((int(discord), str(username or roblox)))
+        for roblox, discord_id, username, role in linked:
+            is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
+            if not is_con and discord_id:
+                missing.append((int(discord_id), str(username or roblox)))
 
         if not missing:
             return await interaction.followup.send("✅ Everyone is connected — no DMs needed.", ephemeral=True)
