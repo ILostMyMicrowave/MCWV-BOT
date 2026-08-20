@@ -21478,17 +21478,36 @@ async def before_hub_war_collect_loop():
 
 
 async def hub_biggames_connected(discord_id):
-    """Ask the Hub whether a user has connected their PS99 account (BIG Games
-    OAuth). Used to require authorization before opening an application ticket.
-    Returns True/False; on any failure returns None so callers can decide how
-    strictly to enforce (we default to requiring it, but never hard-fail on a
-    transient hub outage)."""
+    """Whether a user has a valid BIG Games (PS99) connection — required before
+    opening an application ticket.
+
+    Primary path: the Hub's /api/internal/biggames-connected route (validates
+    the token server-side). If that route is unreachable, stale, or rejects us
+    (returns None), we FALL BACK to querying the shared database directly (the
+    bot and hub use the same Supabase), so a broken/misconfigured hub route can
+    never silently disable the application gate.
+
+    Returns True/False; None only when we genuinely cannot tell (DB down), and
+    callers treat None as "allow through" (never hard-fail on an outage)."""
+    # --- Primary: ask the hub ---
+    hub_result = await _hub_biggames_connected_route(discord_id)
+    if hub_result is not None:
+        return hub_result
+
+    # --- Fallback: direct DB check (same Supabase the hub uses) ---
+    print("[biggames-connected] hub route unavailable — falling back to direct DB check")
+    return await _biggames_connected_direct_db(discord_id)
+
+
+async def _hub_biggames_connected_route(discord_id):
+    """Try the Hub's internal route first. Returns True/False on a definitive
+    answer, or None when the hub can't answer (missing config / 401 / error)."""
     if not HUB_BASE_URL:
-        print("[biggames-connected] BLOCKED-DIAGNOSTIC: HUB_BASE_URL is empty — gate disabled")
+        print("[biggames-connected] BLOCKED-DIAGNOSTIC: HUB_BASE_URL is empty")
         return None
     api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
     if not api_key:
-        print("[biggames-connected] BLOCKED-DIAGNOSTIC: BOT_ADMIN_API_KEY is not set on the bot — gate disabled")
+        print("[biggames-connected] BLOCKED-DIAGNOSTIC: BOT_ADMIN_API_KEY is not set on the bot")
         return None
     try:
         global session
@@ -21514,6 +21533,79 @@ async def hub_biggames_connected(discord_id):
         return connected
     except Exception as exc:
         print(f"[biggames-connected] BLOCKED-DIAGNOSTIC: hub check failed: {type(exc).__name__}")
+        return None
+
+
+async def _biggames_connected_direct_db(discord_id):
+    """Self-contained check against the shared database (the same Supabase the
+    hub writes to): resolve the user's roblox_id, read their BIG Games token,
+    and validate it against the BIG Games API. This does not depend on the hub
+    route at all, so a stale hub deploy can't disable the gate."""
+    if not DATABASE_URL or not db_enabled():
+        print("[biggames-connected] DB unavailable — cannot check, allowing")
+        return None
+
+    # 1) Resolve the user's roblox_id (same link the hub uses).
+    rid = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT roblox_id FROM users WHERE discord_id = %s LIMIT 1", (int(discord_id),))
+            row = cur.fetchone()
+            if row and row[0]:
+                rid = str(row[0]).strip()
+    except Exception as exc:
+        print(f"[biggames-connected] DB resolve failed: {type(exc).__name__}")
+        conn.rollback()
+        return None
+    if not rid:
+        # No linked Roblox account → definitely not connected → block.
+        print(f"[biggames-connected] DB: no roblox link for discord {discord_id} -> not connected")
+        return False
+
+    # 2) Read their BIG Games token.
+    token = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT access_token FROM big_games_tokens WHERE roblox_id = %s LIMIT 1", (rid,))
+            row = cur.fetchone()
+            if row and row[0]:
+                token = row[0]
+    except Exception as exc:
+        # Table missing or query error → nobody has authorised, so block.
+        print(f"[biggames-connected] DB token lookup failed: {type(exc).__name__}")
+        conn.rollback()
+        return False
+    if not token:
+        print(f"[biggames-connected] DB: no token for roblox {rid} -> not connected")
+        return False
+
+    # 3) Validate the token against BIG Games (catches revokes/expiry).
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        async with session.get(
+            "https://ps99.biggamesapi.io/v1/account/profile",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as res:
+            if res.status == 200:
+                print(f"[biggames-connected] DB: token valid for roblox {rid} -> connected")
+                return True
+            if res.status in (401, 403):
+                # Revoked/expired → clear the stale token and block.
+                print(f"[biggames-connected] DB: token rejected (HTTP {res.status}) for roblox {rid} -> not connected")
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM big_games_tokens WHERE roblox_id = %s", (rid,))
+                except Exception:
+                    conn.rollback()
+                return False
+            # 5xx / unexpected → conservative, keep them connected.
+            print(f"[biggames-connected] DB: validation HTTP {res.status} (conservative) -> connected")
+            return True
+    except Exception as exc:
+        print(f"[biggames-connected] DB validation failed: {type(exc).__name__}")
         return None
 
 
