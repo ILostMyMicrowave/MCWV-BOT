@@ -1,4 +1,4 @@
-e import os
+import os
 import re
 import asyncio
 import sqlite3
