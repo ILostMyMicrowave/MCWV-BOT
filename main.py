@@ -21819,18 +21819,21 @@ def _fetch_all_biggames_tokens():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT t.user_id, t.roblox_id, t.access_token, u.discord_id
+                SELECT t.user_id, t.roblox_id, t.access_token,
+                       COALESCE(u.discord_id, u2.discord_id) AS discord_id,
+                       COALESCE(u.roblox_id, u2.roblox_id) AS user_roblox_id
                 FROM big_games_tokens t
                 LEFT JOIN users u ON u.roblox_id = t.roblox_id
+                LEFT JOIN users u2 ON u2.id = t.user_id
             """)
-            for user_id, roblox_id, at, discord_id in cur.fetchall():
+            for user_id, roblox_id, at, discord_id, user_roblox_id in cur.fetchall():
                 if at:
                     out.append({
                         "kind": "member",
-                        "key": f"r:{roblox_id or user_id}",
+                        "key": f"r:{roblox_id or user_roblox_id or user_id}",
                         "user_id": str(user_id) if user_id else None,
                         "discord_id": str(discord_id) if discord_id else None,
-                        "roblox_id": str(roblox_id) if roblox_id else None,
+                        "roblox_id": str(roblox_id or user_roblox_id) if (roblox_id or user_roblox_id) else None,
                         "access_token": at,
                     })
     except Exception as exc:
@@ -21890,14 +21893,29 @@ async def _alert_biggames_revoke(guild, staff_channel, t):
     member_id = int(t["discord_id"]) if (t["discord_id"] and str(t["discord_id"]).isdigit()) else None
     label = t["roblox_id"] or t["discord_id"] or "unknown"
 
+    # Show the Discord user's NAME (no ping) so staff can read it without a
+    # noisy mention. The member is already DMed separately.
+    discord_label = None
+    if member_id and guild:
+        try:
+            m = guild.get_member(member_id)
+            if m is None:
+                m = await guild.fetch_member(member_id)
+            if m:
+                discord_label = f"{m.display_name} (`{member_id}`)"
+        except Exception:
+            discord_label = None
+    if not discord_label:
+        discord_label = f"`{member_id}`" if member_id else None
+
     embed = discord.Embed(
         title="🚨 BIG Games Access Revoked",
         description=f"**{label}** no longer has the MCWV Bot app authorised.",
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
     )
-    if member_id:
-        embed.add_field(name="Discord User", value=f"<@{member_id}>", inline=True)
+    if discord_label:
+        embed.add_field(name="Discord User", value=discord_label, inline=True)
     embed.add_field(name="Roblox", value=label, inline=True)
     embed.add_field(
         name="Action Required",
