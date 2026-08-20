@@ -21712,9 +21712,16 @@ def _fetch_all_biggames_tokens():
     AFTER they have authorised, which is exactly the "don't monitor anyone who
     hasn't connected yet" requirement."""
     out = []
+    if not DATABASE_URL:
+        return out
+    # Explicitly (re)connect. On a worker thread this can open a fresh
+    # connection; on the event loop it schedules a heal and returns None.
+    try:
+        ensure_db_connection()
+    except Exception:
+        pass
     if not db_enabled():
         return out
-    # Self-heal: ensure the BIG Games tables exist so a missing table never
     # hides the other table's tokens (and never breaks /connected, the revoke
     # loop, or /connect_dm). Idempotent, mirrors the hub's ensureBigGamesTables.
     try:
@@ -21883,7 +21890,7 @@ async def biggames_revoke_loop():
     global _biggames_known_valid
     await bot.wait_until_ready()
     try:
-        tokens = _fetch_all_biggames_tokens()
+        tokens = await asyncio.to_thread(_fetch_all_biggames_tokens)
         if not tokens:
             _biggames_known_valid = set()
             return
@@ -21927,6 +21934,10 @@ def _connected_status_map():
     """Return (connected_roblox_ids:set, connected_discord_ids:set)."""
     connected_rids = set()
     connected_dids = set()
+    try:
+        ensure_db_connection()
+    except Exception:
+        pass
     for t in _fetch_all_biggames_tokens():
         if t["roblox_id"]:
             connected_rids.add(t["roblox_id"])
@@ -21940,8 +21951,8 @@ def _connected_status_map():
 async def connected_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        linked = db_get_all_linked() or []  # (roblox, discord_id, username, role)
-        connected_rids, connected_dids = _connected_status_map()
+        linked = await asyncio.to_thread(db_get_all_linked) or []  # (roblox, discord_id, username, role)
+        connected_rids, connected_dids = await asyncio.to_thread(_connected_status_map)
         rows = []
         for roblox, discord_id, username, role in linked:
             is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
@@ -21988,8 +21999,8 @@ async def connected_cmd(interaction: discord.Interaction):
 async def connect_dm_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        linked = db_get_all_linked() or []
-        connected_rids, connected_dids = _connected_status_map()
+        linked = await asyncio.to_thread(db_get_all_linked) or []
+        connected_rids, connected_dids = await asyncio.to_thread(_connected_status_map)
         missing = []
         for roblox, discord_id, username, role in linked:
             is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
