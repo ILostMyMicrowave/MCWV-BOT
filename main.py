@@ -21997,10 +21997,19 @@ async def connected_cmd(interaction: discord.Interaction):
             _linked = await asyncio.to_thread(db_get_main_link, interaction.user.id)
             if _linked:
                 my_rid = str(_linked[0]).strip()
-                my_match = f" | my roblox={my_rid} in_connected={'YES' if my_rid in connected_rids else 'NO'}"
+                my_match = f"my roblox={my_rid} in_connected={'YES' if my_rid in connected_rids else 'NO'}"
         except Exception:
             pass
-        embed.set_footer(text=f"tokens={len(tokens)}{my_match} · /connect_dm to DM the rest")
+        token_ids = ", ".join(
+            (t.get("kind") + ":" + (t.get("roblox_id") or t.get("discord_id") or "?"))
+            for t in tokens
+        ) or "none"
+        embed.add_field(
+            name="🔍 Debug",
+            value=f"`{my_match} · tokens={len(tokens)} · [{token_ids}]`",
+            inline=False,
+        )
+        embed.set_footer(text="/connect_dm to DM the rest")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as exc:
         print(f"[connected] error: {exc}")
