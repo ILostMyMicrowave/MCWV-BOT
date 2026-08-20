@@ -8476,7 +8476,13 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
     embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
-    embed.add_field(name="Roblox", value=f"**{roblox_name}**\n`{roblox_id}`", inline=True)
+    roblox_slug = roblox_name if (roblox_name and roblox_name != "Unknown") else roblox_id
+    roblox_profile = f"{HUB_BASE_URL}/profile/{roblox_slug}"
+    embed.add_field(
+        name="Roblox",
+        value=f"[**{roblox_name}**]({roblox_profile})\n`{roblox_id}`",
+        inline=True,
+    )
     embed.add_field(name="Ticket", value=f"`{ticket_id}`", inline=True)
     embed.set_footer(text=f"Claimed by {claimed_by}" if claimed_by else "Pending staff review")
     return embed
@@ -8507,7 +8513,9 @@ async def send_application_review_card(guild, channel, ticket_id, applicant, app
             app_row[5],
             avatar_url=avatar_url,
         )
-        await channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
+        roblox_slug = roblox_username if (roblox_username and roblox_username != "Unknown") else roblox_id
+        profile_url = f"{HUB_BASE_URL}/profile/{roblox_slug}"
+        await channel.send(embed=embed, view=ApplicationReviewView(ticket_id, profile_url))
         return True
     except Exception as exc:
         print(f"[ticket] in-ticket review card send failed for {ticket_id}: {exc}")
@@ -9108,7 +9116,13 @@ async def build_staff_info_embed(ticket_row):
         return embed
 
     roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at = app
-    embed.add_field(name="Roblox", value=f"**{roblox_username}**\n`{roblox_id}`", inline=True)
+    roblox_slug = roblox_username if (roblox_username and roblox_username != "Unknown") else roblox_id
+    roblox_profile = f"{HUB_BASE_URL}/profile/{roblox_slug}"
+    embed.add_field(
+        name="Roblox",
+        value=f"[**{roblox_username}**]({roblox_profile})\n`{roblox_id}`",
+        inline=True,
+    )
     embed.add_field(name="AFK 24/7 on Windows?", value=str(afk_247 or "—")[:1024], inline=False)
     embed.add_field(name="Discord + in-game active hours", value=str(activity or "—")[:1024], inline=False)
     embed.add_field(name="Liquid gems per war", value=str(liquid_gems or "—")[:1024], inline=False)
@@ -10279,9 +10293,17 @@ class CloseConfirmView(discord.ui.View):
 
 
 class ApplicationReviewView(discord.ui.View):
-    def __init__(self, ticket_id):
+    def __init__(self, ticket_id, profile_url=None):
         super().__init__(timeout=None)
         self.ticket_id = ticket_id
+        if profile_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="View Profile",
+                    style=discord.ButtonStyle.link,
+                    url=profile_url,
+                )
+            )
 
     def staff_ok(self, interaction):
         return has_mcwv_ticket_staff_permission(interaction.user)
