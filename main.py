@@ -9783,6 +9783,22 @@ class ApplicationModal(discord.ui.Modal):
         if existing:
             return await interaction.followup.send(f"You already have an open application: {existing.mention}", ephemeral=True)
 
+        # MCWV requires applicants to authorize the clan app (BIG Games OAuth)
+        # so we can verify their profile before accepting. Block the application
+        # if they haven't connected. On a transient hub failure we allow it
+        # through rather than locking out an applicant, but a confirmed
+        # "not connected" is a hard block.
+        bg_connected = await hub_biggames_connected(interaction.user.id)
+        if bg_connected is False:
+            return await interaction.followup.send(
+                "❌ Before you can apply, you must **connect your PS99 account** so MCWV can verify your profile.\n\n"
+                "1. Visit **https://mcwv-hub.vercel.app/profile/me**\n"
+                "2. Click **Connect BIG Games** and authorise the app\n"
+                "3. Return here and open your application again.\n\n"
+                "This only reads your stats — we never see your password.",
+                ephemeral=True,
+            )
+
         roblox_input = self.answer("roblox_username").strip()
         resolved = await resolve_roblox_username_basic(roblox_input)
         if not resolved:
@@ -21429,6 +21445,37 @@ async def hub_war_collect_loop():
 @hub_war_collect_loop.before_loop
 async def before_hub_war_collect_loop():
     await bot.wait_until_ready()
+
+
+async def hub_biggames_connected(discord_id):
+    """Ask the Hub whether a user has connected their PS99 account (BIG Games
+    OAuth). Used to require authorization before opening an application ticket.
+    Returns True/False; on any failure returns None so callers can decide how
+    strictly to enforce (we default to requiring it, but never hard-fail on a
+    transient hub outage)."""
+    if not HUB_BASE_URL:
+        return None
+    api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+    if not api_key:
+        return None
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        endpoint = f"{HUB_BASE_URL}/api/internal/biggames-connected"
+        async with session.post(
+            endpoint,
+            json={"discord_id": str(discord_id)},
+            headers={"X-Admin-API-Key": api_key, "Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as res:
+            if res.status != 200:
+                return None
+            data = await res.json(content_type=None)
+        return bool(data and data.get("connected"))
+    except Exception as exc:
+        print(f"[biggames-connected] hub check failed: {type(exc).__name__}")
+        return None
 
 
 async def fetch_website_roles():
