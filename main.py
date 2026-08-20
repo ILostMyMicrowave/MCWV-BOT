@@ -21777,17 +21777,18 @@ def _fetch_all_biggames_tokens():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT t.roblox_id, t.access_token, u.discord_id
+                SELECT t.user_id, t.roblox_id, t.access_token, u.discord_id
                 FROM big_games_tokens t
                 LEFT JOIN users u ON u.roblox_id = t.roblox_id
             """)
-            for roblox_id, at, discord_id in cur.fetchall():
+            for user_id, roblox_id, at, discord_id in cur.fetchall():
                 if at:
                     out.append({
                         "kind": "member",
-                        "key": f"r:{roblox_id}",
+                        "key": f"r:{roblox_id or user_id}",
+                        "user_id": str(user_id) if user_id else None,
                         "discord_id": str(discord_id) if discord_id else None,
-                        "roblox_id": str(roblox_id),
+                        "roblox_id": str(roblox_id) if roblox_id else None,
                         "access_token": at,
                     })
     except Exception as exc:
@@ -21931,9 +21932,10 @@ async def before_biggames_revoke_loop():
 
 
 def _connected_status_map():
-    """Return (connected_roblox_ids:set, connected_discord_ids:set)."""
+    """Return (connected_roblox_ids, connected_discord_ids, connected_user_ids)."""
     connected_rids = set()
     connected_dids = set()
+    connected_uids = set()
     try:
         ensure_db_connection()
     except Exception:
@@ -21941,11 +21943,32 @@ def _connected_status_map():
     for t in _fetch_all_biggames_tokens():
         rid = str(t["roblox_id"]).strip() if t["roblox_id"] else ""
         did = str(t["discord_id"]).strip() if t["discord_id"] else ""
+        uid = str(t["user_id"]).strip() if t.get("user_id") else ""
         if rid:
             connected_rids.add(rid)
         if did:
             connected_dids.add(did)
-    return connected_rids, connected_dids
+        if uid:
+            connected_uids.add(uid)
+    return connected_rids, connected_dids, connected_uids
+
+
+def _hub_user_id_by_discord(discord_id):
+    """Resolve a member's hub users.id from their discord_id (or via roblox_id)."""
+    if not discord_id:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE discord_id = %s LIMIT 1", (str(discord_id),))
+            row = cur.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    return None
 
 
 @bot.tree.command(name="connected", description="Staff: see who has authorised the BIG Games app", guild=guild_obj)
@@ -21954,7 +21977,7 @@ async def connected_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         linked = await asyncio.to_thread(db_get_all_linked) or []  # (roblox, discord_id, username, role)
-        connected_rids, connected_dids = await asyncio.to_thread(_connected_status_map)
+        connected_rids, connected_dids, connected_uids = await asyncio.to_thread(_connected_status_map)
         tokens = await asyncio.to_thread(_fetch_all_biggames_tokens)
         token_desc = ", ".join(f"{t.get('kind')}:{t.get('roblox_id') or t.get('discord_id')}" for t in tokens)
         print(f"[connected] DEBUG: {len(tokens)} tokens [{token_desc}] rid_set={connected_rids} did_set={connected_dids}")
@@ -21962,7 +21985,12 @@ async def connected_cmd(interaction: discord.Interaction):
         for roblox, discord_id, username, role in linked:
             rid_key = str(roblox).strip()
             did_key = str(discord_id).strip() if discord_id else ""
-            is_con = (rid_key in connected_rids) or (did_key and did_key in connected_dids)
+            uid_key = await asyncio.to_thread(_hub_user_id_by_discord, discord_id)
+            is_con = (
+                (rid_key in connected_rids)
+                or (did_key and did_key in connected_dids)
+                or (uid_key and uid_key in connected_uids)
+            )
             rows.append((is_con, str(username or roblox), did_key))
         connected_count = sum(1 for c, _, _ in rows if c)
         not_count = len(rows) - connected_count
@@ -21991,17 +22019,20 @@ async def connected_cmd(interaction: discord.Interaction):
         else:
             embed.add_field(name="🎉", value="Everyone is connected!", inline=False)
         # Diagnostic (debug): helps pinpoint why someone reads as not connected.
-        viewer_rid = str(getattr(interaction.user, "id", ""))
         my_match = ""
         try:
             _linked = await asyncio.to_thread(db_get_main_link, interaction.user.id)
             if _linked:
                 my_rid = str(_linked[0]).strip()
-                my_match = f"my roblox={my_rid} in_connected={'YES' if my_rid in connected_rids else 'NO'}"
+                my_uid = await asyncio.to_thread(_hub_user_id_by_discord, interaction.user.id)
+                my_match = (
+                    f"my roblox={my_rid} in_connected={'YES' if my_rid in connected_rids else 'NO'}"
+                    + (f" uid={my_uid} in={'YES' if my_uid and my_uid in connected_uids else 'NO'}" if my_uid else "")
+                )
         except Exception:
             pass
         token_ids = ", ".join(
-            (t.get("kind") + ":" + (t.get("roblox_id") or t.get("discord_id") or "?"))
+            (t.get("kind") + ":" + (t.get("roblox_id") or t.get("discord_id") or t.get("user_id") or "?"))
             for t in tokens
         ) or "none"
         embed.add_field(
@@ -22026,10 +22057,17 @@ async def connect_dm_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         linked = await asyncio.to_thread(db_get_all_linked) or []
-        connected_rids, connected_dids = await asyncio.to_thread(_connected_status_map)
+        connected_rids, connected_dids, connected_uids = await asyncio.to_thread(_connected_status_map)
         missing = []
         for roblox, discord_id, username, role in linked:
-            is_con = (roblox in connected_rids) or (discord_id and str(discord_id) in connected_dids)
+            rid_key = str(roblox).strip()
+            did_key = str(discord_id).strip() if discord_id else ""
+            uid_key = await asyncio.to_thread(_hub_user_id_by_discord, discord_id)
+            is_con = (
+                (rid_key in connected_rids)
+                or (did_key and did_key in connected_dids)
+                or (uid_key and uid_key in connected_uids)
+            )
             if not is_con and discord_id:
                 missing.append((int(discord_id), str(username or roblox)))
 
