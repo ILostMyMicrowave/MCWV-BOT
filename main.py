@@ -21484,9 +21484,11 @@ async def hub_biggames_connected(discord_id):
     strictly to enforce (we default to requiring it, but never hard-fail on a
     transient hub outage)."""
     if not HUB_BASE_URL:
+        print("[biggames-connected] BLOCKED-DIAGNOSTIC: HUB_BASE_URL is empty — gate disabled")
         return None
     api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
     if not api_key:
+        print("[biggames-connected] BLOCKED-DIAGNOSTIC: BOT_ADMIN_API_KEY is not set on the bot — gate disabled")
         return None
     try:
         global session
@@ -21499,12 +21501,19 @@ async def hub_biggames_connected(discord_id):
             headers={"X-Admin-API-Key": api_key, "Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as res:
+            body = await res.text()
             if res.status != 200:
+                print(f"[biggames-connected] BLOCKED-DIAGNOSTIC: hub HTTP {res.status} -> {body[:200]}")
                 return None
-            data = await res.json(content_type=None)
-        return bool(data and data.get("connected"))
+            try:
+                data = await res.json(content_type=None)
+            except Exception:
+                data = None
+        connected = bool(data and data.get("connected"))
+        print(f"[biggames-connected] BLOCKED-DIAGNOSTIC: hub said connected={connected} for discord_id={discord_id}")
+        return connected
     except Exception as exc:
-        print(f"[biggames-connected] hub check failed: {type(exc).__name__}")
+        print(f"[biggames-connected] BLOCKED-DIAGNOSTIC: hub check failed: {type(exc).__name__}")
         return None
 
 
