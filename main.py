@@ -21555,7 +21555,10 @@ async def _biggames_connected_direct_db(discord_id):
                 rid = str(row[0]).strip()
     except Exception as exc:
         print(f"[biggames-connected] DB resolve failed: {type(exc).__name__}")
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return None
     if not rid:
         # No linked Roblox account → definitely not connected → block.
@@ -21573,7 +21576,10 @@ async def _biggames_connected_direct_db(discord_id):
     except Exception as exc:
         # Table missing or query error → nobody has authorised, so block.
         print(f"[biggames-connected] DB token lookup failed: {type(exc).__name__}")
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return False
     if not token:
         print(f"[biggames-connected] DB: no token for roblox {rid} -> not connected")
@@ -21599,7 +21605,10 @@ async def _biggames_connected_direct_db(discord_id):
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM big_games_tokens WHERE roblox_id = %s", (rid,))
                 except Exception:
-                    conn.rollback()
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 return False
             # 5xx / unexpected → conservative, keep them connected.
             print(f"[biggames-connected] DB: validation HTTP {res.status} (conservative) -> connected")
