@@ -9790,11 +9790,19 @@ class ApplicationModal(discord.ui.Modal):
         # "not connected" is a hard block.
         bg_connected = await hub_biggames_connected(interaction.user.id)
         if bg_connected is False:
+            connect_url = _biggames_connect_url(interaction.user.id)
+            try:
+                await interaction.user.send(
+                    f"**MCWV — Authorise the app to apply**\n\n"
+                    f"Click the link below to connect your PS99 account. It only reads your "
+                    f"stats — we never see your password.\n\n{connect_url}"
+                )
+            except Exception:
+                pass
             return await interaction.followup.send(
                 "❌ Before you can apply, you must **connect your PS99 account** so MCWV can verify your profile.\n\n"
-                "1. Visit **https://mcwv-hub.vercel.app/profile/me**\n"
-                "2. Click **Connect BIG Games** and authorise the app\n"
-                "3. Return here and open your application again.\n\n"
+                f"👉 **Click here to authorise:** {connect_url}\n\n"
+                "Return here and open your application again afterwards.\n\n"
                 "This only reads your stats — we never see your password.",
                 ephemeral=True,
             )
@@ -10402,14 +10410,21 @@ class MCWVTicketPanelView(discord.ui.View):
                 bg_connected = None
 
             if bg_connected is False:
+                connect_url = _biggames_connect_url(interaction.user.id)
+                try:
+                    await interaction.user.send(
+                        f"**MCWV — Authorise the app to apply**\n\n"
+                        f"Click the link below to connect your PS99 account. It only reads your "
+                        f"stats — we never see your password.\n\n{connect_url}"
+                    )
+                except Exception:
+                    pass
                 return await interaction.response.send_message(
                     "❌ **You need to authorise the MCWV app before making a ticket.**\n\n"
                     "The **Open Application** button won't work until you've done this — and "
                     "**no tickets can be opened** unless the opener has authorised it.\n\n"
-                    "1. Go to **https://mcwv-hub.vercel.app/profile/me**\n"
-                    "2. Click **Connect BIG Games** and authorise the app\n"
-                    "3. Come back and press **Open Application** again\n\n"
-                    "This only reads your stats so we can verify your profile — we never see your password.",
+                    f"👉 **Click here to authorise:** {connect_url}\n\n"
+                    "It only takes a second. Once done, press **Open Application** again.",
                     ephemeral=True,
                 )
 
@@ -21477,6 +21492,11 @@ async def before_hub_war_collect_loop():
     await bot.wait_until_ready()
 
 
+def _biggames_connect_url(discord_id):
+    """Public no-login connect link for an applicant (no hub account needed)."""
+    return f"{HUB_BASE_URL}/api/biggames/connect?discord={discord_id}"
+
+
 async def hub_biggames_connected(discord_id):
     """Whether a user has a valid BIG Games (PS99) connection — required before
     opening an application ticket.
@@ -21536,16 +21556,80 @@ async def _hub_biggames_connected_route(discord_id):
         return None
 
 
+def _db_delete(table, col, value):
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {table} WHERE {col} = %s", (value,))
+
+
+async def _validate_biggames_token(token, cleanup, label):
+    """Validate a stored BIG Games token against the API and return
+    True/False/None. On a revoked/expired token (401/403) it clears the stale
+    row via `cleanup`. On 5xx/network it is conservative (returns True) so a
+    transient BIG Games outage never locks out a legitimately-connected user."""
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        async with session.get(
+            "https://ps99.biggamesapi.io/v1/account/profile",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as res:
+            if res.status == 200:
+                print(f"[biggames-connected] DB: token valid for {label} -> connected")
+                return True
+            if res.status in (401, 403):
+                print(f"[biggames-connected] DB: token rejected (HTTP {res.status}) for {label} -> not connected")
+                try:
+                    cleanup()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return False
+            print(f"[biggames-connected] DB: validation HTTP {res.status} (conservative) -> connected")
+            return True
+    except Exception as exc:
+        print(f"[biggames-connected] DB validation failed for {label}: {type(exc).__name__}")
+        return None
+
+
 async def _biggames_connected_direct_db(discord_id):
     """Self-contained check against the shared database (the same Supabase the
-    hub writes to): resolve the user's roblox_id, read their BIG Games token,
-    and validate it against the BIG Games API. This does not depend on the hub
-    route at all, so a stale hub deploy can't disable the gate."""
+    hub writes to). Covers BOTH flows:
+      1) Applicant: token keyed directly by Discord ID (big_games_discord_tokens
+         — no hub account needed).
+      2) Member: token keyed by the user's linked Roblox id (big_games_tokens).
+    Validates against the BIG Games API. Does not depend on the hub route at
+    all, so a stale hub deploy can't disable the gate."""
     if not DATABASE_URL or not db_enabled():
         print("[biggames-connected] DB unavailable — cannot check, allowing")
         return None
 
-    # 1) Resolve the user's roblox_id (same link the hub uses).
+    did = str(discord_id)
+
+    # 1) Applicant path: token keyed directly by Discord ID.
+    dtoken = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT access_token FROM big_games_discord_tokens WHERE discord_id = %s LIMIT 1",
+                (did,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                dtoken = row[0]
+    except Exception:
+        dtoken = None
+    if dtoken:
+        return await _validate_biggames_token(
+            dtoken,
+            cleanup=lambda: _db_delete("big_games_discord_tokens", "discord_id", did),
+            label=f"discord {did}",
+        )
+
+    # 2) Member path: resolve roblox_id, then read its token.
     rid = None
     try:
         with conn.cursor() as cur:
@@ -21562,10 +21646,9 @@ async def _biggames_connected_direct_db(discord_id):
         return None
     if not rid:
         # No linked Roblox account → definitely not connected → block.
-        print(f"[biggames-connected] DB: no roblox link for discord {discord_id} -> not connected")
+        print(f"[biggames-connected] DB: no roblox link for discord {did} -> not connected")
         return False
 
-    # 2) Read their BIG Games token.
     token = None
     try:
         with conn.cursor() as cur:
@@ -21585,37 +21668,11 @@ async def _biggames_connected_direct_db(discord_id):
         print(f"[biggames-connected] DB: no token for roblox {rid} -> not connected")
         return False
 
-    # 3) Validate the token against BIG Games (catches revokes/expiry).
-    try:
-        global session
-        if session is None or session.closed:
-            session = aiohttp.ClientSession()
-        async with session.get(
-            "https://ps99.biggamesapi.io/v1/account/profile",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=8),
-        ) as res:
-            if res.status == 200:
-                print(f"[biggames-connected] DB: token valid for roblox {rid} -> connected")
-                return True
-            if res.status in (401, 403):
-                # Revoked/expired → clear the stale token and block.
-                print(f"[biggames-connected] DB: token rejected (HTTP {res.status}) for roblox {rid} -> not connected")
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("DELETE FROM big_games_tokens WHERE roblox_id = %s", (rid,))
-                except Exception:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                return False
-            # 5xx / unexpected → conservative, keep them connected.
-            print(f"[biggames-connected] DB: validation HTTP {res.status} (conservative) -> connected")
-            return True
-    except Exception as exc:
-        print(f"[biggames-connected] DB validation failed: {type(exc).__name__}")
-        return None
+    return await _validate_biggames_token(
+        token,
+        cleanup=lambda: _db_delete("big_games_tokens", "roblox_id", rid),
+        label=f"roblox {rid}",
+    )
 
 
 async def fetch_website_roles():
