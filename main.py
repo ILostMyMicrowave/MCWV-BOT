@@ -9339,7 +9339,9 @@ async def restore_application_review_messages(guild):
                     already_posted = True  # cannot verify -> safer to skip than duplicate
                 if already_posted:
                     continue
-                await ticket_channel.send(embed=embed, view=ApplicationReviewView(ticket_id))
+                restore_slug = (row[4] or "") if (row[4] and row[4] != "Unknown") else (row[5] or "")
+                restore_profile = f"{HUB_BASE_URL}/profile/{restore_slug}" if restore_slug else None
+                await ticket_channel.send(embed=embed, view=ApplicationReviewView(ticket_id, restore_profile))
                 restored += 1
                 await asyncio.sleep(1.0)
             except Exception as exc:
