@@ -21950,7 +21950,13 @@ async def _alert_biggames_revoke(guild, staff_channel, t):
 async def biggames_revoke_loop():
     """Every 30 min, validate all stored BIG Games tokens. When one that was
     previously working gets revoked/expired, alert staff and DM the member, then
-    clear the stale token. Users who never authorised are never tracked."""
+    clear the stale token. Users who never authorised are never tracked.
+
+    Dedupes by user: a user can have multiple token rows (e.g. a member token
+    in big_games_tokens AND an applicant token in big_games_discord_tokens, or
+    a stale copy). We only treat them as revoked if NONE of their tokens are
+    valid — otherwise a stale duplicate would false-alert someone who is
+    genuinely connected."""
     global _biggames_known_valid
     await bot.wait_until_ready()
     try:
@@ -21965,26 +21971,49 @@ async def biggames_revoke_loop():
         except Exception:
             staff_channel = None
 
-        valid_now = set()
+        # Validate all tokens in one pass, remembering status per token.
+        results = []  # {t, ok}
         for t in tokens:
-            key = t["key"]
             ok = await _validate_token_no_cleanup(t["access_token"])
-            if ok is True:
-                valid_now.add(key)
-                # Restore + stop alerts: a previously-revoked member reconnected.
-                # Clear their revoke log so (a) no lingering alert state and
-                # (b) a FUTURE revoke alerts fresh instead of being suppressed.
-                _biggames_revoke_log.pop(key, None)
-                continue
-            if ok is False:
-                # Revoked/expired. Only alert if we previously saw it working.
-                was_valid = key in _biggames_known_valid
-                _delete_token_by_key(t)
-                if was_valid:
-                    await _alert_biggames_revoke(bot.get_guild(GUILD_ID) or broadcast_primary_guild(), staff_channel, t)
-            # ok is None -> transient API error, leave it for next run.
+            results.append({"t": t, "ok": ok})
 
-        _biggames_known_valid = valid_now
+        # Group tokens by user identity (discord_id, else roblox_id).
+        by_user: dict = {}
+        order = []
+        for r in results:
+            t = r["t"]
+            uid = str(t.get("discord_id") or t.get("roblox_id") or t.get("user_id") or t["key"])
+            if uid not in by_user:
+                by_user[uid] = []
+                order.append(uid)
+            by_user[uid].append(r)
+
+        valid_keys = set()
+        for uid in order:
+            group = by_user[uid]
+            # User is connected if ANY of their tokens is valid.
+            user_connected = any(r["ok"] is True for r in group)
+            if user_connected:
+                # Keep their valid token(s) as known-valid; clear any stale rows
+                # silently (no alert — they're still connected via another).
+                for r in group:
+                    if r["ok"] is True:
+                        valid_keys.add(r["t"]["key"])
+                        _biggames_revoke_log.pop(r["t"]["key"], None)
+                    elif r["ok"] is False:
+                        # Stale duplicate next to a valid token — clean it up quietly.
+                        _delete_token_by_key(r["t"])
+                continue
+
+            # No valid token for this user — they are revoked.
+            for r in group:
+                if r["ok"] is False:
+                    was_valid = r["t"]["key"] in _biggames_known_valid
+                    _delete_token_by_key(r["t"])
+                    if was_valid:
+                        await _alert_biggames_revoke(bot.get_guild(GUILD_ID) or broadcast_primary_guild(), staff_channel, r["t"])
+
+        _biggames_known_valid = valid_keys
     except Exception as exc:
         print(f"[biggames-revoke] loop error: {exc}")
 
