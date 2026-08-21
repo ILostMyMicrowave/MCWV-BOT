@@ -21884,7 +21884,22 @@ def _delete_token_by_key(t):
         if t["kind"] == "discord":
             _db_delete("big_games_discord_tokens", "discord_id", t["discord_id"])
         else:
-            _db_delete("big_games_tokens", "roblox_id", t["roblox_id"])
+            # Member tokens are keyed by user_id (the PRIMARY KEY) and are often
+            # stored with roblox_id = NULL. The roblox_id in the fetched entry
+            # may come from a users-table JOIN rather than the token row itself,
+            # so `WHERE roblox_id = $1` would match NOTHING for a user_id-keyed
+            # row and the stale token would never be cleaned up (and its revoke
+            # alert would never fire). Delete by user_id first (the reliable PK),
+            # and fall back to roblox_id for any row that lacks a user_id.
+            deleted = False
+            if t.get("user_id"):
+                try:
+                    _db_delete("big_games_tokens", "user_id", t["user_id"])
+                    deleted = True
+                except Exception:
+                    deleted = False
+            if not deleted and t.get("roblox_id"):
+                _db_delete("big_games_tokens", "roblox_id", t["roblox_id"])
     except Exception as exc:
         print(f"[biggames-revoke] delete failed for {t.get('key')}: {exc}")
 
