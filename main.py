@@ -21695,14 +21695,18 @@ async def _biggames_connected_direct_db(discord_id):
             label=f"discord {did}",
         )
 
-    # 2) Member path: resolve roblox_id, then read its token.
+    # 2) Member path: resolve roblox_id AND hub user_id, then read its token.
     rid = None
+    hub_user_id = None
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT roblox_id FROM users WHERE discord_id = %s LIMIT 1", (int(discord_id),))
+            cur.execute("SELECT roblox_id, id FROM users WHERE discord_id = %s LIMIT 1", (int(discord_id),))
             row = cur.fetchone()
-            if row and row[0]:
-                rid = str(row[0]).strip()
+            if row:
+                if row[0]:
+                    rid = str(row[0]).strip()
+                if len(row) > 1 and row[1]:
+                    hub_user_id = str(row[1]).strip()
     except Exception as exc:
         print(f"[biggames-connected] DB resolve failed: {type(exc).__name__}")
         try:
@@ -21710,18 +21714,27 @@ async def _biggames_connected_direct_db(discord_id):
         except Exception:
             pass
         return None
-    if not rid:
+    if not rid and not hub_user_id:
         # No linked Roblox account → definitely not connected → block.
         print(f"[biggames-connected] DB: no roblox link for discord {did} -> not connected")
         return False
 
     token = None
+    token_cleanup = None
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT access_token FROM big_games_tokens WHERE roblox_id = %s LIMIT 1", (rid,))
-            row = cur.fetchone()
-            if row and row[0]:
-                token = row[0]
+            if rid:
+                cur.execute("SELECT access_token FROM big_games_tokens WHERE roblox_id = %s LIMIT 1", (rid,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    token = row[0]
+                    token_cleanup = lambda: _db_delete("big_games_tokens", "roblox_id", rid)
+            if not token and hub_user_id:
+                cur.execute("SELECT access_token FROM big_games_tokens WHERE user_id = %s LIMIT 1", (hub_user_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    token = row[0]
+                    token_cleanup = lambda: _db_delete("big_games_tokens", "user_id", hub_user_id)
     except Exception as exc:
         # Table missing or query error → nobody has authorised, so block.
         print(f"[biggames-connected] DB token lookup failed: {type(exc).__name__}")
@@ -21731,13 +21744,13 @@ async def _biggames_connected_direct_db(discord_id):
             pass
         return False
     if not token:
-        print(f"[biggames-connected] DB: no token for roblox {rid} -> not connected")
+        print(f"[biggames-connected] DB: no token for discord {did} -> not connected")
         return False
 
     return await _validate_biggames_token(
         token,
-        cleanup=lambda: _db_delete("big_games_tokens", "roblox_id", rid),
-        label=f"roblox {rid}",
+        cleanup=token_cleanup,
+        label=f"discord {did}",
     )
 
 
