@@ -8514,7 +8514,7 @@ async def send_application_review_card(guild, channel, ticket_id, applicant, app
             avatar_url=avatar_url,
         )
         roblox_slug = roblox_username if (roblox_username and roblox_username != "Unknown") else roblox_id
-        profile_url = f"{HUB_BASE_URL}/profile/{roblox_slug}"
+        profile_url = f"{HUB_BASE_URL}/profile/{roblox_slug}?discord={applicant.id}"
         await channel.send(embed=embed, view=ApplicationReviewView(ticket_id, profile_url))
         return True
     except Exception as exc:
@@ -9117,7 +9117,7 @@ async def build_staff_info_embed(ticket_row):
 
     roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at = app
     roblox_slug = roblox_username if (roblox_username and roblox_username != "Unknown") else roblox_id
-    roblox_profile = f"{HUB_BASE_URL}/profile/{roblox_slug}"
+    roblox_profile = f"{HUB_BASE_URL}/profile/{roblox_slug}?discord={opener_id}"
     embed.add_field(
         name="Roblox",
         value=f"[**{roblox_username}**]({roblox_profile})\n`{roblox_id}`",
