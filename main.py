@@ -18447,6 +18447,20 @@ async def clan_leave_loop():
         if session is None or session.closed:
             return
 
+        # Members on an ACTIVE Leave of Absence are intentionally out of the
+        # clan, so they must never trigger "Clan Leave Detected". Otherwise,
+        # once staff grants LOA (which pops pending_clan_removals), the very
+        # next 10-min tick would re-detect them and re-alert forever.
+        loa_roblox_ids = set()
+        try:
+            for row in db_list_active_loas():
+                # row: (id, roblox_id, roblox_username, discord_id, ...)
+                if row and row[1]:
+                    loa_roblox_ids.add(str(row[1]).strip())
+        except Exception as exc:
+            print("clan_leave_loop LOA lookup error:", exc)
+            loa_roblox_ids = set()
+
         timeout = aiohttp.ClientTimeout(total=15)
 
         async with session.get(CLAN_API, timeout=timeout) as r:
@@ -18483,6 +18497,11 @@ async def clan_leave_loop():
         for roblox_id, discord_id, roblox_name in users:
             try:
                 if int(roblox_id) in clan_member_ids:
+                    continue
+
+                # Skip anyone on an active LOA — they're deliberately not in
+                # the clan and must not be re-alerted every 10 minutes.
+                if str(roblox_id).strip() in loa_roblox_ids:
                     continue
 
                 if roblox_id in pending_clan_removals:
