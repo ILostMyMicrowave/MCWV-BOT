@@ -18401,27 +18401,29 @@ async def war_poll_loop():
             if currently_active:
                 if hub_war_collect_loop.is_running():
                     hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
-                await channel.send("⚠️ CLAN WAR STARTED!! LETS GO MCWV!!!!!")
+                war_name = PS99_CURRENT_WAR_NAME or "New battle"
+                await channel.send(f"WAR STARTED — {war_name}")
                 print("War started (state synced)")
                 await run_initial_presence_check()
                 # Fire instant push to all Hub subscribers.
                 await trigger_hub_push(
                     "war_start",
-                    title="⚔️ WAR DECLARED",
-                    body=f"{PS99_CURRENT_WAR_NAME or 'New battle'} is live — MCWV, to arms!",
+                    title="WAR STARTED",
+                    body=war_name,
                     url="/war-info",
-                    tag=f"war-start-{PS99_CURRENT_WAR_NAME or 'battle'}".lower()[:48],
+                    tag=f"war-start-{war_name}".lower()[:48],
                 )
             else:
                 offline_since.clear()
                 status_cache.clear()
-                await channel.send("🛑 CLAN WAR OVER. GG EVERYONE!!")
+                war_name = PS99_CURRENT_WAR_NAME or "Clan war"
+                await channel.send(f"WAR OVER — {war_name}")
                 print("War ended (state synced)")
                 # Fire instant push + sweep any pending broadcasts.
                 await trigger_hub_push(
                     "war_end",
-                    title="🛑 WAR OVER",
-                    body="GG MCWV — war's done. Check the recap on the Hub.",
+                    title="WAR OVER",
+                    body=war_name,
                     url="/war-info",
                     tag="war-end",
                 )
@@ -21450,8 +21452,8 @@ async def placement_alert_loop():
             improved = rank < old_rank
             await trigger_hub_push(
                 "placement",
-                title=f"{'📈' if improved else '📉'} MCWV #{rank}",
-                body=f"Clan placement {'up' if improved else 'down'} from #{old_rank} to #{rank} - {format_compact_points(points)} pts",
+                title=f"MCWV #{rank}",
+                body=f"{'Up' if improved else 'Down'} from #{old_rank} · {format_compact_points(points)} pts",
                 url="/war-info",
                 tag=f"placement-{battle_id}".lower()[:48],
             )
