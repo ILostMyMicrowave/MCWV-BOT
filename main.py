@@ -22038,6 +22038,141 @@ async def before_biggames_revoke_loop():
     await bot.wait_until_ready()
 
 
+async def _fetch_gems_from_token(token):
+    """GET /v1/account/profile and extract the Diamond (gem) count, or None.
+
+    Diamonds may come back as a plain number OR as an object carrying the amount
+    in one of several field names, so we tolerate both shapes (mirrors the
+    hub's extractDiamonds)."""
+    try:
+        import json as _json
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        async with session.get(
+            "https://ps99.biggamesapi.io/v1/account/profile",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as res:
+            if res.status != 200:
+                return None
+            body = await res.text()
+            data = _json.loads(body or "{}")
+    except Exception:
+        return None
+    if not data or data.get("status") == "error":
+        return None
+    profile = data.get("data") or data
+    diamonds = (
+        profile.get("Currency", {}).get("Diamonds")
+        or profile.get("Diamonds")
+        or profile.get("Gems")
+    )
+    if isinstance(diamonds, dict):
+        for k in ("_am", "amount", "Amount", "value", "Value", "count", "Count"):
+            v = diamonds.get(k)
+            try:
+                n = float(v)
+                if n == n:
+                    return n
+            except (TypeError, ValueError):
+                continue
+        return None
+    try:
+        n = float(diamonds)
+        return n if n == n else None
+    except (TypeError, ValueError):
+        return None
+
+
+@tasks.loop(minutes=60)
+async def biggames_gem_snapshot_loop():
+    """Hourly: capture each connected member's current PS99 gem count into
+    player_gem_snapshots so the hub's Profiles "Most Improved" / WarSpending
+    deltas are meaningful even if staff never open the page.
+
+    Reuses the same token store as the revoke monitor. Runs on the event loop
+    but keeps blocking DB/network work short and throttles to one row per member
+    per ~hour so the table doesn't bloat. Non-fatal on any error — this is a
+    background nicety, never a hard dependency."""
+    await bot.wait_until_ready()
+    if not DATABASE_URL or not db_enabled():
+        return
+    try:
+        tokens = await asyncio.to_thread(_fetch_all_biggames_tokens)
+        if not tokens:
+            return
+
+        # Ensure the snapshot table exists (mirrors the hub's shape/index).
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS player_gem_snapshots (
+                        id BIGSERIAL PRIMARY KEY,
+                        roblox_id TEXT NOT NULL,
+                        gems BIGINT,
+                        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS player_gem_snapshots_roblox_time_idx
+                    ON player_gem_snapshots (roblox_id, captured_at)
+                """)
+            conn.commit()
+        except Exception as exc:
+            print(f"[biggames-snap] ensure table failed: {exc}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return
+
+        seen_roblox = set()
+        for t in tokens:
+            roblox_id = t.get("roblox_id") or t.get("user_id")
+            if not roblox_id or roblox_id in seen_roblox:
+                continue
+            seen_roblox.add(roblox_id)
+
+            ok = await _validate_token_no_cleanup(t["access_token"])
+            if ok is not True:
+                continue
+            gems = await _fetch_gems_from_token(t["access_token"])
+            if gems is None:
+                continue
+
+            rid = str(roblox_id)
+            try:
+                with conn.cursor() as cur:
+                    # Throttle: only insert if no row in the last ~50 min.
+                    cur.execute(
+                        "SELECT 1 FROM player_gem_snapshots WHERE roblox_id = %s "
+                        "AND captured_at > NOW() - INTERVAL '50 minutes' LIMIT 1",
+                        (rid,),
+                    )
+                    if cur.fetchone():
+                        continue
+                    cur.execute(
+                        "INSERT INTO player_gem_snapshots (roblox_id, gems) VALUES (%s, %s)",
+                        (rid, int(round(gems))),
+                    )
+                conn.commit()
+                print(f"[biggames-snap] recorded gems for roblox {rid}")
+            except Exception as exc:
+                print(f"[biggames-snap] insert failed for {rid}: {exc}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"[biggames-snap] loop error: {exc}")
+
+
+@biggames_gem_snapshot_loop.before_loop
+async def before_biggames_gem_snapshot_loop():
+    await bot.wait_until_ready()
+
+
 def _connected_status_map():
     """Return (connected_roblox_ids, connected_discord_ids, connected_user_ids)."""
     connected_rids = set()
@@ -22326,6 +22461,10 @@ def start_bot_loops():
         biggames_revoke_loop.start()
         print("✅ BIG Games revoke monitor loop started (30m)")
 
+    if not biggames_gem_snapshot_loop.is_running():
+        biggames_gem_snapshot_loop.start()
+        print("✅ BIG Games gem snapshot loop started (60m)")
+
     # ---------------- GIVEAWAY LOOP ----------------
     if not check_giveaway_event.is_running():
         check_giveaway_event.start()
@@ -22415,6 +22554,7 @@ ALL_LOOPS = [
     ("Reminder", "reminder_loop"),
     ("Clan Leave", "clan_leave_loop"),
     ("Big Games Revoke", "biggames_revoke_loop"),
+    ("Big Games Gem Snapshot", "biggames_gem_snapshot_loop"),
     ("Placement", "placement_alert_loop"),
     ("Clan Logs", "clan_log_loop"),
     ("Hourly Stats", "hourly_stats_loop"),
