@@ -8464,6 +8464,20 @@ async def get_roblox_headshot_url(roblox_id):
     return None
 
 
+
+def hub_applicant_profile_url(slug, discord_id=None):
+    """Hub profile URL for an applicant. Officers need ?discord= so the hub
+    can load the token stored against that Discord id (private PS99 views)."""
+    slug = str(slug or "").strip()
+    if not slug:
+        return None
+    url = f"{HUB_BASE_URL}/profile/{slug}"
+    did = str(discord_id or "").strip()
+    if did.isdigit():
+        url = f"{url}?discord={did}"
+    return url
+
+
 def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id, afk_247, activity, liquid_gems, why_accept, claimed_by=None, avatar_url=None):
     embed = discord.Embed(
         title="MCWV Application Ready for Review",
@@ -8477,7 +8491,7 @@ def build_application_review_embed(ticket_id, applicant, roblox_name, roblox_id,
         embed.set_thumbnail(url=avatar_url)
     embed.add_field(name="Applicant", value=f"{applicant.mention}\n`{applicant.id}`", inline=True)
     roblox_slug = roblox_name if (roblox_name and roblox_name != "Unknown") else roblox_id
-    roblox_profile = f"{HUB_BASE_URL}/profile/{roblox_slug}"
+    roblox_profile = hub_applicant_profile_url(roblox_slug, applicant.id)
     embed.add_field(
         name="Roblox",
         value=f"[**{roblox_name}**]({roblox_profile})\n`{roblox_id}`",
@@ -8514,7 +8528,7 @@ async def send_application_review_card(guild, channel, ticket_id, applicant, app
             avatar_url=avatar_url,
         )
         roblox_slug = roblox_username if (roblox_username and roblox_username != "Unknown") else roblox_id
-        profile_url = f"{HUB_BASE_URL}/profile/{roblox_slug}?discord={applicant.id}"
+        profile_url = hub_applicant_profile_url(roblox_slug, applicant.id)
         await channel.send(embed=embed, view=ApplicationReviewView(ticket_id, profile_url))
         return True
     except Exception as exc:
@@ -9117,7 +9131,7 @@ async def build_staff_info_embed(ticket_row):
 
     roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at = app
     roblox_slug = roblox_username if (roblox_username and roblox_username != "Unknown") else roblox_id
-    roblox_profile = f"{HUB_BASE_URL}/profile/{roblox_slug}?discord={opener_id}"
+    roblox_profile = hub_applicant_profile_url(roblox_slug, opener_id)
     embed.add_field(
         name="Roblox",
         value=f"[**{roblox_username}**]({roblox_profile})\n`{roblox_id}`",
@@ -9340,7 +9354,7 @@ async def restore_application_review_messages(guild):
                 if already_posted:
                     continue
                 restore_slug = (row[4] or "") if (row[4] and row[4] != "Unknown") else (row[5] or "")
-                restore_profile = f"{HUB_BASE_URL}/profile/{restore_slug}" if restore_slug else None
+                restore_profile = hub_applicant_profile_url(restore_slug, applicant.id)
                 await ticket_channel.send(embed=embed, view=ApplicationReviewView(ticket_id, restore_profile))
                 restored += 1
                 await asyncio.sleep(1.0)
@@ -9540,7 +9554,7 @@ async def accept_application_ticket(interaction, ticket_row):
     if MCWV_HUB_LINKS_ENABLED:
         status_embed.add_field(
             name="Hub Profile",
-            value=f"https://mcwv-hub.vercel.app/profile/{roblox_id}",
+            value=hub_applicant_profile_url(roblox_id, applicant.id) or f"{HUB_BASE_URL}/profile/{roblox_id}",
             inline=False,
         )
         status_embed.add_field(
@@ -22241,9 +22255,6 @@ async def connected_cmd(interaction: discord.Interaction):
     try:
         linked = await asyncio.to_thread(db_get_all_linked) or []  # (roblox, discord_id, username, role)
         connected_rids, connected_dids, connected_uids = await asyncio.to_thread(_connected_status_map)
-        tokens = await asyncio.to_thread(_fetch_all_biggames_tokens)
-        token_desc = ", ".join(f"{t.get('kind')}:{t.get('roblox_id') or t.get('discord_id')}" for t in tokens)
-        print(f"[connected] DEBUG: {len(tokens)} tokens [{token_desc}] rid_set={connected_rids} did_set={connected_dids}")
         rows = []
         for roblox, discord_id, username, role in linked:
             rid_key = str(roblox).strip()
@@ -22258,8 +22269,14 @@ async def connected_cmd(interaction: discord.Interaction):
         connected_count = sum(1 for c, _, _ in rows if c)
         not_count = len(rows) - connected_count
 
-        ok_lines = [f"✅ **{u}** <@{d}>" for c, u, d in rows if c]
-        missing_lines = [f"⚠️ **{u}** <@{d}>" for c, u, d in rows if not c]
+        def _clip_lines(lines, extra=""):
+            text = "\n".join(lines)
+            if extra:
+                text = f"{text}\n{extra}" if text else extra
+            return text[:1024] if len(text) > 1024 else text
+
+        ok_lines = [f"✅ **{u}** <@{d}>" if d else f"✅ **{u}**" for c, u, d in rows if c]
+        missing_lines = [f"⚠️ **{u}** <@{d}>" if d else f"⚠️ **{u}**" for c, u, d in rows if not c]
 
         embed = discord.Embed(
             title="BIG Games Connection Status",
@@ -22268,41 +22285,21 @@ async def connected_cmd(interaction: discord.Interaction):
             timestamp=datetime.now(timezone.utc),
         )
         if connected_count:
+            extra = f"…and {connected_count - 20} more" if connected_count > 20 else ""
             embed.add_field(
                 name=f"✅ Connected ({connected_count})",
-                value="\n".join(ok_lines[:20]) + (f"\n…and {connected_count - 20} more" if connected_count > 20 else ""),
+                value=_clip_lines(ok_lines[:20], extra),
                 inline=False,
             )
         if not_count:
+            extra = f"…and {not_count - 20} more" if not_count > 20 else ""
             embed.add_field(
                 name=f"⚠️ Not connected ({not_count})",
-                value="\n".join(missing_lines[:20]) + (f"\n…and {not_count - 20} more" if not_count > 20 else ""),
+                value=_clip_lines(missing_lines[:20], extra),
                 inline=False,
             )
         else:
             embed.add_field(name="🎉", value="Everyone is connected!", inline=False)
-        # Diagnostic (debug): helps pinpoint why someone reads as not connected.
-        my_match = ""
-        try:
-            _linked = await asyncio.to_thread(db_get_main_link, interaction.user.id)
-            if _linked:
-                my_rid = str(_linked[0]).strip()
-                my_uid = await asyncio.to_thread(_hub_user_id_by_discord, interaction.user.id)
-                my_match = (
-                    f"my roblox={my_rid} in_connected={'YES' if my_rid in connected_rids else 'NO'}"
-                    + (f" uid={my_uid} in={'YES' if my_uid and my_uid in connected_uids else 'NO'}" if my_uid else "")
-                )
-        except Exception:
-            pass
-        token_ids = ", ".join(
-            (t.get("kind") + ":" + (t.get("roblox_id") or t.get("discord_id") or t.get("user_id") or "?"))
-            for t in tokens
-        ) or "none"
-        embed.add_field(
-            name="🔍 Debug",
-            value=f"`{my_match} · tokens={len(tokens)} · [{token_ids}]`",
-            inline=False,
-        )
         embed.set_footer(text="/connect_dm to DM the rest")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as exc:
