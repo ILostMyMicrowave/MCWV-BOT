@@ -681,33 +681,33 @@ def db_admin_get_mcwv_ticket(ticket_id):
                 WHERE ticket_id = %s OR channel_id::text = %s OR id::text = %s
                 LIMIT 1
             """, (str(ticket_id), str(ticket_id), str(ticket_id)))
-        ticket = cur.fetchone()
-        if not ticket:
-            return None
-        canonical = ticket[1]
-        cur.execute("""
-            SELECT roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at
-            FROM mcwv_ticket_applications
-            WHERE ticket_id = %s
-            LIMIT 1
-        """, (canonical,))
-        app_row = cur.fetchone()
-        cur.execute("""
-            SELECT id, ticket_id, actor_discord_id, action, message, metadata, created_at
-            FROM mcwv_ticket_actions
-            WHERE ticket_id = %s
-            ORDER BY created_at DESC
-            LIMIT 50
-        """, (canonical,))
-        actions = cur.fetchall()
-        cur.execute("""
-            SELECT transcript_text, created_at
-            FROM mcwv_ticket_transcripts
-            WHERE ticket_id = %s
-            ORDER BY created_at DESC
-            LIMIT 1
-        """, (canonical,))
-        transcript = cur.fetchone()
+            ticket = cur.fetchone()
+            if not ticket:
+                return None
+            canonical = ticket[1]
+            cur.execute("""
+                SELECT roblox_username, roblox_id, afk_247, activity, liquid_gems, why_accept, submitted_at
+                FROM mcwv_ticket_applications
+                WHERE ticket_id = %s
+                LIMIT 1
+            """, (canonical,))
+            app_row = cur.fetchone()
+            cur.execute("""
+                SELECT id, ticket_id, actor_discord_id, action, message, metadata, created_at
+                FROM mcwv_ticket_actions
+                WHERE ticket_id = %s
+                ORDER BY created_at DESC
+                LIMIT 50
+            """, (canonical,))
+            actions = cur.fetchall()
+            cur.execute("""
+                SELECT transcript_text, created_at
+                FROM mcwv_ticket_transcripts
+                WHERE ticket_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (canonical,))
+            transcript = cur.fetchone()
         payload = _ticket_row_to_payload(ticket)
         payload["application"] = _ticket_application_payload(app_row)
         payload["actions"] = [_ticket_action_payload(row) for row in actions]
