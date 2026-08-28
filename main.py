@@ -148,20 +148,33 @@ def _safe_call(name, default=None, *args, **kwargs):
 
 
 def parse_hex_color(value, default=0x34D399):
+    """Accept #RRGGBB, 0xRRGGBB, or an already-parsed 0–0xFFFFFF int.
+
+    JSON round-trips store colours as decimals (e.g. 3404761). Treating those
+    as hex strings used to fail the 6-char check and silently reset every
+    saved embed colour back to the default on GET.
+    """
+    try:
+        fallback = int(default)
+    except Exception:
+        fallback = 0x34D399
+
     if value is None or value == "":
-        return int(default)
+        return fallback
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return number if 0 <= number <= 0xFFFFFF else fallback
     try:
         raw = str(value).strip().replace("#", "")
         if raw.lower().startswith("0x"):
             raw = raw[2:]
         if not re.fullmatch(r"[0-9a-fA-F]{6}", raw):
-            return int(default)
+            return fallback
         return int(raw, 16)
     except Exception:
-        try:
-            return int(default)
-        except Exception:
-            return 0x34D399
+        return fallback
 
 
 def _loop_status(name):
