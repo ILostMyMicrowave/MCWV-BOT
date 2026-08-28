@@ -4349,6 +4349,175 @@ def db_get_ticket_by_ticket_id(ticket_id):
         return None
 
 
+GUILD_CHECK_TTL_SECONDS = 15 * 60
+GUILD_CHECK_DENYLIST_KEY = "mcwv_check_denylist"
+_guild_check_tables_ready = False
+
+
+def db_ensure_guild_check_tables():
+    """Staff /check snapshots. Shared with the hub (same Supabase)."""
+    global _guild_check_tables_ready
+    if _guild_check_tables_ready:
+        return True
+    if not db_enabled():
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS discord_guild_checks (
+                    token TEXT PRIMARY KEY,
+                    target_discord_id TEXT NOT NULL,
+                    ticket_id TEXT,
+                    requested_by TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    flagged_hits JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    guild_count INTEGER,
+                    identified_discord_id TEXT,
+                    oauth_state TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS discord_guild_checks_target_idx
+                ON discord_guild_checks (target_discord_id, status)
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS discord_guild_checks_oauth_state_idx
+                ON discord_guild_checks (oauth_state)
+                WHERE oauth_state IS NOT NULL
+            """)
+        conn.commit()
+        _guild_check_tables_ready = True
+        return True
+    except Exception as e:
+        print("db_ensure_guild_check_tables error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def get_check_denylist():
+    raw = _safe_call("db_get_setting", "", GUILD_CHECK_DENYLIST_KEY) or ""
+    try:
+        parsed = json.loads(raw) if raw else []
+    except Exception:
+        parsed = []
+    if not isinstance(parsed, list):
+        return []
+    cleaned = []
+    seen = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        gid = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()[:100]
+        if not gid.isdigit() or gid in seen:
+            continue
+        seen.add(gid)
+        cleaned.append({"id": gid, "name": name or gid})
+    return cleaned
+
+
+def save_check_denylist(entries):
+    cleaned = []
+    seen = set()
+    for item in entries or []:
+        if not isinstance(item, dict):
+            continue
+        gid = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()[:100]
+        if not gid.isdigit() or gid in seen:
+            continue
+        seen.add(gid)
+        cleaned.append({"id": gid, "name": name or gid})
+    _safe_call("db_set_setting", None, GUILD_CHECK_DENYLIST_KEY, json.dumps(cleaned))
+    return cleaned
+
+
+def db_create_guild_check(target_discord_id, requested_by, ticket_id=None):
+    if not db_ensure_guild_check_tables():
+        return None
+    token = secrets.token_urlsafe(32)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE discord_guild_checks
+                SET status = 'superseded', completed_at = NOW(), oauth_state = NULL
+                WHERE target_discord_id = %s AND status = 'pending'
+                """,
+                (str(target_discord_id),),
+            )
+            cur.execute(
+                """
+                INSERT INTO discord_guild_checks
+                    (token, target_discord_id, ticket_id, requested_by, status, expires_at)
+                VALUES (%s, %s, %s, %s, 'pending', NOW() + INTERVAL '15 minutes')
+                """,
+                (token, str(target_discord_id), str(ticket_id) if ticket_id else None, str(requested_by)),
+            )
+        conn.commit()
+        return token
+    except Exception as e:
+        print("db_create_guild_check error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def db_get_guild_check(token):
+    if not db_ensure_guild_check_tables():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT token, target_discord_id, ticket_id, requested_by, status,
+                       flagged_hits, guild_count, identified_discord_id, expires_at
+                FROM discord_guild_checks
+                WHERE token = %s
+                LIMIT 1
+                """,
+                (str(token),),
+            )
+            return cur.fetchone()
+    except Exception as e:
+        print("db_get_guild_check error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def db_expire_guild_check(token):
+    if not db_ensure_guild_check_tables():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE discord_guild_checks
+                SET status = 'expired', completed_at = NOW(), oauth_state = NULL
+                WHERE token = %s AND status = 'pending'
+                """,
+                (str(token),),
+            )
+        conn.commit()
+    except Exception as e:
+        print("db_expire_guild_check error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def db_get_ticket_by_opener(opener_discord_id, channel_id=None):
     """Look up a ticket by the opener's Discord ID.
     If channel_id is provided, prefer the ticket that matches both."""
@@ -10314,6 +10483,176 @@ class CloseConfirmView(discord.ui.View):
         self.stop()
 
 
+def _parse_guild_check_hits(raw):
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = []
+    if not isinstance(raw, list):
+        return []
+    names = []
+    for item in raw:
+        if isinstance(item, dict):
+            label = str(item.get("name") or item.get("id") or "").strip()
+        else:
+            label = str(item or "").strip()
+        if label:
+            names.append(label)
+    return names
+
+
+def build_guild_check_result_embed(row, target_mention=None):
+    status = str(row[4] or "pending") if row else "error"
+    who = target_mention or (f"<@{row[1]}>" if row else "this user")
+    hits = _parse_guild_check_hits(row[5] if row else [])
+    guild_count = row[6] if row else None
+    identified = str(row[7] or "") if row else ""
+
+    titles = {
+        "pending": ("Server check · Pending", discord.Color.orange()),
+        "clean": ("Server check · Clean", discord.Color.green()),
+        "flagged": ("Server check · Flagged", discord.Color.red()),
+        "declined": ("Server check · Declined", discord.Color.light_grey()),
+        "expired": ("Server check · Timed out", discord.Color.light_grey()),
+        "mismatch": ("Server check · Different Discord", discord.Color.orange()),
+        "error": ("Server check · Failed", discord.Color.red()),
+        "superseded": ("Server check · Replaced", discord.Color.light_grey()),
+    }
+    title, color = titles.get(status, ("Server check", discord.Color.blurple()))
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+
+    if status == "clean":
+        extra = ""
+        if not get_check_denylist():
+            extra = "\n\nDenylist is empty, so this will always be clean until you `/checkdenylist add`."
+        embed.description = f"{who} is **not** in any denylisted servers.{extra}"
+    elif status == "flagged":
+        shown = hits[:15] or ["(unnamed server)"]
+        extra = f"\n…and {len(hits) - 15} more" if len(hits) > 15 else ""
+        embed.description = (
+            f"{who} is in **{len(hits)}** denylisted server(s). This is a **flag only** — it does not auto-reject."
+        )
+        embed.add_field(name="Denylist hits", value="\n".join(f"• {name}" for name in shown) + extra, inline=False)
+    elif status == "declined":
+        embed.description = f"{who} declined Discord authorisation."
+    elif status == "expired":
+        embed.description = f"The 15 minute link for {who} expired. Run the check again if you still need it."
+    elif status == "mismatch":
+        embed.description = (
+            f"{who} authorised a **different Discord account** than the one you targeted. Treat this as an alt."
+        )
+        if identified.isdigit():
+            embed.add_field(name="Signed-in account", value=f"`{identified}`", inline=False)
+    elif status == "superseded":
+        embed.description = "A newer check was started for this user."
+    elif status == "pending":
+        embed.description = f"Still waiting on {who} to authorise."
+    else:
+        embed.description = f"The check for {who} failed. Try again."
+
+    footer_bits = []
+    if guild_count is not None:
+        footer_bits.append(f"Snapshot of {int(guild_count)} servers")
+    footer_bits.append("token discarded · full server list not stored")
+    embed.set_footer(text=" · ".join(footer_bits))
+    return embed
+
+
+async def _dm_guild_check_link(user, link, officer_name):
+    embed = discord.Embed(
+        title="MCWV server check",
+        description=(
+            f"**{officer_name}** asked you to confirm your Discord account for an MCWV application review.\n\n"
+            "This is a **one-time 15 minute** link. It lets staff see your Discord identity and check a server denylist. "
+            "We do **not** keep your full server list or the login token.\n\n"
+            f"[Click here to authorise]({link})"
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="If you weren't expecting this, ask in your MCWV ticket.")
+    try:
+        await user.send(embed=embed)
+        return True
+    except Exception:
+        return False
+
+
+async def _watch_guild_check(token, message, target_mention):
+    try:
+        deadline = time.monotonic() + GUILD_CHECK_TTL_SECONDS + 8
+        while time.monotonic() < deadline:
+            await asyncio.sleep(8)
+            row = db_get_guild_check(token)
+            if not row:
+                return
+            status = str(row[4] or "")
+            if status == "pending":
+                continue
+            try:
+                await message.edit(embed=build_guild_check_result_embed(row, target_mention))
+            except Exception as exc:
+                print(f"[guildcheck] result edit failed: {exc}")
+            return
+        db_expire_guild_check(token)
+        row = db_get_guild_check(token)
+        try:
+            await message.edit(embed=build_guild_check_result_embed(row, target_mention))
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[guildcheck] watch failed: {exc}")
+        traceback.print_exc()
+
+
+async def start_guild_check_flow(interaction, target, ticket_id=None):
+    """DM the target a 15-min OAuth link and update the staff ephemeral when done."""
+    if getattr(target, "bot", False):
+        return await interaction.followup.send("❌ Can't run a server check on a bot.", ephemeral=True)
+
+    token = db_create_guild_check(target.id, interaction.user.id, ticket_id)
+    if not token:
+        return await interaction.followup.send("❌ Could not start the check (database).", ephemeral=True)
+
+    link = f"{HUB_BASE_URL}/api/discord/guilds?t={token}"
+    officer_name = getattr(interaction.user, "display_name", None) or interaction.user.name
+    dm_ok = await _dm_guild_check_link(target, link, officer_name)
+    if ticket_id:
+        try:
+            db_ticket_log(
+                ticket_id,
+                interaction.user.id,
+                "guildcheck/start",
+                f"Started server check for {target.id}",
+                {"target": str(target.id)},
+            )
+        except Exception:
+            pass
+
+    mention = getattr(target, "mention", None) or f"<@{target.id}>"
+    pending = discord.Embed(
+        title="Server check · Pending",
+        description=(
+            f"Waiting on {mention} to authorise Discord (`identify` + `guilds`).\n"
+            "Link expires in **15 minutes**. This only **flags** denylist hits — it does not auto-reject.\n\n"
+            + ("✅ DM sent." if dm_ok else "⚠️ Couldn't DM them (closed DMs). Paste this link in the ticket:")
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    pending.add_field(name="Link", value=link[:1024], inline=False)
+    pending.set_footer(text="Full server list is never stored")
+
+    try:
+        msg = await interaction.followup.send(embed=pending, ephemeral=True, wait=True)
+    except TypeError:
+        await interaction.followup.send(embed=pending, ephemeral=True)
+        msg = None
+    if msg is not None:
+        asyncio.create_task(_watch_guild_check(token, msg, mention))
+
+
 class ApplicationReviewView(discord.ui.View):
     def __init__(self, ticket_id, profile_url=None):
         super().__init__(timeout=None)
@@ -10368,7 +10707,8 @@ class ApplicationReviewView(discord.ui.View):
                 "Before confirming, make sure you have checked:\n"
                 "• Their full non-cropped screenshots\n"
                 "• Their application answers via **Staff Info**\n"
-                "• Their Roblox profile/history and requirements\n\n"
+                "• Their Roblox profile/history and requirements\n"
+                "• **Server check** if you want a denylist scan (flag only)\n\n"
                 "Confirming will link their Roblox account, save this ticket for broadcasts, and give the member role."
             ),
             view=AcceptConfirmView(row[0], interaction.user.id, interaction.channel.id, interaction.message.id if interaction.message else None),
@@ -10386,6 +10726,26 @@ class ApplicationReviewView(discord.ui.View):
             return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
         embed = await build_staff_info_embed(row)
         await interaction.followup.send(embed=embed, view=StaffInfoView(row[0], row[3]), ephemeral=True)
+
+    @discord.ui.button(label="Server check", style=discord.ButtonStyle.secondary, custom_id="mcwv_ticket_server_check")
+    async def server_check_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if not self.staff_ok(interaction):
+            return await interaction.followup.send("❌ Staff only.", ephemeral=True)
+        ticket_id = self.resolved_ticket_id(interaction)
+        row = db_get_ticket_by_ticket_id(ticket_id) or find_ticket_in_channel(interaction.channel)
+        if not row:
+            return await interaction.followup.send("❌ Ticket record not found.", ephemeral=True)
+        opener_id = int(row[3])
+        target = interaction.guild.get_member(opener_id) if interaction.guild else None
+        if target is None:
+            try:
+                target = await bot.fetch_user(opener_id)
+            except Exception:
+                target = None
+        if target is None:
+            return await interaction.followup.send("❌ Could not resolve the ticket opener.", ephemeral=True)
+        await start_guild_check_flow(interaction, target, row[0])
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="mcwv_ticket_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -14550,6 +14910,107 @@ async def ticket_review_restore(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     restored = await restore_application_review_messages(interaction.guild)
     await interaction.followup.send(f"✅ Done — {restored} review card(s) re-sent into ticket channels.", ephemeral=True)
+
+
+@bot.tree.command(name="checkdenylist", description="Staff: list/add/remove Discord servers flagged by /check", guild=guild_obj)
+@app_commands.describe(
+    action="List, add, or remove a denylisted Discord server",
+    guild_id="Discord server ID (Developer Mode, right click server, Copy Server ID)",
+    name="Display name for this server (add only)",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="List", value="list"),
+        app_commands.Choice(name="Add", value="add"),
+        app_commands.Choice(name="Remove", value="remove"),
+    ]
+)
+async def checkdenylist_cmd(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    guild_id: str = None,
+    name: str = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.followup.send("❌ Staff only.", ephemeral=True)
+
+    entries = get_check_denylist()
+    act = action.value
+
+    if act == "list":
+        if not entries:
+            return await interaction.followup.send(
+                "Denylist is empty. `/check` will always come back **Clean** until you add servers.",
+                ephemeral=True,
+            )
+        lines = [f"• **{e['name']}** `{e['id']}`" for e in entries[:25]]
+        extra = f"\n…and {len(entries) - 25} more" if len(entries) > 25 else ""
+        embed = discord.Embed(
+            title=f"Server check denylist ({len(entries)})",
+            description="\n".join(lines) + extra,
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Matched by server ID. Officers only see names on a flagged result.")
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    gid = str(guild_id or "").strip()
+    if not gid.isdigit():
+        return await interaction.followup.send("❌ Need a numeric Discord server ID.", ephemeral=True)
+
+    if act == "add":
+        label = str(name or "").strip()[:100]
+        if not label:
+            known = bot.get_guild(int(gid))
+            label = known.name if known else gid
+        entries = [e for e in entries if e["id"] != gid]
+        entries.append({"id": gid, "name": label})
+        save_check_denylist(entries)
+        return await interaction.followup.send(f"✅ Added **{label}** `{gid}` to the denylist.", ephemeral=True)
+
+    before = len(entries)
+    entries = [e for e in entries if e["id"] != gid]
+    if len(entries) == before:
+        return await interaction.followup.send("❌ That server ID is not on the denylist.", ephemeral=True)
+    save_check_denylist(entries)
+    return await interaction.followup.send(f"✅ Removed `{gid}` from the denylist.", ephemeral=True)
+
+
+@bot.tree.command(name="check", description="Staff: ask a user to authorise Discord so we can scan a server denylist", guild=guild_obj)
+@app_commands.describe(user="Who to check. In a ticket with no user, this defaults to the opener.")
+async def check_cmd(interaction: discord.Interaction, user: discord.User = None):
+    await interaction.response.defer(ephemeral=True)
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.followup.send("❌ Staff only.", ephemeral=True)
+
+    ticket_row = None
+    if interaction.channel:
+        try:
+            ticket_row = find_ticket_in_channel(interaction.channel)
+        except Exception:
+            ticket_row = None
+    target = user
+    ticket_id = None
+    if target is None:
+        if not ticket_row:
+            return await interaction.followup.send(
+                "❌ Name a user, or run this inside an application ticket.",
+                ephemeral=True,
+            )
+        opener_id = int(ticket_row[3])
+        target = interaction.guild.get_member(opener_id) if interaction.guild else None
+        if target is None:
+            try:
+                target = await bot.fetch_user(opener_id)
+            except Exception:
+                target = None
+        if target is None:
+            return await interaction.followup.send("❌ Could not resolve the ticket opener.", ephemeral=True)
+        ticket_id = ticket_row[0]
+    elif ticket_row and int(ticket_row[3]) == int(target.id):
+        ticket_id = ticket_row[0]
+
+    await start_guild_check_flow(interaction, target, ticket_id)
 
 
 @bot.tree.command(name="reject", description="Reject this application and close the ticket", guild=guild_obj)
