@@ -10502,7 +10502,7 @@ def _parse_guild_check_hits(raw):
     return names
 
 
-def build_guild_check_result_embed(row, target_mention=None):
+def build_guild_check_result_embed(row, target_mention=None, reused=False):
     status = str(row[4] or "pending") if row else "error"
     who = target_mention or (f"<@{row[1]}>" if row else "this user")
     hits = _parse_guild_check_hits(row[5] if row else [])
@@ -10554,7 +10554,8 @@ def build_guild_check_result_embed(row, target_mention=None):
     footer_bits = []
     if guild_count is not None:
         footer_bits.append(f"Snapshot of {int(guild_count)} servers")
-    footer_bits.append("token discarded · full server list not stored")
+    footer_bits.append("saved authorisation" if reused else "authorisation saved for later checks")
+    footer_bits.append("full server list not stored")
     embed.set_footer(text=" · ".join(footer_bits))
     return embed
 
@@ -10564,8 +10565,8 @@ async def _dm_guild_check_link(user, link, officer_name):
         title="MCWV server check",
         description=(
             f"**{officer_name}** asked you to confirm your Discord account for an MCWV application review.\n\n"
-            "This is a **one-time 15 minute** link. It lets staff see your Discord identity and check a server denylist. "
-            "We do **not** keep your full server list or the login token.\n\n"
+            "This is a **15 minute** link. Authorise once and later staff checks won't ask again. "
+            "We only check a server denylist — we do **not** keep your full server list.\n\n"
             f"[Click here to authorise]({link})"
         ),
         color=discord.Color.blurple(),
