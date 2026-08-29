@@ -4388,6 +4388,16 @@ def db_ensure_guild_check_tables():
                 ON discord_guild_checks (oauth_state)
                 WHERE oauth_state IS NOT NULL
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS discord_oauth_tokens (
+                    discord_id TEXT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    scope TEXT NOT NULL DEFAULT 'identify guilds',
+                    expires_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
         _guild_check_tables_ready = True
         return True
@@ -10607,10 +10617,173 @@ async def _watch_guild_check(token, message, target_mention):
         traceback.print_exc()
 
 
+async def hub_silent_guild_check(discord_id):
+    """Re-scan using a saved Discord OAuth token. None = hub couldn't answer."""
+    if not HUB_BASE_URL:
+        return None
+    api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+    if not api_key:
+        print("[guildcheck] silent hub skipped: no BOT_ADMIN_API_KEY")
+        return None
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        async with session.post(
+            f"{HUB_BASE_URL}/api/internal/discord-guild-check",
+            json={"discord_id": str(discord_id)},
+            headers={"X-Admin-API-Key": api_key, "Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as res:
+            raw = await res.text()
+            try:
+                data = json.loads(raw) if raw else None
+            except Exception:
+                data = None
+        print(f"[guildcheck] silent hub HTTP {res.status} needAuth={isinstance(data, dict) and data.get('needAuth')}")
+        if res.status != 200 or not isinstance(data, dict):
+            return None
+        return data
+    except Exception as exc:
+        print(f"[guildcheck] silent hub failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def db_get_discord_oauth_access(discord_id):
+    if not db_ensure_guild_check_tables():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT access_token FROM discord_oauth_tokens WHERE discord_id = %s LIMIT 1",
+                (str(discord_id),),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception as exc:
+        print(f"[guildcheck] oauth token lookup failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+
+async def bot_silent_guild_check_from_db(discord_id):
+    """Fallback if the hub internal route is unreachable: use the saved token directly."""
+    access = db_get_discord_oauth_access(discord_id)
+    if not access:
+        print(f"[guildcheck] no saved oauth token for {discord_id}")
+        return None
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        headers = {"Authorization": f"Bearer {access}", "Accept": "application/json"}
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with session.get("https://discord.com/api/v10/users/@me", headers=headers, timeout=timeout) as res:
+            if res.status in (401, 403):
+                print(f"[guildcheck] saved token rejected HTTP {res.status}")
+                return None
+            if res.status != 200:
+                print(f"[guildcheck] identify HTTP {res.status}")
+                return None
+            ident = await res.json(content_type=None)
+        identified = str((ident or {}).get("id") or "")
+        if identified != str(discord_id):
+            return {
+                "success": True,
+                "needAuth": False,
+                "status": "mismatch",
+                "flaggedHits": [],
+                "guildCount": 0,
+                "identifiedDiscordId": identified,
+            }
+        guilds = []
+        after = None
+        for _ in range(10):
+            url = "https://discord.com/api/v10/users/@me/guilds?limit=200"
+            if after:
+                url += f"&after={after}"
+            async with session.get(url, headers=headers, timeout=timeout) as res:
+                if res.status in (401, 403):
+                    return None
+                if res.status != 200:
+                    print(f"[guildcheck] guilds HTTP {res.status}")
+                    return None
+                batch = await res.json(content_type=None)
+            if not isinstance(batch, list) or not batch:
+                break
+            guilds.extend(batch)
+            if len(batch) < 200:
+                break
+            after = str(batch[-1].get("id") or "") or None
+            if not after:
+                break
+        denylist = get_check_denylist()
+        by_id = {e["id"]: e for e in denylist}
+        hits = []
+        seen = set()
+        for g in guilds:
+            gid = str((g or {}).get("id") or "")
+            if not gid or gid in seen or gid not in by_id:
+                continue
+            seen.add(gid)
+            hits.append({"id": gid, "name": by_id[gid]["name"] or str((g or {}).get("name") or gid)})
+        return {
+            "success": True,
+            "needAuth": False,
+            "status": "flagged" if hits else "clean",
+            "flaggedHits": hits,
+            "guildCount": len(guilds),
+            "identifiedDiscordId": identified,
+        }
+    except Exception as exc:
+        print(f"[guildcheck] db silent failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def build_guild_check_result_embed_from_payload(payload, target_mention, reused=False):
+    hits = payload.get("flaggedHits") if isinstance(payload, dict) else []
+    fake_row = (
+        None,
+        None,
+        None,
+        None,
+        (payload or {}).get("status") or "error",
+        hits or [],
+        (payload or {}).get("guildCount"),
+        (payload or {}).get("identifiedDiscordId"),
+        None,
+    )
+    return build_guild_check_result_embed(fake_row, target_mention, reused=reused)
+
+
 async def start_guild_check_flow(interaction, target, ticket_id=None):
-    """DM the target a 15-min OAuth link and update the staff ephemeral when done."""
+    """Silent re-check if they've authorised before; otherwise DM a 15-min OAuth link."""
     if getattr(target, "bot", False):
         return await interaction.followup.send("❌ Can't run a server check on a bot.", ephemeral=True)
+
+    mention = getattr(target, "mention", None) or f"<@{target.id}>"
+    silent = await hub_silent_guild_check(target.id)
+    if not (silent and silent.get("success") and silent.get("needAuth") is False):
+        silent = await bot_silent_guild_check_from_db(target.id)
+    if silent and silent.get("success") and silent.get("needAuth") is False:
+        if ticket_id:
+            try:
+                db_ticket_log(
+                    ticket_id,
+                    interaction.user.id,
+                    "guildcheck/silent",
+                    f"Silent server check for {target.id}",
+                    {"target": str(target.id), "status": silent.get("status")},
+                )
+            except Exception:
+                pass
+        return await interaction.followup.send(
+            embed=build_guild_check_result_embed_from_payload(silent, mention, reused=True),
+            ephemeral=True,
+        )
 
     token = db_create_guild_check(target.id, interaction.user.id, ticket_id)
     if not token:
