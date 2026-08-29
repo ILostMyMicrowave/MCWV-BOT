@@ -103,7 +103,12 @@ def admin_log(event: str, message: str = "", level: str = "info", extra=None):
     if str(level).lower() in ("warning", "error"):
         hook = globals().get("ops_log_soon")
         if callable(hook):
-            hook("errors", title=str(event), description=str(message), level=str(level))
+            hook(
+                "errors",
+                title=str(event) or "Hub warning",
+                description=str(message) or "—",
+                level=str(level),
+            )
     return entry
 
 
@@ -2936,6 +2941,21 @@ async def perform_loa_revert(guild, record, actor, end_notes=""):
     notes.append("LOA record closed" if ok else f"DB close failed: {msg}")
 
     cleanup_memory_for_removed_user(str(record["roblox_id"]))
+    try:
+        name = record.get("roblox_username") or record.get("roblox_id") or "?"
+        did = record.get("discord_id")
+        ops_log_soon(
+            "members",
+            title="LOA ended" if ok else "LOA end failed",
+            description=f"**{name}** is back on tracking." if ok else f"**{name}** — DB close failed: {msg}",
+            level="success" if ok else "error",
+            fields=[
+                {"name": "Discord", "value": f"<@{did}>" if did else "—", "inline": True},
+                {"name": "By", "value": getattr(actor, "mention", str(actor)), "inline": True},
+            ],
+        )
+    except Exception:
+        pass
     return ok, notes
 
 
@@ -5155,9 +5175,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             user = getattr(interaction.user, "mention", "?")
             ops_log_soon(
                 "errors",
-                title="Command failed",
-                description=f"**/{cmd}** by {user}\n`{type(error).__name__}: {error}`",
+                title="Slash command crashed",
+                description=f"**/{cmd}** — {user}",
                 level="error",
+                fields=[
+                    {"name": "Error", "value": f"`{type(error).__name__}`", "inline": True},
+                    {"name": "Detail", "value": str(error)[:1024] or "—", "inline": False},
+                ],
             )
         except Exception:
             pass
@@ -5184,8 +5208,8 @@ async def on_error(event_method: str, *args, **kwargs):
     try:
         ops_log_soon(
             "errors",
-            title="Unhandled event error",
-            description=f"`{event_method}` crashed. Check bot console for traceback.",
+            title="Event handler crashed",
+            description=f"`{event_method}` blew up. Traceback is in the bot console.",
             level="error",
         )
     except Exception:
@@ -6227,30 +6251,68 @@ MCWV_OPS_LOG_TOPICS = (
     ("cache", "Cache"),
     ("members", "Members"),
 )
+MCWV_OPS_LOG_EMOJI = {
+    "war": "⚔️",
+    "broadcasts": "📣",
+    "tickets": "🎫",
+    "loops": "🔁",
+    "errors": "🛑",
+    "cache": "💾",
+    "members": "👤",
+}
+MCWV_OPS_LOG_COLORS = {
+    "error": 0xEF4444,
+    "fatal": 0xEF4444,
+    "warning": 0xF59E0B,
+    "warn": 0xF59E0B,
+    "success": 0x22C55E,
+    "ok": 0x22C55E,
+    "info": 0x6366F1,
+}
+MCWV_OPS_LOG_LEVEL_TAG = {
+    "error": "ERROR",
+    "fatal": "FATAL",
+    "warning": "WARN",
+    "warn": "WARN",
+    "success": "OK",
+    "ok": "OK",
+    "info": "INFO",
+}
 _ops_log_queue = None
 _ops_log_worker_task = None
+_ops_recent = {}
+_ops_last_loop_dead = None
 
 
-def ops_log_soon(topic, title, description="", level="info", fields=None):
+def ops_log_soon(topic, title, description="", level="info", fields=None, edit_key=None):
     """Queue an ops-forum log. Never raises. Safe from sync code."""
     try:
         loop = getattr(bot, "loop", None)
         if loop is None or not loop.is_running():
             return
-        loop.create_task(ops_log(topic, title=title, description=description, level=level, fields=fields))
+        loop.create_task(
+            ops_log(
+                topic,
+                title=title,
+                description=description,
+                level=level,
+                fields=fields,
+                edit_key=edit_key,
+            )
+        )
     except Exception:
         pass
 
 
 def _ops_log_color(level):
-    level = str(level or "info").lower()
-    if level in ("error", "fatal"):
-        return discord.Color.red()
-    if level in ("warning", "warn"):
-        return discord.Color.orange()
-    if level in ("success", "ok"):
-        return discord.Color.green()
-    return discord.Color.blurple()
+    return discord.Color(MCWV_OPS_LOG_COLORS.get(str(level or "info").lower(), 0x6366F1))
+
+
+def _ops_topic_name(topic):
+    for key, name in MCWV_OPS_LOG_TOPICS:
+        if key == topic:
+            return name
+    return str(topic or "Ops").title()
 
 
 def _ops_log_state():
@@ -6263,11 +6325,30 @@ def _ops_log_state():
         data = {}
     data.setdefault("forum_id", 0)
     data.setdefault("threads", {})
+    data.setdefault("edit_ids", {})
     return data
 
 
 def _ops_log_save_state(state):
     db_set_setting("mcwv_ops_log_state", json.dumps(state))
+
+
+def _ops_should_drop(topic, title, description, level, edit_key):
+    """Collapse identical posts so a crashing loop cannot flood the forum."""
+    global _ops_recent
+    if edit_key:
+        return False
+    key = (str(topic), str(title), str(description or "")[:240], str(level or ""))
+    now = time.monotonic()
+    last = _ops_recent.get(key, 0)
+    window = 40 if str(level or "").lower() in ("error", "fatal") else 90
+    if now - last < window:
+        return True
+    _ops_recent[key] = now
+    if len(_ops_recent) > 300:
+        cutoff = now - 400
+        _ops_recent = {k: v for k, v in _ops_recent.items() if v >= cutoff}
+    return False
 
 
 async def _ops_lock_forum_owner_only(forum):
@@ -6339,6 +6420,7 @@ async def _ops_ensure_threads(forum):
     except Exception:
         pass
     for key, name in MCWV_OPS_LOG_TOPICS:
+        emoji = MCWV_OPS_LOG_EMOJI.get(key, "•")
         tid = int(threads.get(key) or 0)
         thread = bot.get_channel(tid) if tid else None
         if thread is None and tid:
@@ -6347,12 +6429,16 @@ async def _ops_ensure_threads(forum):
             except Exception:
                 thread = None
         if thread is None:
-            thread = existing.get(name.lower())
+            thread = existing.get(name.lower()) or existing.get(f"{emoji} {name}".lower())
         if thread is None:
             try:
                 created = await forum.create_thread(
                     name=name,
-                    content=f"**{name}** ops log. Owner only. Bot keeps this thread open.",
+                    content=(
+                        f"{emoji} **{name}**\n"
+                        "Owner only. Real events go here — not every loop tick.\n"
+                        "Errors and warnings post as new messages. Status cards get edited in place."
+                    ),
                     auto_archive_duration=10080,
                 )
                 thread = getattr(created, "thread", None) or created
@@ -6374,7 +6460,35 @@ async def _ops_ensure_threads(forum):
     return threads
 
 
-async def _ops_log_send(topic, title, description, level, fields):
+def _ops_build_embed(topic, title, description, level, fields):
+    topic = str(topic or "errors")
+    emoji = MCWV_OPS_LOG_EMOJI.get(topic, "•")
+    name = _ops_topic_name(topic)
+    level_key = str(level or "info").lower()
+    tag = MCWV_OPS_LOG_LEVEL_TAG.get(level_key, "INFO")
+    raw_title = str(title or "Event").strip() or "Event"
+    if not raw_title.startswith(emoji):
+        display_title = f"{emoji}  {raw_title}"
+    else:
+        display_title = raw_title
+    embed = discord.Embed(
+        title=display_title[:256],
+        description=str(description or "")[:4000] or None,
+        color=_ops_log_color(level),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=f"{tag}  ·  {name}")
+    for field in (fields or [])[:10]:
+        if not isinstance(field, dict):
+            continue
+        fname = str(field.get("name") or "Field")[:256]
+        value = str(field.get("value") if field.get("value") not in (None, "") else "—")[:1024]
+        embed.add_field(name=fname, value=value or "—", inline=bool(field.get("inline", True)))
+    embed.set_footer(text="MCWV bot")
+    return embed
+
+
+async def _ops_log_send(topic, title, description, level, fields, edit_key=None):
     forum = await _ops_get_forum()
     if forum is None:
         return
@@ -6393,34 +6507,47 @@ async def _ops_log_send(topic, title, description, level, fields):
             await channel.edit(archived=False, auto_archive_duration=10080)
         except Exception:
             pass
-    embed = discord.Embed(
-        title=str(title or "Event")[:256],
-        description=str(description or "")[:4000],
-        color=_ops_log_color(level),
-        timestamp=datetime.now(timezone.utc),
-    )
-    for field in (fields or [])[:10]:
-        if not isinstance(field, dict):
-            continue
-        name = str(field.get("name") or "Field")[:256]
-        value = str(field.get("value") or "—")[:1024]
-        embed.add_field(name=name, value=value or "—", inline=bool(field.get("inline")))
-    embed.set_footer(text=f"MCWV ops · {topic}")
+    embed = _ops_build_embed(topic, title, description, level, fields)
+    if edit_key:
+        state = _ops_log_state()
+        edits = dict(state.get("edit_ids") or {})
+        mid = int(edits.get(str(edit_key)) or 0)
+        if mid:
+            try:
+                msg = await channel.fetch_message(mid)
+                await msg.edit(embed=embed)
+                return
+            except Exception:
+                pass
+        sent = await channel.send(embed=embed)
+        state = _ops_log_state()
+        edits = dict(state.get("edit_ids") or {})
+        edits[str(edit_key)] = int(sent.id)
+        state["edit_ids"] = edits
+        _ops_log_save_state(state)
+        try:
+            await sent.pin()
+        except Exception:
+            pass
+        return
     await channel.send(embed=embed)
 
 
-async def ops_log(topic, title, description="", level="info", fields=None):
+async def ops_log(topic, title, description="", level="info", fields=None, edit_key=None):
     """Public entry. Queues so commands never wait on Discord."""
     global _ops_log_queue, _ops_log_worker_task
     topic = str(topic or "errors")
     if topic not in {k for k, _ in MCWV_OPS_LOG_TOPICS}:
         topic = "errors"
+    if _ops_should_drop(topic, title, description, level, edit_key):
+        return
     payload = {
         "topic": topic,
         "title": str(title or "Event")[:256],
         "description": str(description or "")[:4000],
         "level": str(level or "info"),
         "fields": list(fields or []),
+        "edit_key": str(edit_key) if edit_key else None,
     }
     try:
         if _ops_log_queue is None:
@@ -6463,6 +6590,22 @@ async def setup_ops_log_forum(guild, forum=None):
     _ops_log_save_state(state)
     await _ops_ensure_threads(forum)
     return forum
+
+
+def _ops_loop_health():
+    """Return (running_count, total, dead_labels)."""
+    running = 0
+    dead = []
+    total = 0
+    for label, loop_name in (globals().get("ALL_LOOPS") or []):
+        total += 1
+        obj = globals().get(loop_name)
+        if obj is not None and obj.is_running():
+            running += 1
+        else:
+            dead.append(label)
+    return running, total, dead
+
 
 MCWV_CLAN_LOGS_ENABLED_DEFAULT = os.environ.get("MCWV_CLAN_LOGS_ENABLED", "1") != "0"
 MCWV_CLAN_LOG_INTERVAL_SECONDS = max(30, int(os.environ.get("MCWV_CLAN_LOG_INTERVAL_SECONDS", "60") or "60"))
@@ -7238,15 +7381,24 @@ async def _admin_broadcast_send_from_body(body):
         metadata,
     )
 
+    snippet = (message or "").strip().replace("\n", " ")
+    if len(snippet) > 180:
+        snippet = snippet[:177] + "..."
+    fail_preview = ", ".join(
+        str(item[0].get("username") or item[0].get("discord_id") or "?")
+        for item in failed[:8]
+    )
     ops_log_soon(
         "broadcasts",
-        title="Broadcast sent",
-        description=f"{actor_name} → **{audience}** via {delivery}",
+        title="Broadcast failed" if failed else "Broadcast sent",
+        description=f"**{actor_name}** → `{audience}` via **{delivery}**"
+        + (f"\n{snippet}" if snippet else ""),
         level="warning" if failed else "success",
         fields=[
             {"name": "Sent", "value": str(sent), "inline": True},
             {"name": "Failed", "value": str(len(failed)), "inline": True},
             {"name": "Matched", "value": str(len(recipients)), "inline": True},
+            *([{"name": "Failed users", "value": fail_preview[:1024], "inline": False}] if fail_preview else []),
         ],
     )
     return {
@@ -8163,14 +8315,20 @@ class BroadcastConfirmView(discord.ui.View):
             metadata,
         )
 
+        fail_preview = ", ".join(
+            str(item[0].get("username") or item[0].get("discord_id") or "?")
+            for item in failed[:8]
+        )
         ops_log_soon(
             "broadcasts",
-            title="Broadcast sent",
-            description=f"{self.actor_name} via {self.delivery}",
+            title="Broadcast failed" if failed else "Broadcast sent",
+            description=f"**{self.actor_name}** via **{self.delivery}**",
             level="warning" if failed else "success",
             fields=[
                 {"name": "Sent", "value": str(sent), "inline": True},
                 {"name": "Failed", "value": str(len(failed)), "inline": True},
+                {"name": "Matched", "value": str(len(self.recipients)), "inline": True},
+                *([{"name": "Failed users", "value": fail_preview[:1024], "inline": False}] if fail_preview else []),
             ],
         )
         embed = discord.Embed(
@@ -10089,6 +10247,17 @@ async def accept_application_ticket(interaction, ticket_row):
     if channel:
         await channel.send(embed=status_embed)
     await log_ticket_event(guild, status_embed)
+    ops_log_soon(
+        "tickets",
+        title="Applicant accepted" if ok else "Accept failed",
+        description=f"{applicant.mention} · **{roblox_name}**",
+        level="success" if ok else "error",
+        fields=[
+            {"name": "By", "value": interaction.user.mention, "inline": True},
+            {"name": "Roblox", "value": f"`{roblox_name}`", "inline": True},
+            *([{"name": "Needs attention", "value": "\n".join(errors)[:1024], "inline": False}] if errors else []),
+        ],
+    )
 
     if ok:
         try:
@@ -10312,9 +10481,12 @@ class ApplicationModal(discord.ui.Modal):
             traceback.print_exc()
             ops_log_soon(
                 "tickets",
-                title="Application failed",
-                description=f"{interaction.user.mention} crashed while opening a ticket.\n`{type(exc).__name__}: {exc}`",
+                title="Apply crashed",
+                description=f"{interaction.user.mention} died while submitting.",
                 level="error",
+                fields=[
+                    {"name": "Error", "value": f"`{type(exc).__name__}: {exc}`"[:1024], "inline": False},
+                ],
             )
             try:
                 await interaction.followup.send(
@@ -10334,9 +10506,10 @@ class ApplicationModal(discord.ui.Modal):
             reason = str(blacklist_entry[1] or "No reason provided")[:500]
             ops_log_soon(
                 "tickets",
-                title="Application blocked",
-                description=f"{interaction.user.mention} is blacklisted. Reason: {reason}",
+                title="Blocked — blacklist",
+                description=f"{interaction.user.mention} tried to apply.",
                 level="warning",
+                fields=[{"name": "Reason", "value": reason[:1024], "inline": False}],
             )
             return await interaction.followup.send(
                 f"❌ You are currently blocked from opening MCWV application tickets. Reason: {reason}",
@@ -10356,8 +10529,8 @@ class ApplicationModal(discord.ui.Modal):
         if bg_connected is False:
             ops_log_soon(
                 "tickets",
-                title="Application blocked",
-                description=f"{interaction.user.mention} tried to apply without BIG Games connected.",
+                title="Blocked — no BIG Games",
+                description=f"{interaction.user.mention} hit apply without authorising PS99.",
                 level="warning",
             )
             connect_url = _biggames_connect_url(interaction.user.id)
@@ -10375,8 +10548,8 @@ class ApplicationModal(discord.ui.Modal):
         if not resolved:
             ops_log_soon(
                 "tickets",
-                title="Application blocked",
-                description=f"{interaction.user.mention} — Roblox username not found: `{roblox_input}`",
+                title="Blocked — bad Roblox name",
+                description=f"{interaction.user.mention} submitted `{roblox_input}` — username not found.",
                 level="warning",
             )
             return await interaction.followup.send("❌ Roblox username not found. Please check spelling and try again.", ephemeral=True)
@@ -10439,9 +10612,10 @@ class ApplicationModal(discord.ui.Modal):
         if not saved:
             ops_log_soon(
                 "tickets",
-                title="Application save failed",
-                description=f"{interaction.user.mention} ticket `{ticket_id}` created but DB save failed.",
+                title="Ticket DB save failed",
+                description=f"{interaction.user.mention} — channel made, application row did not save.",
                 level="error",
+                fields=[{"name": "Ticket", "value": f"`{ticket_id}`", "inline": True}],
             )
             return await interaction.followup.send("❌ Ticket created, but I could not save the application. Please contact staff.", ephemeral=True)
 
@@ -10791,6 +10965,13 @@ class StaffInfoView(discord.ui.View):
             await member.add_roles(role, reason=f"Ticket blacklist by {interaction.user}")
             db_ticket_blacklist_add(member.id, f"Blacklisted from Staff Info by {interaction.user}", interaction.user.id)
             db_ticket_log(self.ticket_id, interaction.user.id, "ticket/blacklist", f"Blacklisted {member} from opening application tickets", {"roleId": str(role.id)})
+            ops_log_soon(
+                "tickets",
+                title="Applicant blacklisted",
+                description=f"{member.mention} can no longer open tickets.",
+                level="warning",
+                fields=[{"name": "By", "value": interaction.user.mention, "inline": True}],
+            )
             await interaction.followup.send(f"✅ {member.mention} has been given **{role.name}** and cannot open application tickets.", ephemeral=True)
             try:
                 await interaction.channel.send(f"🚫 {member.mention} has been blacklisted from opening MCWV application tickets by {interaction.user.mention}.")
@@ -11465,22 +11646,24 @@ async def ops_logs_cmd(interaction: discord.Interaction, action: app_commands.Ch
             state = _ops_log_state()
             forum_id = int(state.get("forum_id") or 0)
             threads = state.get("threads") or {}
-            lines = [f"Forum: {f'<#{forum_id}>' if forum_id else 'not set'}"]
+            emoji = MCWV_OPS_LOG_EMOJI
+            lines = [f"**Forum:** {f'<#{forum_id}>' if forum_id else 'not set'}"]
             for key, name in MCWV_OPS_LOG_TOPICS:
                 tid = int(threads.get(key) or 0)
-                lines.append(f"• {name}: {f'<#{tid}>' if tid else 'missing'}")
+                mark = f"<#{tid}>" if tid else "`missing`"
+                lines.append(f"{emoji.get(key, '•')} **{name}** — {mark}")
             return await interaction.followup.send("\n".join(lines), ephemeral=True)
         if action.value == "attach":
             if not isinstance(forum, discord.ForumChannel):
                 return await interaction.followup.send("❌ Pick an existing **forum** channel.", ephemeral=True)
             await setup_ops_log_forum(interaction.guild, forum=forum)
-            await ops_log("loops", title="Ops logs attached", description=f"Forum {forum.mention} locked to owner only.", level="success")
+            await ops_log("loops", title="Ops logs attached", description=f"Using {forum.mention}. Locked to owner.", level="success")
             return await interaction.followup.send(
                 f"✅ Using {forum.mention}. Owner-only. Threads seeded. You'll see a test message in Loops.",
                 ephemeral=True,
             )
         created = await setup_ops_log_forum(interaction.guild, forum=None)
-        await ops_log("loops", title="Ops logs created", description=f"Forum {created.mention} is owner-only.", level="success")
+        await ops_log("loops", title="Ops logs created", description=f"{created.mention} is live. Owner only.", level="success")
         await interaction.followup.send(
             f"✅ Created {created.mention} (owner only). Sticky threads are in there.",
             ephemeral=True,
@@ -14445,16 +14628,37 @@ async def auto_cache_war_end(battle_id):
         return
     if not DATABASE_URL:
         return
+    frozen = 0
     try:
-        await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
+        frozen = await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id) or 0
     except Exception as exc:
         print(f"[cross-clan cache] freeze failed: {exc}")
+        ops_log_soon(
+            "cache",
+            title="MCWV freeze failed",
+            description=f"`{battle_id}`\n`{type(exc).__name__}: {exc}`",
+            level="error",
+        )
     if GLOBAL_BACKFILL_RUNNING:
         print(f"[cross-clan cache] full scan deferred for {battle_id}: global backfill already running")
+        ops_log_soon(
+            "cache",
+            title="Scan deferred",
+            description=f"`{battle_id}` — global backfill already running.",
+            level="warning",
+            fields=[{"name": "MCWV freeze", "value": f"{frozen} players", "inline": True}],
+        )
         return
     asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
     print(f"[cross-clan cache] auto-cache full scan queued for {battle_id}")
-    ops_log_soon("cache", title="War-end scan queued", description=str(battle_id), level="info")
+    ops_log_soon(
+        "cache",
+        title="War-end scan started",
+        description=f"**{battle_id}**\nFull clan scan queued while the API still has the roster.",
+        level="info",
+        fields=[{"name": "MCWV freeze", "value": f"{frozen} players", "inline": True}],
+        edit_key=f"scan:{battle_id}",
+    )
 
 
 async def _auto_cache_full_scan(battle_id, include_participants=False, only_clans=None):
@@ -14478,6 +14682,13 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
             clan_names = await fetch_all_clan_names_from_sitemap(scan_session)
         if not clan_names:
             print(f"[auto-cache] no clans for {battle_id}")
+            ops_log_soon(
+                "cache",
+                title="Scan aborted",
+                description=f"**{battle_id}** — sitemap returned no clans.",
+                level="warning",
+                edit_key=f"scan:{battle_id}",
+            )
             return
 
         ensure_db_connection()
@@ -14536,6 +14747,17 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
         pending_participants = []
 
         print(f"[auto-cache] scanning {len(clan_names)} clans for {battle_id} (concurrency={CONCURRENCY}, participants={include_participants})")
+        ops_log_soon(
+            "cache",
+            title="Scanning clans",
+            description=f"**{battle_id}**",
+            level="info",
+            fields=[
+                {"name": "Clans", "value": f"{len(clan_names):,}", "inline": True},
+                {"name": "Participants", "value": "yes" if include_participants else "no", "inline": True},
+            ],
+            edit_key=f"scan:{battle_id}",
+        )
 
         for batch_start in range(0, len(clan_names), CONCURRENCY):
             batch = clan_names[batch_start:batch_start + CONCURRENCY]
@@ -14574,7 +14796,20 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
 
             if (batch_start // CONCURRENCY + 1) % 100 == 0:
                 elapsed = time.time() - started
-                print(f"[auto-cache] {batch_start+CONCURRENCY}/{len(clan_names)} clans, {total_contribs:,} contribs, {total_participants:,} participants, {elapsed:.0f}s")
+                done = min(batch_start + CONCURRENCY, len(clan_names))
+                print(f"[auto-cache] {done}/{len(clan_names)} clans, {total_contribs:,} contribs, {total_participants:,} participants, {elapsed:.0f}s")
+                ops_log_soon(
+                    "cache",
+                    title="Scanning clans",
+                    description=f"**{battle_id}**",
+                    level="info",
+                    fields=[
+                        {"name": "Progress", "value": f"{done:,}/{len(clan_names):,}", "inline": True},
+                        {"name": "Contribs", "value": f"{total_contribs:,}", "inline": True},
+                        {"name": "Elapsed", "value": f"{elapsed:.0f}s", "inline": True},
+                    ],
+                    edit_key=f"scan:{battle_id}",
+                )
                 await asyncio.sleep(0)
 
         if pending_rows:
@@ -14611,10 +14846,32 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
         ranked = await asyncio.to_thread(_rank_battle)
         elapsed = time.time() - started
         print(f"[auto-cache] {battle_id}: {clans_with_data} clans, {total_contribs:,} contribs, {total_participants:,} participants, {ranked:,} ranked, {elapsed:.0f}s")
+        mins = elapsed / 60
+        ops_log_soon(
+            "cache",
+            title="Scan finished",
+            description=f"**{battle_id}** cached.",
+            level="success",
+            fields=[
+                {"name": "Clans with data", "value": f"{clans_with_data:,}", "inline": True},
+                {"name": "Contribs", "value": f"{total_contribs:,}", "inline": True},
+                {"name": "Participants", "value": f"{total_participants:,}", "inline": True},
+                {"name": "Ranked", "value": f"{ranked:,}", "inline": True},
+                {"name": "Time", "value": f"{mins:.1f}m", "inline": True},
+            ],
+            edit_key=f"scan:{battle_id}",
+        )
 
     except Exception as e:
         print(f"[auto-cache] FATAL: {e}")
         traceback.print_exc()
+        ops_log_soon(
+            "cache",
+            title="Scan crashed",
+            description=f"**{battle_id}**\n`{type(e).__name__}: {e}`",
+            level="error",
+            edit_key=f"scan:{battle_id}",
+        )
     finally:
         GLOBAL_BACKFILL_RUNNING = False
         await scan_session.close()
@@ -15808,6 +16065,16 @@ async def reject_application(interaction: discord.Interaction, reason: str = Non
     await interaction.followup.send(
         f"✅ Application rejected (**{final_reason}**). Transcript saved, applicant DM sent, channel deletes in {MCWV_TICKET_DELETE_DELAY_SECONDS}s.",
         ephemeral=True,
+    )
+    ops_log_soon(
+        "tickets",
+        title="Applicant rejected",
+        description=f"<@{opener_id}>" if opener_id else f"`{ticket_id}`",
+        level="warning",
+        fields=[
+            {"name": "By", "value": interaction.user.mention, "inline": True},
+            {"name": "Reason", "value": final_reason[:1024], "inline": False},
+        ],
     )
     await finalize_ticket_close(ticket_channel, str(interaction.user), f"Rejected: {final_reason}", ticket_id)
 
@@ -19587,7 +19854,12 @@ async def war_poll_loop():
                 if channel:
                     await channel.send(f"WAR STARTED — {war_name}")
                 print("War started (state synced)")
-                ops_log_soon("war", title="WAR STARTED", description=str(war_name), level="success")
+                ops_log_soon(
+                    "war",
+                    title="War started",
+                    description=f"**{war_name}** is live.",
+                    level="success",
+                )
                 await run_initial_presence_check()
                 # Fire instant push to all Hub subscribers.
                 await trigger_hub_push(
@@ -19605,7 +19877,12 @@ async def war_poll_loop():
                 if channel:
                     await channel.send(f"WAR OVER — {war_name}")
                 print("War ended (state synced)")
-                ops_log_soon("war", title="WAR OVER", description=str(war_name), level="warning")
+                ops_log_soon(
+                    "war",
+                    title="War over",
+                    description=f"**{war_name}** ended. Freeze + full scan queued.",
+                    level="warning",
+                )
                 # Fire instant push + sweep any pending broadcasts.
                 await trigger_hub_push(
                     "war_end",
@@ -19715,6 +19992,16 @@ async def clan_leave_loop():
                 await staff_channel.send(
                     embed=embed,
                     view=ClanReviewView(roblox_id)
+                )
+                ops_log_soon(
+                    "members",
+                    title="Left the clan",
+                    description=f"**{roblox_name}** is gone from the live roster.",
+                    level="warning",
+                    fields=[
+                        {"name": "Discord", "value": f"<@{discord_id}>", "inline": True},
+                        {"name": "Roblox", "value": f"`{roblox_name}`", "inline": True},
+                    ],
                 )
 
             except Exception as e:
@@ -19941,8 +20228,12 @@ class ClanReviewView(discord.ui.View):
                 ops_log_soon(
                     "members",
                     title="LOA started",
-                    description=f"**{roblox_name}** <@{discord_id}> by {interaction.user.mention}",
+                    description=f"**{roblox_name}** is off wars until staff ends it.",
                     level="warning",
+                    fields=[
+                        {"name": "Discord", "value": f"<@{discord_id}>", "inline": True},
+                        {"name": "By", "value": interaction.user.mention, "inline": True},
+                    ],
                 )
 
             # 5) Post the LOA card in the member's ticket (End LOA button lives there).
@@ -23773,22 +24064,47 @@ ALL_LOOPS = [
 
 @tasks.loop(minutes=60)
 async def ops_log_heartbeat_loop():
-    """Quiet hourly pulse so you know the bot is alive — not every loop tick."""
+    """Hourly status card. Edited in place. New posts only if loops die or recover."""
+    global _ops_last_loop_dead
     await bot.wait_until_ready()
     try:
-        running = 0
-        for _label, loop_name in ALL_LOOPS:
-            obj = globals().get(loop_name)
-            if obj is not None and obj.is_running():
-                running += 1
+        running, total, dead = _ops_loop_health()
         war = "active" if globals().get("ps99_war_active") else "peacetime"
         name = globals().get("PS99_CURRENT_WAR_NAME") or "none"
+        lag = globals().get("_bot_event_loop_lag") or 0
+        fields = [
+            {"name": "Loops", "value": f"**{running}/{total}**", "inline": True},
+            {"name": "War", "value": war, "inline": True},
+            {"name": "Battle", "value": str(name)[:256], "inline": True},
+            {"name": "Event lag", "value": f"{float(lag):.2f}s", "inline": True},
+        ]
+        if dead:
+            fields.append({"name": "Down", "value": ", ".join(dead)[:1024], "inline": False})
+        newly_dead = bool(dead) and dead != _ops_last_loop_dead
+        recovered = (not dead) and bool(_ops_last_loop_dead)
+        _ops_last_loop_dead = list(dead)
         await ops_log(
             "loops",
-            title="Heartbeat",
-            description=f"**{running}/{len(ALL_LOOPS)}** loops running · war **{war}** · `{name}`",
-            level="info",
+            title="Status" if not dead else "Loops down",
+            description="All loops running." if not dead else "Health check found stopped loops — restart is attempted every 5 minutes.",
+            level="warning" if dead else "info",
+            fields=fields,
+            edit_key="heartbeat",
         )
+        if newly_dead:
+            await ops_log(
+                "loops",
+                title="Loops went down",
+                description=", ".join(dead),
+                level="error",
+            )
+        elif recovered:
+            await ops_log(
+                "loops",
+                title="Loops recovered",
+                description="All listed loops are running again.",
+                level="success",
+            )
     except Exception as exc:
         print(f"[ops-log] heartbeat failed: {exc}")
 
@@ -23822,8 +24138,9 @@ async def health_monitor_loop():
         ops_log_soon(
             "loops",
             title="Loops restarted",
-            description=", ".join(restarted),
+            description="Health monitor kicked dead loops back on.",
             level="warning",
+            fields=[{"name": "Restarted", "value": ", ".join(restarted)[:1024], "inline": False}],
         )
 
     # 2. DB connection health check. The actual socket I/O stays off the
@@ -24185,7 +24502,23 @@ async def on_ready():
         pass
 
     try:
-        await ops_log("loops", title="Bot ready", description=f"Logged in as {bot.user}", level="success")
+        running, total, dead = _ops_loop_health()
+        tracked_n = 0
+        try:
+            tracked_n = len(db_get_all_tracked() or [])
+        except Exception:
+            pass
+        await ops_log(
+            "loops",
+            title="Bot online",
+            description=f"Logged in as **{bot.user}**.",
+            level="success" if not dead else "warning",
+            fields=[
+                {"name": "Loops", "value": f"**{running}/{total}**", "inline": True},
+                {"name": "Tracked", "value": str(tracked_n), "inline": True},
+                *([{"name": "Down", "value": ", ".join(dead)[:1024], "inline": False}] if dead else []),
+            ],
+        )
     except Exception:
         pass
 
