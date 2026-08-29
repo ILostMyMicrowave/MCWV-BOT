@@ -19037,6 +19037,8 @@ async def war_poll_loop():
             session = aiohttp.ClientSession()
 
         timeout = aiohttp.ClientTimeout(total=15)
+        previous_war_name = PS99_CURRENT_WAR_NAME
+        previous_active = ps99_war_active
 
         async with session.get(ACTIVE_BATTLE_API, timeout=timeout) as r:
             if r.status != 200:
@@ -19071,7 +19073,7 @@ async def war_poll_loop():
         # PS99 creates battles early and its windows run long, so honor BOTH the
         # real start (no war mode during the API staging period) and the real
         # end (peacetime even while the API still reports the battle as live).
-        st = get_battles_row_for(PS99_CURRENT_WAR_NAME)
+        st = get_battles_row_for(PS99_CURRENT_WAR_NAME) or get_battles_row_for(previous_war_name)
         if currently_active and st:
             if st.get("finish") and float(st["finish"]) <= now:
                 currently_active = False
@@ -19087,21 +19089,21 @@ async def war_poll_loop():
             update_check_loop_interval()
             return
 
-        if ps99_war_active != currently_active:
+        if previous_active != currently_active:
             ps99_war_active = currently_active
             bot_enabled = currently_active
             await update_bot_presence()
             update_check_loop_interval()
 
             channel = await _get_channel(CHANNEL_ID)
-            if not channel:
-                return
+            # Cache/push must still run even if the announce channel is missing.
 
             if currently_active:
                 if hub_war_collect_loop.is_running():
                     hub_war_collect_loop.change_interval(minutes=WAR_COLLECT_INTERVAL_MINUTES)
                 war_name = PS99_CURRENT_WAR_NAME or "New battle"
-                await channel.send(f"WAR STARTED — {war_name}")
+                if channel:
+                    await channel.send(f"WAR STARTED — {war_name}")
                 print("War started (state synced)")
                 await run_initial_presence_check()
                 # Fire instant push to all Hub subscribers.
@@ -19115,8 +19117,10 @@ async def war_poll_loop():
             else:
                 offline_since.clear()
                 status_cache.clear()
-                war_name = PS99_CURRENT_WAR_NAME or "Clan war"
-                await channel.send(f"WAR OVER — {war_name}")
+                ended_battle = previous_war_name or PS99_CURRENT_WAR_NAME
+                war_name = ended_battle or "Clan war"
+                if channel:
+                    await channel.send(f"WAR OVER — {war_name}")
                 print("War ended (state synced)")
                 # Fire instant push + sweep any pending broadcasts.
                 await trigger_hub_push(
@@ -19127,10 +19131,10 @@ async def war_poll_loop():
                     tag="war-end",
                 )
                 await trigger_hub_push("sweep")
-                # Auto-cache the just-ended war's cross-clan contributor data.
-                if PS99_CURRENT_WAR_NAME:
-                    asyncio.create_task(auto_cache_war_end(PS99_CURRENT_WAR_NAME))
-                    print(f"[cross-clan cache] auto-cache queued for {PS99_CURRENT_WAR_NAME}")
+                # Auto-cache the war that actually ended (not a newly staged one).
+                if ended_battle:
+                    asyncio.create_task(auto_cache_war_end(ended_battle))
+                    print(f"[cross-clan cache] auto-cache queued for {ended_battle}")
 
     except Exception as e:
         print("War poll error:", e)
