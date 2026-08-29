@@ -100,6 +100,10 @@ def admin_log(event: str, message: str = "", level: str = "info", extra=None):
     ADMIN_LOGS.insert(0, entry)
     del ADMIN_LOGS[200:]
     print(f"[admin-api] {level.upper()} {event}: {message}")
+    if str(level).lower() in ("warning", "error"):
+        hook = globals().get("ops_log_soon")
+        if callable(hook):
+            hook("errors", title=str(event), description=str(message), level=str(level))
     return entry
 
 
@@ -5147,6 +5151,17 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         print(f"[command error] {error}")
         traceback.print_exc()
         try:
+            cmd = getattr(getattr(interaction, "command", None), "qualified_name", None) or "unknown"
+            user = getattr(interaction.user, "mention", "?")
+            ops_log_soon(
+                "errors",
+                title="Command failed",
+                description=f"**/{cmd}** by {user}\n`{type(error).__name__}: {error}`",
+                level="error",
+            )
+        except Exception:
+            pass
+        try:
             err_msg = f"\u26a0\ufe0f Something went wrong. The error has been logged."
             if interaction.response.is_done():
                 await interaction.followup.send(err_msg, ephemeral=True)
@@ -5163,6 +5178,16 @@ async def on_error(event_method: str, *args, **kwargs):
     interaction here whenever we still can, then log the traceback."""
     try:
         traceback.print_exc()
+    except Exception:
+        pass
+
+    try:
+        ops_log_soon(
+            "errors",
+            title="Unhandled event error",
+            description=f"`{event_method}` crashed. Check bot console for traceback.",
+            level="error",
+        )
     except Exception:
         pass
 
@@ -6192,6 +6217,253 @@ MCWV_PLACEMENT_BG_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "placement_card_bg.webp"),
 )
 MCWV_LOG_CHANNEL_ID = int(os.environ.get("MCWV_LOG_CHANNEL_ID", "0") or "0")
+
+MCWV_OPS_LOG_TOPICS = (
+    ("war", "War"),
+    ("broadcasts", "Broadcasts"),
+    ("tickets", "Tickets"),
+    ("loops", "Loops"),
+    ("errors", "Errors"),
+    ("cache", "Cache"),
+    ("members", "Members"),
+)
+_ops_log_queue = None
+_ops_log_worker_task = None
+
+
+def ops_log_soon(topic, title, description="", level="info", fields=None):
+    """Queue an ops-forum log. Never raises. Safe from sync code."""
+    try:
+        loop = getattr(bot, "loop", None)
+        if loop is None or not loop.is_running():
+            return
+        loop.create_task(ops_log(topic, title=title, description=description, level=level, fields=fields))
+    except Exception:
+        pass
+
+
+def _ops_log_color(level):
+    level = str(level or "info").lower()
+    if level in ("error", "fatal"):
+        return discord.Color.red()
+    if level in ("warning", "warn"):
+        return discord.Color.orange()
+    if level in ("success", "ok"):
+        return discord.Color.green()
+    return discord.Color.blurple()
+
+
+def _ops_log_state():
+    raw = db_get_setting("mcwv_ops_log_state", "") or ""
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("forum_id", 0)
+    data.setdefault("threads", {})
+    return data
+
+
+def _ops_log_save_state(state):
+    db_set_setting("mcwv_ops_log_state", json.dumps(state))
+
+
+async def _ops_lock_forum_owner_only(forum):
+    guild = forum.guild
+    me = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False, create_public_threads=False),
+    }
+    if me:
+        overwrites[me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            send_messages_in_threads=True,
+            create_public_threads=True,
+            manage_threads=True,
+            manage_messages=True,
+            read_message_history=True,
+            embed_links=True,
+            attach_files=True,
+            manage_channels=True,
+        )
+    owner = guild.owner
+    if owner is None and guild.owner_id:
+        owner = guild.get_member(guild.owner_id)
+        if owner is None:
+            try:
+                owner = await guild.fetch_member(guild.owner_id)
+            except Exception:
+                owner = None
+    if owner:
+        overwrites[owner] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            send_messages_in_threads=True,
+            read_message_history=True,
+            embed_links=True,
+        )
+    try:
+        await forum.edit(overwrites=overwrites, reason="MCWV ops logs — owner only")
+    except Exception as exc:
+        print(f"[ops-log] could not lock forum perms: {exc}")
+
+
+async def _ops_get_forum():
+    state = _ops_log_state()
+    forum_id = int(state.get("forum_id") or 0)
+    if not forum_id:
+        return None
+    forum = bot.get_channel(forum_id)
+    if forum is None:
+        try:
+            forum = await bot.fetch_channel(forum_id)
+        except Exception:
+            return None
+    if not isinstance(forum, discord.ForumChannel):
+        return None
+    return forum
+
+
+async def _ops_ensure_threads(forum):
+    state = _ops_log_state()
+    threads = dict(state.get("threads") or {})
+    changed = False
+    existing = {str(getattr(t, "name", "")).lower(): t for t in list(getattr(forum, "threads", []) or [])}
+    try:
+        archived = [t async for t in forum.archived_threads(limit=30)]
+        for t in archived:
+            existing.setdefault(str(t.name).lower(), t)
+    except Exception:
+        pass
+    for key, name in MCWV_OPS_LOG_TOPICS:
+        tid = int(threads.get(key) or 0)
+        thread = bot.get_channel(tid) if tid else None
+        if thread is None and tid:
+            try:
+                thread = await bot.fetch_channel(tid)
+            except Exception:
+                thread = None
+        if thread is None:
+            thread = existing.get(name.lower())
+        if thread is None:
+            try:
+                created = await forum.create_thread(
+                    name=name,
+                    content=f"**{name}** ops log. Owner only. Bot keeps this thread open.",
+                    auto_archive_duration=10080,
+                )
+                thread = getattr(created, "thread", None) or created
+            except Exception as exc:
+                print(f"[ops-log] create thread {name} failed: {exc}")
+                continue
+        if thread and int(getattr(thread, "id", 0) or 0) != tid:
+            threads[key] = int(thread.id)
+            changed = True
+        if thread and getattr(thread, "archived", False):
+            try:
+                await thread.edit(archived=False, auto_archive_duration=10080)
+            except Exception:
+                pass
+    if changed:
+        state["forum_id"] = int(forum.id)
+        state["threads"] = threads
+        _ops_log_save_state(state)
+    return threads
+
+
+async def _ops_log_send(topic, title, description, level, fields):
+    forum = await _ops_get_forum()
+    if forum is None:
+        return
+    threads = await _ops_ensure_threads(forum)
+    tid = int((threads or {}).get(topic) or (threads or {}).get("errors") or 0)
+    if not tid:
+        return
+    channel = bot.get_channel(tid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(tid)
+        except Exception:
+            return
+    if getattr(channel, "archived", False):
+        try:
+            await channel.edit(archived=False, auto_archive_duration=10080)
+        except Exception:
+            pass
+    embed = discord.Embed(
+        title=str(title or "Event")[:256],
+        description=str(description or "")[:4000],
+        color=_ops_log_color(level),
+        timestamp=datetime.now(timezone.utc),
+    )
+    for field in (fields or [])[:10]:
+        if not isinstance(field, dict):
+            continue
+        name = str(field.get("name") or "Field")[:256]
+        value = str(field.get("value") or "—")[:1024]
+        embed.add_field(name=name, value=value or "—", inline=bool(field.get("inline")))
+    embed.set_footer(text=f"MCWV ops · {topic}")
+    await channel.send(embed=embed)
+
+
+async def ops_log(topic, title, description="", level="info", fields=None):
+    """Public entry. Queues so commands never wait on Discord."""
+    global _ops_log_queue, _ops_log_worker_task
+    topic = str(topic or "errors")
+    if topic not in {k for k, _ in MCWV_OPS_LOG_TOPICS}:
+        topic = "errors"
+    payload = {
+        "topic": topic,
+        "title": str(title or "Event")[:256],
+        "description": str(description or "")[:4000],
+        "level": str(level or "info"),
+        "fields": list(fields or []),
+    }
+    try:
+        if _ops_log_queue is None:
+            _ops_log_queue = asyncio.Queue(maxsize=250)
+        if _ops_log_worker_task is None or _ops_log_worker_task.done():
+            _ops_log_worker_task = asyncio.create_task(_ops_log_worker())
+        _ops_log_queue.put_nowait(payload)
+    except asyncio.QueueFull:
+        print(f"[ops-log] queue full, dropped: {payload.get('title')}")
+    except Exception as exc:
+        print(f"[ops-log] queue failed: {exc}")
+
+
+async def _ops_log_worker():
+    while True:
+        try:
+            payload = await _ops_log_queue.get()
+            await _ops_log_send(**payload)
+        except Exception as exc:
+            print(f"[ops-log] worker: {exc}")
+        await asyncio.sleep(0.35)
+
+
+async def setup_ops_log_forum(guild, forum=None):
+    """Create or attach the owner-only ops forum and seed threads."""
+    if forum is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        }
+        forum = await guild.create_forum(
+            name="bot-logs",
+            topic="Owner-only MCWV bot ops. Do not grant access to staff.",
+            overwrites=overwrites,
+            reason="MCWV ops logs",
+            default_auto_archive_duration=10080,
+        )
+    await _ops_lock_forum_owner_only(forum)
+    state = _ops_log_state()
+    state["forum_id"] = int(forum.id)
+    _ops_log_save_state(state)
+    await _ops_ensure_threads(forum)
+    return forum
+
 MCWV_CLAN_LOGS_ENABLED_DEFAULT = os.environ.get("MCWV_CLAN_LOGS_ENABLED", "1") != "0"
 MCWV_CLAN_LOG_INTERVAL_SECONDS = max(30, int(os.environ.get("MCWV_CLAN_LOG_INTERVAL_SECONDS", "60") or "60"))
 MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS = max(1, min(int(os.environ.get("MCWV_CLAN_LOG_MAX_DIAMOND_ALERTS", "8") or "8"), 25))
@@ -6966,6 +7238,17 @@ async def _admin_broadcast_send_from_body(body):
         metadata,
     )
 
+    ops_log_soon(
+        "broadcasts",
+        title="Broadcast sent",
+        description=f"{actor_name} → **{audience}** via {delivery}",
+        level="warning" if failed else "success",
+        fields=[
+            {"name": "Sent", "value": str(sent), "inline": True},
+            {"name": "Failed", "value": str(len(failed)), "inline": True},
+            {"name": "Matched", "value": str(len(recipients)), "inline": True},
+        ],
+    )
     return {
         "success": True,
         "message": f"Broadcast complete: {sent} sent, {len(failed)} failed.",
@@ -7880,6 +8163,16 @@ class BroadcastConfirmView(discord.ui.View):
             metadata,
         )
 
+        ops_log_soon(
+            "broadcasts",
+            title="Broadcast sent",
+            description=f"{self.actor_name} via {self.delivery}",
+            level="warning" if failed else "success",
+            fields=[
+                {"name": "Sent", "value": str(sent), "inline": True},
+                {"name": "Failed", "value": str(len(failed)), "inline": True},
+            ],
+        )
         embed = discord.Embed(
             title="Broadcast complete",
             description=f"✅ Sent: **{sent}**\n❌ Failed: **{len(failed)}**",
@@ -10017,6 +10310,12 @@ class ApplicationModal(discord.ui.Modal):
         except Exception as exc:
             print(f"[ticket] application submit error: {exc}")
             traceback.print_exc()
+            ops_log_soon(
+                "tickets",
+                title="Application failed",
+                description=f"{interaction.user.mention} crashed while opening a ticket.\n`{type(exc).__name__}: {exc}`",
+                level="error",
+            )
             try:
                 await interaction.followup.send(
                     "❌ Something went wrong while creating your ticket. Please try again — if it keeps happening, ping staff.",
@@ -10033,6 +10332,12 @@ class ApplicationModal(discord.ui.Modal):
         blacklist_entry = await asyncio.to_thread(db_ticket_blacklist_get, interaction.user.id)
         if blacklist_entry:
             reason = str(blacklist_entry[1] or "No reason provided")[:500]
+            ops_log_soon(
+                "tickets",
+                title="Application blocked",
+                description=f"{interaction.user.mention} is blacklisted. Reason: {reason}",
+                level="warning",
+            )
             return await interaction.followup.send(
                 f"❌ You are currently blocked from opening MCWV application tickets. Reason: {reason}",
                 ephemeral=True,
@@ -10049,6 +10354,12 @@ class ApplicationModal(discord.ui.Modal):
         # "not connected" is a hard block.
         bg_connected = await hub_biggames_connected(interaction.user.id)
         if bg_connected is False:
+            ops_log_soon(
+                "tickets",
+                title="Application blocked",
+                description=f"{interaction.user.mention} tried to apply without BIG Games connected.",
+                level="warning",
+            )
             connect_url = _biggames_connect_url(interaction.user.id)
             await _send_biggames_connect_dm(interaction.user.id, reason="apply")
             return await interaction.followup.send(
@@ -10062,6 +10373,12 @@ class ApplicationModal(discord.ui.Modal):
         roblox_input = self.answer("roblox_username").strip()
         resolved = await resolve_roblox_username_basic(roblox_input)
         if not resolved:
+            ops_log_soon(
+                "tickets",
+                title="Application blocked",
+                description=f"{interaction.user.mention} — Roblox username not found: `{roblox_input}`",
+                level="warning",
+            )
             return await interaction.followup.send("❌ Roblox username not found. Please check spelling and try again.", ephemeral=True)
 
         category = guild.get_channel(MCWV_TICKET_CATEGORY_ID)
@@ -10120,6 +10437,12 @@ class ApplicationModal(discord.ui.Modal):
             why_accept,
         )
         if not saved:
+            ops_log_soon(
+                "tickets",
+                title="Application save failed",
+                description=f"{interaction.user.mention} ticket `{ticket_id}` created but DB save failed.",
+                level="error",
+            )
             return await interaction.followup.send("❌ Ticket created, but I could not save the application. Please contact staff.", ephemeral=True)
 
         db_ticket_log(ticket_id, interaction.user.id, "ticket/opened", "Application ticket opened", {"robloxId": resolved["id"]})
@@ -11121,6 +11444,50 @@ async def setup(interaction: discord.Interaction, system: app_commands.Choice[st
         return
 
     await interaction.followup.send("❌ Unknown setup option.", ephemeral=True)
+
+
+@bot.tree.command(name="ops_logs", description="Owner: create/attach the private bot ops log forum", guild=guild_obj)
+@app_commands.describe(
+    action="Create a new owner-only forum, or attach an existing one",
+    forum="Existing forum to use (attach only)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Create forum", value="create"),
+    app_commands.Choice(name="Attach existing forum", value="attach"),
+    app_commands.Choice(name="Status", value="status"),
+])
+async def ops_logs_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], forum: discord.ForumChannel = None):
+    if not interaction.guild or interaction.guild.owner_id != interaction.user.id:
+        return await interaction.response.send_message("❌ Server owner only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if action.value == "status":
+            state = _ops_log_state()
+            forum_id = int(state.get("forum_id") or 0)
+            threads = state.get("threads") or {}
+            lines = [f"Forum: {f'<#{forum_id}>' if forum_id else 'not set'}"]
+            for key, name in MCWV_OPS_LOG_TOPICS:
+                tid = int(threads.get(key) or 0)
+                lines.append(f"• {name}: {f'<#{tid}>' if tid else 'missing'}")
+            return await interaction.followup.send("\n".join(lines), ephemeral=True)
+        if action.value == "attach":
+            if not isinstance(forum, discord.ForumChannel):
+                return await interaction.followup.send("❌ Pick an existing **forum** channel.", ephemeral=True)
+            await setup_ops_log_forum(interaction.guild, forum=forum)
+            await ops_log("loops", title="Ops logs attached", description=f"Forum {forum.mention} locked to owner only.", level="success")
+            return await interaction.followup.send(
+                f"✅ Using {forum.mention}. Owner-only. Threads seeded. You'll see a test message in Loops.",
+                ephemeral=True,
+            )
+        created = await setup_ops_log_forum(interaction.guild, forum=None)
+        await ops_log("loops", title="Ops logs created", description=f"Forum {created.mention} is owner-only.", level="success")
+        await interaction.followup.send(
+            f"✅ Created {created.mention} (owner only). Sticky threads are in there.",
+            ephemeral=True,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Could not set up ops logs: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
 @bot.tree.command(name="hourly_stats", description="Send the MCWV hourly points statistics card", guild=guild_obj)
@@ -13998,21 +14365,40 @@ def freeze_mcwv_war_from_last_snapshot(battle_id):
                     PRIMARY KEY (battle_id, clan_name, roblox_id))
             """)
             cur.execute("""
-                SELECT DISTINCT ON (roblox_id)
-                    roblox_id::text, username, points, rank
-                FROM player_leaderboard_history
-                WHERE battle_id = %s AND points IS NOT NULL
-                ORDER BY roblox_id, captured_at DESC
-            """, (key,))
+                SELECT end_time FROM battles
+                WHERE regexp_replace(lower(battle_id), '[^a-z0-9]+', '', 'g') = %s
+                   OR regexp_replace(lower(COALESCE(battle_name,'')), '[^a-z0-9]+', '', 'g') = %s
+                ORDER BY end_time DESC NULLS LAST
+                LIMIT 1
+            """, (key, key))
+            end_row = cur.fetchone()
+            end_time = end_row[0] if end_row else None
+            cur.execute("""
+                SELECT roblox_id::text, username, points, rank
+                FROM hourly_stats_player_snapshots
+                WHERE battle_id = %s AND scheduled_at = (
+                    SELECT MAX(scheduled_at) FROM hourly_stats_player_snapshots
+                    WHERE battle_id = %s
+                      AND (%s::timestamptz IS NULL OR scheduled_at <= %s)
+                )
+            """, (key, key, end_time, end_time))
             rows = cur.fetchall()
             if not rows:
                 cur.execute("""
-                    SELECT roblox_id::text, username, points, rank
-                    FROM hourly_stats_player_snapshots
-                    WHERE battle_id = %s AND scheduled_at = (
-                        SELECT MAX(scheduled_at) FROM hourly_stats_player_snapshots WHERE battle_id = %s
+                    WITH last_ts AS (
+                        SELECT MAX(captured_at) AS ts
+                        FROM player_leaderboard_history
+                        WHERE battle_id = %s AND points IS NOT NULL
+                          AND (%s::timestamptz IS NULL OR captured_at <= %s)
                     )
-                """, (key, key))
+                    SELECT DISTINCT ON (roblox_id)
+                        roblox_id::text, username, points, rank
+                    FROM player_leaderboard_history
+                    WHERE battle_id = %s AND points IS NOT NULL
+                      AND captured_at >= (SELECT ts FROM last_ts) - INTERVAL '3 minutes'
+                      AND captured_at <= COALESCE(%s::timestamptz, (SELECT ts FROM last_ts))
+                    ORDER BY roblox_id, captured_at DESC
+                """, (key, end_time, end_time, key, end_time))
                 rows = cur.fetchall()
             n = 0
             for rid, uname, pts, rank in rows or []:
@@ -14068,6 +14454,7 @@ async def auto_cache_war_end(battle_id):
         return
     asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
     print(f"[cross-clan cache] auto-cache full scan queued for {battle_id}")
+    ops_log_soon("cache", title="War-end scan queued", description=str(battle_id), level="info")
 
 
 async def _auto_cache_full_scan(battle_id, include_participants=False, only_clans=None):
@@ -19200,6 +19587,7 @@ async def war_poll_loop():
                 if channel:
                     await channel.send(f"WAR STARTED — {war_name}")
                 print("War started (state synced)")
+                ops_log_soon("war", title="WAR STARTED", description=str(war_name), level="success")
                 await run_initial_presence_check()
                 # Fire instant push to all Hub subscribers.
                 await trigger_hub_push(
@@ -19217,6 +19605,7 @@ async def war_poll_loop():
                 if channel:
                     await channel.send(f"WAR OVER — {war_name}")
                 print("War ended (state synced)")
+                ops_log_soon("war", title="WAR OVER", description=str(war_name), level="warning")
                 # Fire instant push + sweep any pending broadcasts.
                 await trigger_hub_push(
                     "war_end",
@@ -19549,6 +19938,12 @@ class ClanReviewView(discord.ui.View):
                 notes.append(f"⚠️ LOA record failed: {loa_info}")
             else:
                 notes.append("LOA recorded — links + Hub login preserved")
+                ops_log_soon(
+                    "members",
+                    title="LOA started",
+                    description=f"**{roblox_name}** <@{discord_id}> by {interaction.user.mention}",
+                    level="warning",
+                )
 
             # 5) Post the LOA card in the member's ticket (End LOA button lives there).
             if isinstance(ticket_channel, discord.TextChannel):
@@ -23275,6 +23670,9 @@ def start_bot_loops():
     if not health_monitor_loop.is_running():
         health_monitor_loop.start()
 
+    if not ops_log_heartbeat_loop.is_running():
+        ops_log_heartbeat_loop.start()
+
     # ---------------- DB KEEPER LOOP ----------------
     if not db_keeper_loop.is_running():
         db_keeper_loop.start()
@@ -23373,6 +23771,33 @@ ALL_LOOPS = [
 ]
 
 
+@tasks.loop(minutes=60)
+async def ops_log_heartbeat_loop():
+    """Quiet hourly pulse so you know the bot is alive — not every loop tick."""
+    await bot.wait_until_ready()
+    try:
+        running = 0
+        for _label, loop_name in ALL_LOOPS:
+            obj = globals().get(loop_name)
+            if obj is not None and obj.is_running():
+                running += 1
+        war = "active" if globals().get("ps99_war_active") else "peacetime"
+        name = globals().get("PS99_CURRENT_WAR_NAME") or "none"
+        await ops_log(
+            "loops",
+            title="Heartbeat",
+            description=f"**{running}/{len(ALL_LOOPS)}** loops running · war **{war}** · `{name}`",
+            level="info",
+        )
+    except Exception as exc:
+        print(f"[ops-log] heartbeat failed: {exc}")
+
+
+@ops_log_heartbeat_loop.before_loop
+async def before_ops_log_heartbeat_loop():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(minutes=5)
 async def health_monitor_loop():
     """Check all loops are running, restart dead ones. Also check DB connection."""
@@ -23394,6 +23819,12 @@ async def health_monitor_loop():
 
     if restarted:
         print(f"[health] Restarted {len(restarted)} loops: {', '.join(restarted)}")
+        ops_log_soon(
+            "loops",
+            title="Loops restarted",
+            description=", ".join(restarted),
+            level="warning",
+        )
 
     # 2. DB connection health check. The actual socket I/O stays off the
     # Discord event loop so a stalled pooler cannot block heartbeats.
@@ -23750,6 +24181,11 @@ async def on_ready():
     # ---------------- UPDATE PRESENCE ----------------
     try:
         await update_bot_presence()
+    except Exception:
+        pass
+
+    try:
+        await ops_log("loops", title="Bot ready", description=f"Logged in as {bot.user}", level="success")
     except Exception:
         pass
 
