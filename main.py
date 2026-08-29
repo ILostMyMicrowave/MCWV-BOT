@@ -2823,6 +2823,23 @@ def db_list_active_loas():
         return []
 
 
+def db_active_loa_identities():
+    """Roblox IDs and Discord IDs currently on LOA — used to keep them out of broadcasts."""
+    roblox_ids = set()
+    discord_ids = set()
+    for row in db_list_active_loas() or []:
+        rid = str(row[1] or "").strip() if len(row) > 1 else ""
+        if rid:
+            roblox_ids.add(rid)
+        try:
+            did = int(row[3]) if len(row) > 3 and row[3] is not None else 0
+        except Exception:
+            did = 0
+        if did:
+            discord_ids.add(did)
+    return roblox_ids, discord_ids
+
+
 def get_battles_war_state():
     """Latest worker-cached battle schedule without event-loop PostgreSQL I/O."""
     with _interaction_cache_lock:
@@ -4935,6 +4952,14 @@ def db_get_broadcast_users():
                 WHERE roblox_id IS NOT NULL
                   AND TRIM(CAST(roblox_id AS TEXT)) <> ''
                   AND discord_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM mcwv_loa_records l
+                    WHERE l.active = TRUE
+                      AND (
+                        l.roblox_id = TRIM(CAST(users.roblox_id AS TEXT))
+                        OR l.discord_id = users.discord_id
+                      )
+                  )
                 ORDER BY username ASC
             """)
             rows = cur.fetchall()
@@ -6550,6 +6575,13 @@ async def resolve_broadcast_recipients(interaction, audience, value=None, role=N
     metrics_map = fetch_broadcast_metrics_map()
     users = [broadcast_user_from_row(row, points_map, metrics_map) for row in rows]
 
+    loa_roblox, loa_discord = db_active_loa_identities()
+    users = [
+        item for item in users
+        if str(item.get("roblox_id") or "").strip() not in loa_roblox
+        and int(item.get("discord_id") or 0) not in loa_discord
+    ]
+
     users.sort(key=lambda item: item["points"], reverse=True)
     for index, item in enumerate(users, start=1):
         item["rank"] = index
@@ -6720,6 +6752,11 @@ async def _admin_broadcast_access_from_body(discord_id):
 
 
 async def send_broadcast_to_recipient(guild, recipient, delivery, style, message, image_url=""):
+    try:
+        if db_get_active_loa(discord_id=recipient.get("discord_id")) or db_get_active_loa(roblox_id=recipient.get("roblox_id")):
+            return False, None, "on LOA"
+    except Exception:
+        pass
     image_url = clean_broadcast_image_url(image_url)
     rendered = render_broadcast_message(message, recipient)
     embed = broadcast_embed_for(message, recipient, image_url) if style == "embed" else None
