@@ -13970,6 +13970,84 @@ WAR_CACHE_SCAN_CONCURRENCY = max(4, int(os.environ.get("MCWV_WAR_SCAN_CONCURRENC
 WAR_CACHE_PARTICIPANT_MAX_PLACE = max(0, int(os.environ.get("MCWV_WAR_PARTICIPANT_MAX_PLACE", "2500") or "2500"))
 
 
+def freeze_mcwv_war_from_last_snapshot(battle_id):
+    """Lock MCWV's last leaderboard snapshot into the durable war tables.
+
+    Kicks after war-end must not shrink the report — this copies whoever was
+    on the last hourly/history snapshot, even if the live clan is now 60.
+    """
+    if not battle_id or not db_enabled():
+        return 0
+    key = normalize_hourly_battle_key(str(battle_id))
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_player_history (
+                    id BIGSERIAL PRIMARY KEY, roblox_id TEXT NOT NULL, battle_id TEXT NOT NULL,
+                    battle_name TEXT, clan_name TEXT NOT NULL, points BIGINT NOT NULL DEFAULT 0,
+                    rank INTEGER, total_contributors INTEGER, clan_place INTEGER,
+                    earned_medal BOOLEAN DEFAULT FALSE, start_time BIGINT,
+                    cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (roblox_id, battle_id, clan_name))
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cross_clan_participants (
+                    battle_id TEXT NOT NULL, clan_name TEXT NOT NULL, roblox_id TEXT NOT NULL,
+                    place INTEGER, captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (battle_id, clan_name, roblox_id))
+            """)
+            cur.execute("""
+                SELECT DISTINCT ON (roblox_id)
+                    roblox_id::text, username, points, rank
+                FROM player_leaderboard_history
+                WHERE battle_id = %s AND points IS NOT NULL
+                ORDER BY roblox_id, captured_at DESC
+            """, (key,))
+            rows = cur.fetchall()
+            if not rows:
+                cur.execute("""
+                    SELECT roblox_id::text, username, points, rank
+                    FROM hourly_stats_player_snapshots
+                    WHERE battle_id = %s AND scheduled_at = (
+                        SELECT MAX(scheduled_at) FROM hourly_stats_player_snapshots WHERE battle_id = %s
+                    )
+                """, (key, key))
+                rows = cur.fetchall()
+            n = 0
+            for rid, uname, pts, rank in rows or []:
+                rid = str(rid or "").strip()
+                if not rid:
+                    continue
+                cur.execute("""
+                    INSERT INTO cross_clan_player_history
+                        (roblox_id, battle_id, battle_name, clan_name, points, rank,
+                         total_contributors, clan_place, earned_medal, start_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, NULL, NULL, FALSE, NULL)
+                    ON CONFLICT (roblox_id, battle_id, clan_name)
+                    DO UPDATE SET
+                        points = GREATEST(cross_clan_player_history.points, EXCLUDED.points),
+                        rank = COALESCE(EXCLUDED.rank, cross_clan_player_history.rank),
+                        cached_at = NOW()
+                """, (rid, str(battle_id), str(battle_id), CLAN_NAME, int(pts or 0), rank))
+                cur.execute("""
+                    INSERT INTO cross_clan_participants (battle_id, clan_name, roblox_id, place, captured_at)
+                    VALUES (%s, %s, %s, NULL, NOW())
+                    ON CONFLICT DO NOTHING
+                """, (str(battle_id), CLAN_NAME, rid))
+                n += 1
+        conn.commit()
+        print(f"[war-cache] froze {n} MCWV snapshot rows for {battle_id}")
+        return n
+    except Exception as exc:
+        print(f"[war-cache] freeze snapshot failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
 async def auto_cache_war_end(battle_id):
     """Auto-cache a war's data when it ends. Called from war_poll_loop.
     
@@ -13981,10 +14059,13 @@ async def auto_cache_war_end(battle_id):
         return
     if not DATABASE_URL:
         return
+    try:
+        await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
+    except Exception as exc:
+        print(f"[cross-clan cache] freeze failed: {exc}")
     if GLOBAL_BACKFILL_RUNNING:
-        print(f"[cross-clan cache] auto-cache skipped for {battle_id}: global backfill already running")
+        print(f"[cross-clan cache] full scan deferred for {battle_id}: global backfill already running")
         return
-    # Run the full scan in the background (participants included — CW Bot parity)
     asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
     print(f"[cross-clan cache] auto-cache full scan queued for {battle_id}")
 
@@ -14684,6 +14765,20 @@ async def war_cache_window_loop():
         now = time.time()
         hours_left = (finish - now) / 3600.0
         if hours_left <= 0:
+            # Your schedule says the war is over, but the API may still have
+            # full 75-member contribs until its own finish. Freeze MCWV's last
+            # snapshot and run one full global scan while that data is live.
+            if not db_get_setting(f"mcwv_war_cache_post_{key}"):
+                db_set_setting(f"mcwv_war_cache_post_{key}", str(int(now)))
+                try:
+                    await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
+                except Exception as exc:
+                    print(f"[war-cache] post-end freeze failed: {exc}")
+                if GLOBAL_BACKFILL_RUNNING:
+                    print(f"[war-cache] post-end scan deferred for {battle_id}: scan already running")
+                else:
+                    admin_log("War Cache Post-End Scan", f"{battle_id}: schedule ended, API still live — full capture queued.")
+                    asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
             return
 
         # 1) Full pre-end scan once per battle (captures all clans while the
