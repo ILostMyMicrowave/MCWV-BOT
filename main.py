@@ -12508,20 +12508,31 @@ async def gather_player_data(roblox_id, roblox_name):
         if isinstance(player, dict):
             summary = player
 
-    # 3. Current clan from summary
+    # 3. Current clan from summary (this endpoint is often stale — verify below)
     current_clan = summary.get("Clan", {}) if isinstance(summary.get("Clan"), dict) else {}
     current_clan_name = current_clan.get("Name") or "Unknown"
     active_points = _safe_int(summary.get("ActiveBattlePoints"))
 
-    # 4. Check MCWV membership (1 API call)
+    # 4. Live MCWV roster wins. Owner is often missing from Members.
     mcwv_clan_data = await _fetch_clan_data(CLAN_NAME)
     in_mcwv_now = False
     if mcwv_clan_data:
-        mcwv_members = mcwv_clan_data.get("Members", [])
-        if isinstance(mcwv_members, list):
-            in_mcwv_now = any(str(m.get("UserID")) == str(roblox_id) for m in mcwv_members if isinstance(m, dict))
-            if in_mcwv_now:
-                current_clan_name = CLAN_NAME
+        try:
+            in_mcwv_now = str(roblox_id) in extract_clan_members(mcwv_clan_data)
+        except Exception:
+            members = mcwv_clan_data.get("Members") or []
+            in_mcwv_now = any(str(m.get("UserID")) == str(roblox_id) for m in members if isinstance(m, dict))
+        if in_mcwv_now:
+            current_clan_name = CLAN_NAME
+        elif current_clan_name and _normalize_clan_name(current_clan_name) != _normalize_clan_name(CLAN_NAME):
+            # v1 still saying SOPU/etc after they joined MCWV — confirm they're actually there
+            try:
+                other = await _fetch_clan_data(current_clan_name)
+                other_members = extract_clan_members(other) if other else {}
+                if str(roblox_id) not in other_members:
+                    current_clan_name = "Unknown"
+            except Exception:
+                pass
 
     # 5. Update active battle points from summary
     rows = []
@@ -14441,7 +14452,7 @@ async def get_all_battle_ids():
 # Known battle IDs that exist in PS99 (hardcoded fallback so backfill
 # doesn't depend on the top-100 scan working). Updated 2026-08-13.
 KNOWN_BATTLE_IDS = [
-    "NinjaBattle2026", "GummyBattle2026", "LunarBattle2026", "SoccerBattle2026",
+    "RoyalBattle2026", "NinjaBattle2026", "GummyBattle2026", "LunarBattle2026", "SoccerBattle2026",
     "Backrooms2026", "AngelBattle2026", "StarryBattle", "Spring2026",
     "LuckyChestBattle", "Christmas2025", "Turkey2025", "TrickOrTreat",
     "BlockPartyBattle", "StrengthBattle", "TowerBattle", "BasketballBattle",
@@ -15568,6 +15579,145 @@ def _compute_global_ranks_sql(conn):
         return 0
 
 
+
+async def _run_global_backfill(channel_id=None):
+    """Scan every clan on the sitemap and cache every battle contribution.
+
+    This is what /backfill_global is supposed to run. Two passes:
+      1) fetch all clans, upsert raw PointContributions
+      2) SQL window ranks per battle
+    Always clears GLOBAL_BACKFILL_RUNNING.
+    """
+    global GLOBAL_BACKFILL_RUNNING
+    GLOBAL_BACKFILL_RUNNING = True
+    scan_session = aiohttp.ClientSession()
+    started = time.time()
+    notify = None
+    try:
+        if channel_id:
+            try:
+                notify = bot.get_channel(int(channel_id))
+                if notify is None:
+                    notify = await bot.fetch_channel(int(channel_id))
+            except Exception:
+                notify = None
+
+        ops_log_soon(
+            "cache",
+            title="Global backfill started",
+            description="Scanning every clan on the sitemap for all battles.",
+            level="info",
+            edit_key="global-backfill",
+        )
+
+        clan_names = await fetch_all_clan_names_from_sitemap(scan_session)
+        if not clan_names:
+            msg = "Global backfill aborted — sitemap returned no clans."
+            print(f"[global backfill] {msg}")
+            ops_log_soon("cache", title="Global backfill aborted", description=msg, level="warning", edit_key="global-backfill")
+            if notify:
+                try:
+                    await notify.send(msg)
+                except Exception:
+                    pass
+            return
+
+        def _ensure():
+            ensure_db_connection()
+            ensure_cross_clan_history_table()
+
+        await asyncio.to_thread(_ensure)
+
+        CONCURRENCY = WAR_CACHE_SCAN_CONCURRENCY
+        clans_with_data = 0
+        total_contribs = 0
+        pending_rows = []
+        print(f"[global backfill] scanning {len(clan_names)} clans (concurrency={CONCURRENCY})")
+
+        for batch_start in range(0, len(clan_names), CONCURRENCY):
+            batch = clan_names[batch_start:batch_start + CONCURRENCY]
+            results = await asyncio.gather(
+                *(_fetch_clan_contributions(scan_session, name) for name in batch),
+                return_exceptions=True,
+            )
+            for name, result in zip(batch, results):
+                if isinstance(result, Exception) or not result or not isinstance(result, tuple):
+                    continue
+                rows = result[0] or []
+                if rows:
+                    clans_with_data += 1
+                    total_contribs += len(rows)
+                    pending_rows.extend(rows)
+            if len(pending_rows) >= 5000:
+                await asyncio.to_thread(_insert_raw_contributions, conn, pending_rows)
+                pending_rows.clear()
+            if (batch_start // CONCURRENCY + 1) % 100 == 0:
+                done = min(batch_start + CONCURRENCY, len(clan_names))
+                elapsed = time.time() - started
+                print(f"[global backfill] {done}/{len(clan_names)} clans, {total_contribs:,} contribs, {elapsed:.0f}s")
+                ops_log_soon(
+                    "cache",
+                    title="Global backfill",
+                    description="Scanning all clans.",
+                    level="info",
+                    fields=[
+                        {"name": "Progress", "value": f"{done:,}/{len(clan_names):,}", "inline": True},
+                        {"name": "Contribs", "value": f"{total_contribs:,}", "inline": True},
+                        {"name": "Elapsed", "value": f"{elapsed:.0f}s", "inline": True},
+                    ],
+                    edit_key="global-backfill",
+                )
+                await asyncio.sleep(0)
+
+        if pending_rows:
+            await asyncio.to_thread(_insert_raw_contributions, conn, pending_rows)
+            pending_rows.clear()
+
+        ranked = await asyncio.to_thread(_compute_global_ranks_sql, conn)
+        elapsed = time.time() - started
+        mins = elapsed / 60
+        summary = (
+            f"Global backfill finished in **{mins:.1f}m**.\n"
+            f"Clans with data: **{clans_with_data:,}** / {len(clan_names):,}\n"
+            f"Contrib rows: **{total_contribs:,}**\n"
+            f"Ranked: **{ranked:,}**"
+        )
+        print(f"[global backfill] done: {clans_with_data} clans, {total_contribs:,} contribs, {ranked:,} ranked, {elapsed:.0f}s")
+        ops_log_soon(
+            "cache",
+            title="Global backfill finished",
+            description=summary,
+            level="success",
+            edit_key="global-backfill",
+        )
+        if notify:
+            try:
+                await notify.send(summary)
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[global backfill] FATAL: {exc}")
+        traceback.print_exc()
+        ops_log_soon(
+            "cache",
+            title="Global backfill crashed",
+            description=f"`{type(exc).__name__}: {exc}`",
+            level="error",
+            edit_key="global-backfill",
+        )
+        if notify:
+            try:
+                await notify.send(f"Global backfill crashed: `{type(exc).__name__}: {exc}`")
+            except Exception:
+                pass
+    finally:
+        GLOBAL_BACKFILL_RUNNING = False
+        try:
+            await scan_session.close()
+        except Exception:
+            pass
+
+
 @bot.tree.command(name="backfill_global", description="Scan ALL clans (50k+) for true global battle ranks — takes ~30min, runs in background", guild=guild_obj)
 @require_role()
 async def backfill_global_cmd(interaction: discord.Interaction):
@@ -15575,24 +15725,30 @@ async def backfill_global_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     if GLOBAL_BACKFILL_RUNNING:
-        return await interaction.followup.send("Global backfill is already running. Check logs for progress.", ephemeral=True)
+        return await interaction.followup.send("Global backfill is already running. Check Cache logs for progress.", ephemeral=True)
 
     if not DATABASE_URL:
         return await interaction.followup.send("Database is not available.", ephemeral=True)
 
-    GLOBAL_BACKFILL_RUNNING = True
+    if not callable(globals().get("_run_global_backfill")):
+        return await interaction.followup.send("❌ Backfill runner is missing. Redeploy the bot.", ephemeral=True)
+
     await interaction.followup.send(
         "Starting global backfill... This scans all 50k+ clans from the sitemap and may take ~30 minutes.\n"
-        "The bot stays fully responsive. Progress is logged to console.\n"
+        "The bot stays fully responsive. Progress is in Cache ops logs.\n"
         "When done, `/checkplayer` will show true global ranks.",
         ephemeral=True,
     )
+    GLOBAL_BACKFILL_RUNNING = True
     task = asyncio.create_task(_run_global_backfill(interaction.channel_id))
     def _log_backfill_exception(t):
+        global GLOBAL_BACKFILL_RUNNING
         if t.cancelled():
+            GLOBAL_BACKFILL_RUNNING = False
             return
         exc = t.exception()
         if exc:
+            GLOBAL_BACKFILL_RUNNING = False
             print(f"[global backfill] TASK CRASHED: {exc}")
             traceback.print_exc()
     task.add_done_callback(_log_backfill_exception)
