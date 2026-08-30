@@ -4117,6 +4117,36 @@ def db_remove(did):
         conn.rollback()
 
 
+def db_remove_roblox_link(roblox_id):
+    """Delete one Roblox id from users + user_alts. Returns discord_ids touched."""
+    if not db_enabled():
+        return []
+    rid = str(roblox_id or "").strip()
+    if not rid:
+        return []
+    discord_ids = []
+    try:
+        with conn.cursor() as cur:
+            for table in ("user_alts", "users"):
+                cur.execute(
+                    f"DELETE FROM {table} WHERE TRIM(roblox_id::text) = %s RETURNING discord_id",
+                    (rid,),
+                )
+                for row in cur.fetchall():
+                    if row and row[0] is not None:
+                        discord_ids.append(int(row[0]))
+        conn.commit()
+        cleanup_memory_for_removed_user(rid)
+        return list(dict.fromkeys(discord_ids))
+    except Exception as e:
+        print("db_remove_roblox_link error:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+
+
 def db_get_all():
     if not db_enabled():
         return []
@@ -19846,6 +19876,37 @@ from discord.ext import tasks
 # ---------------- LOOP SAFETY ----------------
 api_semaphore = asyncio.Semaphore(3)
 pending_clan_removals = {}
+CLAN_LEAVE_DISMISSED_KEY = "mcwv_clan_leave_dismissed"
+
+
+def db_clan_leave_dismissed_ids():
+    raw = db_get_setting(CLAN_LEAVE_DISMISSED_KEY, "") or ""
+    try:
+        data = json.loads(raw) if raw else []
+    except Exception:
+        data = []
+    if not isinstance(data, list):
+        data = []
+    return {str(x).strip() for x in data if str(x).strip()}
+
+
+def db_clan_leave_dismiss(roblox_id):
+    rid = str(roblox_id or "").strip()
+    if not rid:
+        return
+    ids = db_clan_leave_dismissed_ids()
+    ids.add(rid)
+    # cap so this cannot grow forever
+    trimmed = list(ids)[-400:]
+    db_set_setting(CLAN_LEAVE_DISMISSED_KEY, json.dumps(trimmed))
+
+
+def db_clan_leave_undismiss(roblox_id):
+    rid = str(roblox_id or "").strip()
+    ids = db_clan_leave_dismissed_ids()
+    if rid in ids:
+        ids.discard(rid)
+        db_set_setting(CLAN_LEAVE_DISMISSED_KEY, json.dumps(list(ids)))
 
 def _chunks(items, size=50):
     for i in range(0, len(items), size):
@@ -20278,22 +20339,27 @@ async def clan_leave_loop():
         if not staff_channel:
             return
 
+        dismissed = db_clan_leave_dismissed_ids()
         for roblox_id, discord_id, roblox_name in users:
             try:
-                if int(roblox_id) in clan_member_ids:
+                rid = str(roblox_id).strip()
+                if int(rid) in clan_member_ids:
                     continue
 
                 # Skip anyone on an active LOA — they're deliberately not in
                 # the clan and must not be re-alerted every 10 minutes.
-                if str(roblox_id).strip() in loa_roblox_ids:
+                if rid in loa_roblox_ids:
                     continue
 
-                if roblox_id in pending_clan_removals:
+                if rid in dismissed:
                     continue
 
-                pending_clan_removals[roblox_id] = {
-                    "discord_id": discord_id,
-                    "roblox_name": roblox_name
+                if rid in pending_clan_removals:
+                    continue
+
+                pending_clan_removals[rid] = {
+                    "discord_id": int(discord_id) if discord_id else 0,
+                    "roblox_name": roblox_name,
                 }
 
                 embed = discord.Embed(
@@ -20304,12 +20370,14 @@ async def clan_leave_loop():
                 )
 
                 embed.add_field(name="Discord User", value=f"<@{discord_id}>", inline=True)
-                embed.add_field(name="Roblox", value=roblox_name, inline=True)
+                embed.add_field(name="Roblox", value=f"`{roblox_name}`", inline=True)
+                embed.add_field(name="Roblox ID", value=f"`{rid}`", inline=True)
                 embed.add_field(name="Action Required", value="Approve removal, grant LOA, or ignore.", inline=False)
+                embed.set_footer(text=f"rid:{rid} | did:{discord_id}")
 
                 await staff_channel.send(
                     embed=embed,
-                    view=ClanReviewView(roblox_id)
+                    view=ClanReviewView(),
                 )
                 ops_log_soon(
                     "members",
@@ -20390,76 +20458,170 @@ class LoaTicketView(discord.ui.View):
 
 # ---------------- CLAN REVIEW VIEW ----------------
 class ClanReviewView(discord.ui.View):
-    def __init__(self, roblox_id):
-        super().__init__(timeout=86400)
-        self.roblox_id = roblox_id
+    """Persistent staff card for clan leaves. Survives bot restarts.
 
-    @discord.ui.button(label="Approve Removal", style=discord.ButtonStyle.danger)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+    Target ids live on the embed footer (`rid:` / `did:`) so we never depend
+    on the in-memory pending dict after a deploy.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @staticmethod
+    def _parse_target(interaction: discord.Interaction):
+        rid = did = name = None
+        embeds = list(getattr(interaction.message, "embeds", None) or [])
+        if embeds:
+            embed = embeds[0]
+            footer = str(getattr(embed.footer, "text", None) or "")
+            m = re.search(r"rid:(\d+)", footer)
+            if m:
+                rid = m.group(1)
+            m = re.search(r"did:(\d+)", footer)
+            if m:
+                did = m.group(1)
+            for field in embed.fields:
+                label = str(field.name or "").lower()
+                value = str(field.value or "").strip()
+                mention = re.search(r"<@!?(\d+)>", value)
+                if mention and ("discord" in label or label == "discord user"):
+                    did = did or mention.group(1)
+                clean = value.strip("`")
+                if label == "roblox" and clean:
+                    name = clean
+                if label in ("roblox id", "id") and re.fullmatch(r"\d+", clean or ""):
+                    rid = rid or clean
+        pending = pending_clan_removals.get(str(rid or "")) if rid else None
+        if isinstance(pending, dict):
+            did = did or str(pending.get("discord_id") or "")
+            name = name or pending.get("roblox_name")
+        if rid:
+            found = db_find_roblox_link(rid, name)
+            if found:
+                did = did or (str(found.get("discord_id")) if found.get("discord_id") else None)
+                name = name or found.get("username")
+        return str(rid or "").strip() or None, str(did or "").strip() or None, name
+
+    async def _staff_gate(self, interaction: discord.Interaction):
+        if not has_mcwv_ticket_staff_permission(interaction.user):
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return False
+        return True
+
+    async def _close_card(self, interaction, embed, content=None):
         try:
-            if self.roblox_id not in pending_clan_removals:
-                return await interaction.response.send_message("Already handled.", ephemeral=True)
-
-            # Defer FIRST so Discord doesn't timeout during DB operations
-            await interaction.response.defer()
-
-            data = pending_clan_removals.pop(self.roblox_id)
-
-            guild = interaction.guild
-            member = guild.get_member(int(data["discord_id"])) if guild else None
-
-            if member is None and guild:
-                try:
-                    member = await guild.fetch_member(int(data["discord_id"]))
-                except Exception:
-                    member = None
-
-            role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
-
-            if member and role and role in member.roles:
-                await member.remove_roles(role, reason="Staff approved clan removal")
-
+            await interaction.message.edit(content=content, embed=embed, view=None)
+        except Exception:
             try:
-                db_remove(data["discord_id"])
-            except Exception as e:
-                print("DB remove error:", e)
-
-            await interaction.edit_original_response(
-                content="✅ Member removed and processed.",
-                embed=interaction.message.embeds[0] if interaction.message.embeds else None,
-                view=None
-            )
-
-        except Exception as e:
-            print("Approve button error:", e)
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(
-                        "❌ Something went wrong while processing this.",
-                        ephemeral=True,
-                    )
-                else:
-                    await interaction.response.send_message(
-                        "❌ Something went wrong while processing this.",
-                        ephemeral=True,
-                    )
+                await interaction.edit_original_response(content=content, embed=embed, view=None)
             except Exception:
                 pass
 
-    @discord.ui.button(label="LOA", style=discord.ButtonStyle.secondary, emoji="🏝️")
-    async def loa(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Approve Removal", style=discord.ButtonStyle.danger, custom_id="mcwv_clan_leave_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._staff_gate(interaction):
+            return
         try:
-            if self.roblox_id not in pending_clan_removals:
-                return await interaction.response.send_message("Already handled.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            rid, did, name = self._parse_target(interaction)
+            if not rid and not did:
+                return await interaction.followup.send(
+                    "❌ Could not tell who this card is for. Run `/cleanup` with their Roblox name.",
+                    ephemeral=True,
+                )
 
-            await interaction.response.defer(ephemeral=True)
-            data = pending_clan_removals.pop(self.roblox_id)
             guild = interaction.guild
-            discord_id = int(data["discord_id"])
-            roblox_name = str(data["roblox_name"] or "unknown")
+            member = None
+            if guild and did:
+                member = guild.get_member(int(did))
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(int(did))
+                    except Exception:
+                        member = None
+
+            actions = []
+            role = guild.get_role(CLAN_MEMBER_ROLE_ID) if guild else None
+            if member and role and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason=f"Staff approved clan removal ({interaction.user})")
+                    actions.append("Clan role removed")
+                except Exception as exc:
+                    actions.append(f"Role removal failed: {exc}")
+            elif not member:
+                actions.append("Not in server — role skipped")
+
+            if did and db_is_owner_discord(int(did)):
+                actions.append("Owner account — links left alone. Use `/cleanup` if you really mean it.")
+            else:
+                if did:
+                    ok, msg = db_remove_all_links_for_discord(int(did))
+                    actions.append(msg if ok else f"Unlink: {msg}")
+                if rid:
+                    extra = db_remove_roblox_link(rid)
+                    if extra:
+                        actions.append(f"Dropped Roblox `{rid}`")
+                    elif not did:
+                        actions.append("No DB row for that Roblox id")
+
+            pending_clan_removals.pop(str(rid or ""), None)
+            if rid:
+                db_clan_leave_dismiss(rid)
+
+            try:
+                await refresh_interaction_caches()
+            except Exception:
+                pass
+
+            done = discord.Embed(
+                title="✅ Removal approved",
+                description=f"**{name or rid}** unlinked by {interaction.user.mention}.",
+                color=discord.Color.green(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            done.add_field(name="Roblox", value=f"`{name or rid}`", inline=True)
+            if did:
+                done.add_field(name="Discord", value=f"<@{did}>", inline=True)
+            done.add_field(name="Actions", value="\n".join(f"• {a}" for a in actions) or "• none", inline=False)
+            await self._close_card(interaction, done)
+            ops_log_soon(
+                "members",
+                title="Clan leave approved",
+                description=f"**{name or rid}** removed from tracking.",
+                level="warning",
+                fields=[
+                    {"name": "Discord", "value": f"<@{did}>" if did else "—", "inline": True},
+                    {"name": "By", "value": interaction.user.mention, "inline": True},
+                ],
+            )
+        except Exception as e:
+            print("Approve button error:", e)
+            traceback.print_exc()
+            try:
+                await interaction.followup.send("❌ Something went wrong while processing this.", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="LOA", style=discord.ButtonStyle.secondary, emoji="🏝️", custom_id="mcwv_clan_leave_loa")
+    async def loa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._staff_gate(interaction):
+            return
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+            rid, did, name = self._parse_target(interaction)
+            if not rid or not did:
+                return await interaction.followup.send(
+                    "❌ Missing Roblox/Discord ids on this card. Use `/loa` instead.",
+                    ephemeral=True,
+                )
+            pending_clan_removals.pop(str(rid), None)
+            guild = interaction.guild
+            discord_id = int(did)
+            roblox_name = str(name or "unknown")
             notes = []
 
-            # 1) Find the member's ticket channel (by topic or DB-stored channel ID).
             ticket_channel = None
             if guild:
                 ticket_channel = discord.utils.get(
@@ -20467,7 +20629,6 @@ class ClanReviewView(discord.ui.View):
                     topic=f"mcwv-ticket-owner:{discord_id}"
                 )
                 if ticket_channel is None:
-                    # Fall back to the DB-stored ticket_channel_id column.
                     try:
                         saved_id = db_get_ticket_channel_id(discord_id)
                         if saved_id:
@@ -20475,7 +20636,6 @@ class ClanReviewView(discord.ui.View):
                     except Exception:
                         pass
 
-            # 2) Move + rename the ticket channel.
             if isinstance(ticket_channel, discord.TextChannel):
                 safe_name = normalize_ticket_key(roblox_name)[:24] or str(discord_id)
                 loa_category = guild.get_channel(MCWV_LOA_CATEGORY_ID) if guild else None
@@ -20483,10 +20643,10 @@ class ClanReviewView(discord.ui.View):
                     try:
                         await ticket_channel.edit(
                             category=loa_category,
-                            name=f"\U0001f3dd\ufe0f-ticket-{safe_name}",
+                            name=f"🏝️-ticket-{safe_name}",
                             reason=f"MCWV LOA - moved by {interaction.user}",
                         )
-                        notes.append(f"Ticket moved to LOA category and renamed")
+                        notes.append("Ticket moved to LOA category and renamed")
                     except Exception as exc:
                         print(f"[LOA] ticket move/rename failed: {exc}")
                         notes.append(f"Could not move ticket: {exc}")
@@ -20495,7 +20655,6 @@ class ClanReviewView(discord.ui.View):
             else:
                 notes.append("No ticket channel found for this member - skipped move")
 
-            # 3) Remove the clan member role and add the LOA role.
             member = guild.get_member(discord_id) if guild else None
             if member is None and guild:
                 try:
@@ -20522,7 +20681,6 @@ class ClanReviewView(discord.ui.View):
             elif not loa_role:
                 notes.append("LOA role not found in server")
 
-            # 4) Record the LOA in the database. KEEP the Roblox link + Hub login intact!
             ticket_row = find_ticket_in_channel(ticket_channel) if isinstance(ticket_channel, discord.TextChannel) else None
             ticket_id = str(ticket_row[0]) if ticket_row else None
             channel_id = int(ticket_channel.id) if isinstance(ticket_channel, discord.TextChannel) else None
@@ -20530,7 +20688,7 @@ class ClanReviewView(discord.ui.View):
             cat_before = ticket_channel.category_id if isinstance(ticket_channel, discord.TextChannel) else None
 
             loa_ok, loa_info = db_start_loa(
-                roblox_id=self.roblox_id,
+                roblox_id=rid,
                 discord_id=discord_id,
                 roblox_username=roblox_name,
                 ticket_id=ticket_id,
@@ -20554,7 +20712,6 @@ class ClanReviewView(discord.ui.View):
                     ],
                 )
 
-            # 5) Post the LOA card in the member's ticket (End LOA button lives there).
             if isinstance(ticket_channel, discord.TextChannel):
                 try:
                     loa_embed = discord.Embed(
@@ -20577,7 +20734,7 @@ class ClanReviewView(discord.ui.View):
                     loa_embed.set_footer(text="End LOA restores roles, the ticket channel and tracking automatically.")
                     await ticket_channel.send(
                         embed=loa_embed,
-                        view=LoaTicketView(self.roblox_id, roblox_name, discord_id),
+                        view=LoaTicketView(rid, roblox_name, discord_id),
                     )
                     notes.append("LOA card posted in ticket")
                 except Exception as exc:
@@ -20586,23 +20743,54 @@ class ClanReviewView(discord.ui.View):
             else:
                 notes.append("No ticket channel — LOA card skipped")
 
-            # 6) Edit the original staff embed to show LOA was applied.
-            await interaction.edit_original_response(
-                content=f"\U0001f3dd\ufe0f **LOA applied by {interaction.user.mention}**\n" + "\n".join(notes),
-                embed=interaction.message.embeds[0] if interaction.message.embeds else None,
-                view=None
+            done = discord.Embed(
+                title="🏝️ LOA applied",
+                description=f"**{roblox_name}** by {interaction.user.mention}",
+                color=discord.Color.from_rgb(96, 165, 250),
+                timestamp=datetime.now(timezone.utc),
             )
-            self.stop()
-
-        except Exception as e:
-            print("LOA button error:", e)
+            done.add_field(name="Changes", value="\n".join(f"• {n}" for n in notes) or "• none", inline=False)
             try:
-                await interaction.followup.send(
-                    "Something went wrong while applying LOA.",
-                    ephemeral=True
-                )
+                await interaction.message.edit(embed=done, view=None)
             except Exception:
                 pass
+            await interaction.followup.send("🏝️ LOA applied.", ephemeral=True)
+        except Exception as e:
+            print("LOA button error:", e)
+            traceback.print_exc()
+            try:
+                await interaction.followup.send("Something went wrong while applying LOA.", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.secondary, custom_id="mcwv_clan_leave_ignore")
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._staff_gate(interaction):
+            return
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            rid, did, name = self._parse_target(interaction)
+            if rid:
+                pending_clan_removals.pop(str(rid), None)
+                db_clan_leave_dismiss(rid)
+            done = discord.Embed(
+                title="Ignored",
+                description=f"**{name or rid or 'Unknown'}** — left on the books. Won't re-alert.",
+                color=discord.Color.dark_grey(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            if did:
+                done.add_field(name="Discord", value=f"<@{did}>", inline=True)
+            done.set_footer(text=f"Ignored by {interaction.user}")
+            await self._close_card(interaction, done)
+        except Exception as e:
+            print("Ignore button error:", e)
+            try:
+                await interaction.followup.send("❌ Could not ignore this card.", ephemeral=True)
+            except Exception:
+                pass
+
 
 # ---------------- TICKET SCREENSHOT REMINDER LOOP ----------------
 def db_tickets_needing_screenshot_reminder():
@@ -24756,6 +24944,7 @@ async def on_ready():
         bot.add_view(ScreenshotUploadedView())
         bot.add_view(TicketWelcomeView("persistent"))
         bot.add_view(ApplicationReviewView("persistent"))
+        bot.add_view(ClanReviewView())
         print("✅ MCWV ticket views registered")
     except Exception as e:
         print(f"❌ Failed to register ticket views: {e}")
