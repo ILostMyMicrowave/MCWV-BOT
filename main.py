@@ -2499,7 +2499,22 @@ def refresh_interaction_caches_sync():
                     worker.rollback()
                 except Exception:
                     pass
-            cur.execute("SELECT roblox_id, discord_id, username FROM users ORDER BY LOWER(username) LIMIT 5000")
+            try:
+                cur.execute("""
+                    SELECT roblox_id, discord_id, username FROM (
+                        SELECT roblox_id, discord_id, username FROM users
+                        UNION ALL
+                        SELECT roblox_id, discord_id, username FROM user_alts
+                    ) t
+                    ORDER BY LOWER(username)
+                    LIMIT 5000
+                """)
+            except Exception:
+                try:
+                    worker.rollback()
+                except Exception:
+                    pass
+                cur.execute("SELECT roblox_id, discord_id, username FROM users ORDER BY LOWER(username) LIMIT 5000")
             users = [
                 (str(row[0]), int(row[1]) if row[1] is not None else 0, str(row[2] or row[0]))
                 for row in cur.fetchall()
@@ -2789,6 +2804,44 @@ def db_end_loa(record_id, ended_by, end_notes=""):
         return False, f"{type(e).__name__}: {e}"
 
 
+def db_get_all_links():
+    """Main + alt Roblox links, including people on LOA.
+
+    Staff unlink tools (/cleanup, /removealt) must see everyone who is linked,
+    not only currently-tracked war accounts.
+    """
+    if not db_enabled():
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT TRIM(roblox_id::text), discord_id, username
+                FROM (
+                    SELECT roblox_id, discord_id, username FROM users
+                    UNION ALL
+                    SELECT roblox_id, discord_id, username FROM user_alts
+                ) t
+                WHERE roblox_id IS NOT NULL
+                  AND TRIM(roblox_id::text) <> ''
+                ORDER BY discord_id, username
+            """)
+            rows = []
+            for rid, did, uname in cur.fetchall():
+                try:
+                    rows.append((
+                        str(rid or "").strip(),
+                        int(did) if did is not None else 0,
+                        str(uname or rid or "").strip(),
+                    ))
+                except Exception:
+                    continue
+            return rows
+    except Exception as e:
+        conn.rollback()
+        print("db_get_all_links error:", e)
+        return []
+
+
 def db_get_all_linked():
     """All main-linked accounts: roblox_id, discord_id, username, role (if any)."""
     if not db_enabled():
@@ -2959,42 +3012,44 @@ async def perform_loa_revert(guild, record, actor, end_notes=""):
     return ok, notes
 
 
-def db_find_roblox_link(roblox_id):
+def db_find_roblox_link(roblox_id, username=None):
     if not db_enabled():
         return None
 
-    rid = str(roblox_id).strip()
+    rid = str(roblox_id or "").strip()
+    uname = str(username or "").strip()
+
+    def _row(kind, row, fallback_id):
+        return {
+            "kind": kind,
+            "discord_id": row[0],
+            "username": row[1],
+            "roblox_id": str(row[2] or fallback_id or "").strip(),
+        }
 
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT discord_id, username
-                FROM users
-                WHERE roblox_id = %s
-            """, (rid,))
-            row = cur.fetchone()
-            if row:
-                return {
-                    "kind": "main",
-                    "discord_id": row[0],
-                    "username": row[1],
-                    "roblox_id": rid
-                }
-
-            cur.execute("""
-                SELECT discord_id, username
-                FROM user_alts
-                WHERE roblox_id = %s
-            """, (rid,))
-            row = cur.fetchone()
-            if row:
-                return {
-                    "kind": "alt",
-                    "discord_id": row[0],
-                    "username": row[1],
-                    "roblox_id": rid
-                }
-
+            for table, kind in (("users", "main"), ("user_alts", "alt")):
+                if rid:
+                    cur.execute(f"""
+                        SELECT discord_id, username, TRIM(roblox_id::text)
+                        FROM {table}
+                        WHERE TRIM(roblox_id::text) = %s
+                        LIMIT 1
+                    """, (rid,))
+                    row = cur.fetchone()
+                    if row:
+                        return _row(kind, row, rid)
+                if uname:
+                    cur.execute(f"""
+                        SELECT discord_id, username, TRIM(roblox_id::text)
+                        FROM {table}
+                        WHERE LOWER(TRIM(username)) = LOWER(%s)
+                        LIMIT 1
+                    """, (uname,))
+                    row = cur.fetchone()
+                    if row:
+                        return _row(kind, row, rid)
     except Exception as e:
         conn.rollback()
         print("db_find_roblox_link error:", e)
@@ -3050,12 +3105,13 @@ def db_add_alt(discord_id, roblox_id, username):
         return False, f"Database error: {e}"
 
 
-def db_remove_alt(discord_id, alt_value):
+def db_remove_alt(discord_id, alt_value, roblox_id=None):
     if not db_enabled():
         return False, None, "Database is not available."
 
     did = int(discord_id)
     alt_clean = str(alt_value).strip()
+    rid_clean = str(roblox_id or "").strip()
 
     if db_is_owner_discord(did):
         return False, None, "Owner accounts cannot be modified from Roblox Links."
@@ -3066,11 +3122,12 @@ def db_remove_alt(discord_id, alt_value):
                 DELETE FROM user_alts
                 WHERE discord_id = %s
                   AND (
-                        LOWER(username) = LOWER(%s)
-                        OR roblox_id = %s
+                        LOWER(TRIM(username)) = LOWER(%s)
+                        OR TRIM(roblox_id::text) = %s
+                        OR (%s <> '' AND TRIM(roblox_id::text) = %s)
                   )
                 RETURNING roblox_id, username
-            """, (did, alt_clean, alt_clean))
+            """, (did, alt_clean, alt_clean, rid_clean, rid_clean))
             row = cur.fetchone()
 
         conn.commit()
@@ -17116,9 +17173,12 @@ async def mystats(interaction: discord.Interaction, roblox_username: str):
         roblox_name = resolved["name"]
 
         # ---------------- DB LINK ----------------
-        db_users = db_get_all()
-        linked = next((u for u in db_users if int(u[0]) == roblox_id), None)
-        discord_display = f"<@{linked[1]}>" if linked else "Not linked"
+        linked = db_find_roblox_link(str(roblox_id), roblox_name)
+        if linked:
+            kind = "main" if linked.get("kind") == "main" else "alt"
+            discord_display = f"<@{linked['discord_id']}> ({kind})"
+        else:
+            discord_display = "Not linked"
 
         # ---------------- SESSION SAFETY ----------------
         if session is None or session.closed:
@@ -18368,60 +18428,128 @@ async def cleanup_autocomplete(interaction: discord.Interaction, current: str):
     return results[:25]
 
 
+def _cleanup_row_for_discord(db_users, discord_id):
+    try:
+        did = int(discord_id)
+    except Exception:
+        return None
+    return next((u for u in db_users if int(u[1] or 0) == did), None)
+
+
+def _cleanup_row_for_roblox(db_users, roblox_id=None, username=None):
+    rid = str(roblox_id or "").strip()
+    uname = str(username or "").strip().lower()
+    for u in db_users:
+        stored_id = str(u[0] or "").strip()
+        stored_name = str(u[2] or "").strip().lower()
+        if rid and stored_id == rid:
+            return u
+        if uname and stored_name == uname:
+            return u
+    return None
+
+
+async def _cleanup_fetch_member(guild, discord_id):
+    try:
+        did = int(discord_id)
+    except Exception:
+        return None
+    if not guild or not did:
+        return None
+    member = guild.get_member(did)
+    if member is None:
+        try:
+            member = await guild.fetch_member(did)
+        except Exception:
+            member = None
+    return member
+
+
 async def resolve_cleanup_target(guild: discord.Guild, target: str, db_users: list):
-    target = target.strip()
+    """Find a linked account by Discord mention/ID, Roblox ID, or username.
+
+    Username is resolved through Roblox when the stored name is stale.
+    Numeric IDs that are not Discord snowflakes fall through to Roblox IDs.
+    Includes alts and people on LOA (caller should pass db_get_all_links()).
+    """
+    target = re.sub(
+        r"\s*\((Roblox|Discord ID|Roblox ID)\)\s*$",
+        "",
+        str(target or "").strip(),
+        flags=re.I,
+    ).strip()
 
     member = None
     linked_row = None
     roblox_id = None
     roblox_name = None
 
-    # Discord mention / ID
-    discord_id = None
+    def finish(row, mem=None):
+        if not row:
+            return mem, None, None, None
+        rid = str(row[0]).strip()
+        name = str(row[2] or rid).strip()
+        return mem, row, rid, name
+
     m = re.fullmatch(r"<@!?(\d+)>", target)
-    if m:
-        discord_id = int(m.group(1))
-    elif target.isdigit():
-        discord_id = int(target)
+    numeric = bool(re.fullmatch(r"\d+", target))
+    discord_id = int(m.group(1)) if m else (int(target) if numeric else None)
 
     if discord_id is not None:
-        member = guild.get_member(discord_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(discord_id)
-            except Exception:
-                member = None
-
-        linked_row = next((u for u in db_users if int(u[1]) == discord_id), None)
+        member = await _cleanup_fetch_member(guild, discord_id)
+        linked_row = _cleanup_row_for_discord(db_users, discord_id)
         if linked_row:
-            roblox_id = str(linked_row[0]).strip()
-            roblox_name = linked_row[2]
+            member = member or await _cleanup_fetch_member(guild, linked_row[1])
+            return finish(linked_row, member)
+        if member:
+            # In the server but no DB row — still allow role cleanup.
+            return member, None, None, None
+        if numeric and len(target) >= 17:
+            return None, None, None, None
+        linked_row = _cleanup_row_for_roblox(db_users, roblox_id=target)
+        if linked_row:
+            member = await _cleanup_fetch_member(guild, linked_row[1])
+            return finish(linked_row, member)
 
-        return member, linked_row, roblox_id, roblox_name
-
-    # Roblox username / Roblox ID
-    lowered = target.lower()
-    linked_row = next(
-        (
-            u for u in db_users
-            if str(u[0]).strip() == target
-            or str(u[2]).strip().lower() == lowered
-        ),
-        None
-    )
+    linked_row = _cleanup_row_for_roblox(db_users, username=target)
+    resolved = None
+    if not linked_row:
+        try:
+            resolved = await resolve_roblox_username(target)
+        except Exception:
+            resolved = None
+        if resolved:
+            linked_row = _cleanup_row_for_roblox(
+                db_users,
+                roblox_id=resolved.get("id"),
+                username=resolved.get("name"),
+            )
+            if not linked_row:
+                found = db_find_roblox_link(resolved.get("id"), resolved.get("name"))
+                if found:
+                    linked_row = (
+                        found["roblox_id"],
+                        int(found["discord_id"] or 0),
+                        found["username"] or resolved.get("name"),
+                    )
+    if not linked_row:
+        found = db_find_roblox_link(target, target)
+        if found:
+            linked_row = (
+                found["roblox_id"],
+                int(found["discord_id"] or 0),
+                found["username"] or target,
+            )
 
     if linked_row:
-        roblox_id = str(linked_row[0]).strip()
-        roblox_name = linked_row[2]
+        member = await _cleanup_fetch_member(guild, linked_row[1])
+        mem, row, rid, name = finish(linked_row, member)
+        if resolved and resolved.get("name"):
+            name = resolved["name"]
+            rid = str(resolved.get("id") or rid)
+        return mem, row, rid, name
 
-        member = guild.get_member(int(linked_row[1]))
-        if member is None:
-            try:
-                member = await guild.fetch_member(int(linked_row[1]))
-            except Exception:
-                member = None
-
-    return member, linked_row, roblox_id, roblox_name
+    return None, None, None, None
 
 
 class CleanupConfirmView(discord.ui.View):
@@ -18435,7 +18563,7 @@ class CleanupConfirmView(discord.ui.View):
 
     async def run_cleanup(self, interaction: discord.Interaction):
 
-        users = db_get_all_tracked()
+        users = db_get_all_links() or db_get_all_tracked()
 
         member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
             self.guild, self.target, users
@@ -18551,14 +18679,16 @@ class CleanupConfirmView(discord.ui.View):
 async def cleanup(interaction: discord.Interaction, target: str, reason: str = "No reason provided"):
     await interaction.response.defer(ephemeral=True)
 
-    users = db_get_all_tracked()
+    users = db_get_all_links() or db_get_all_tracked()
     member, linked_row, roblox_id, roblox_name = await resolve_cleanup_target(
         interaction.guild, target, users
     )
 
     if not member and not linked_row:
         return await interaction.followup.send(
-            "❌ User not found.",
+            f"❌ No Roblox link for `{target}`.\n"
+            "I check mains **and** alts (including LOA). Try the Roblox ID, "
+            "a Discord mention, or `/listalts` on their Discord.",
             ephemeral=True
         )
 
@@ -18920,9 +19050,41 @@ async def removealt(interaction: discord.Interaction, member: discord.Member, al
     await interaction.response.defer(ephemeral=True)
 
     try:
-        ok, roblox_id, msg = db_remove_alt(member.id, alt)
+        alt_clean = str(alt or "").strip()
+        resolved = None
+        try:
+            resolved = await resolve_roblox_username(alt_clean)
+        except Exception:
+            resolved = None
+        resolved_id = str(resolved["id"]).strip() if resolved and resolved.get("id") else None
+        resolved_name = str(resolved["name"]).strip() if resolved and resolved.get("name") else alt_clean
+
+        ok, roblox_id, msg = db_remove_alt(member.id, alt_clean, roblox_id=resolved_id)
         if not ok:
-            return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+            found = db_find_roblox_link(resolved_id or alt_clean, resolved_name)
+            if found:
+                who = found.get("username") or resolved_name
+                owner = found.get("discord_id")
+                if found.get("kind") == "main":
+                    if owner and int(owner) == member.id:
+                        return await interaction.followup.send(
+                            f"❌ **{who}** is {member.mention}'s **main**, not an alt.\n"
+                            f"Use `/cleanup {who}` to unlink.",
+                            ephemeral=True,
+                        )
+                    return await interaction.followup.send(
+                        f"❌ **{who}** is a **main** linked to <@{owner}>, not an alt on {member.mention}.",
+                        ephemeral=True,
+                    )
+                if owner and int(owner) != member.id:
+                    return await interaction.followup.send(
+                        f"❌ **{who}** is an alt on <@{owner}>, not {member.mention}.",
+                        ephemeral=True,
+                    )
+            return await interaction.followup.send(
+                f"❌ No alt `{alt_clean}` on {member.mention}. Check `/listalts`.",
+                ephemeral=True,
+            )
 
         if roblox_id:
             rid = str(roblox_id).strip()
