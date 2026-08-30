@@ -5264,8 +5264,22 @@ def require_role():
         return ALLOWED_ROLE_ID in role_ids
     return app_commands.check(predicate)
 
+def _is_unknown_interaction(error):
+    """Discord 10062: we took >3s to ACK. Command still exists — bot was busy."""
+    err = getattr(error, "original", error)
+    code = getattr(err, "code", None)
+    if code in (10062, 10008):
+        return True
+    text = str(err or "")
+    return "10062" in text or "Unknown interaction" in text or "Unknown Message" in text
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if _is_unknown_interaction(error):
+        cmd = getattr(getattr(interaction, "command", None), "qualified_name", None) or "unknown"
+        print(f"[command] /{cmd} ack too late (10062) — bot was busy, command was NOT deleted")
+        return
     if isinstance(error, app_commands.CheckFailure):
         try:
             if interaction.response.is_done():
@@ -14868,11 +14882,12 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
             )
             return
 
-        ensure_db_connection()
-        conn.autocommit = False
-
-        # Ensure tables exist
         def _ensure():
+            ensure_db_connection()
+            try:
+                conn.autocommit = False
+            except Exception:
+                pass
             try:
                 with conn.cursor() as cur:
                     cur.execute("""CREATE TABLE IF NOT EXISTS cross_clan_player_history (
@@ -14975,6 +14990,8 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
                 await asyncio.to_thread(_insert_participants, conn, pending_participants)
                 pending_participants.clear()
 
+            # Yield so slash commands (/ping, /leaderboard) can ACK within 3s.
+            await asyncio.sleep(0)
             if (batch_start // CONCURRENCY + 1) % 100 == 0:
                 elapsed = time.time() - started
                 done = min(batch_start + CONCURRENCY, len(clan_names))
@@ -16685,7 +16702,10 @@ async def refreshprofile(interaction: discord.Interaction, roblox_id: str):
 @bot.tree.command(name="ping", description="Test command", guild=guild_obj)
 @require_role()
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("pong")
+    try:
+        await interaction.response.send_message("pong")
+    except discord.NotFound:
+        return
 
 
 _EMOJI_SHEET_GROUPS = [
@@ -17253,7 +17273,14 @@ async def warinfo(interaction: discord.Interaction):
     guild=guild_obj
 )
 async def leaderboard(interaction: discord.Interaction):
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except discord.NotFound:
+        return
+    except discord.HTTPException as exc:
+        if getattr(exc, "code", None) == 10062:
+            return
+        raise
 
     async def build_state():
         global session
