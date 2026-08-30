@@ -5197,6 +5197,36 @@ def format_points(n: int) -> str:
         return f"{n / 1_000:.1f}K"
     return str(n)
 
+
+def format_cw_points(n) -> str:
+    """CW-bot style: 9.52k / 6.84m."""
+    try:
+        n = int(n or 0)
+    except Exception:
+        n = 0
+    if n >= 1_000_000_000:
+        s = f"{n / 1_000_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"{s}b"
+    if n >= 1_000_000:
+        s = f"{n / 1_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"{s}m"
+    if n >= 1_000:
+        s = f"{n / 1_000:.2f}".rstrip("0").rstrip(".")
+        return f"{s}k"
+    return str(n)
+
+
+def cw_better_pct(rank, total):
+    """(total - rank) / total * 100 — CW 'better than'."""
+    try:
+        rank = int(rank or 0)
+        total = int(total or 0)
+    except Exception:
+        return None
+    if rank <= 0 or total <= 1:
+        return None
+    return (total - rank) / total * 100
+
 def format_duration(since: datetime) -> str:
     delta = datetime.now(timezone.utc) - since
     total = int(delta.total_seconds())
@@ -12843,20 +12873,21 @@ def build_checkplayer_embed(data, page=0, per_page=7):
                 line2 = f"\u2713 participated (no score data){place_str}"
             elif rank > 0 and total > 1:
                 pct = float(row.get("betterThan") or ((total - rank) / total * 100))
+                pct = cw_better_pct(rank, total) or pct
                 rank_txt = f"#{rank:,}/{total:,}"
                 # Percentile with visual indicator
                 if pct >= 95:
                     pct_icon = "\U0001f451"
-                    better_txt = f"{pct_icon} **{pct:.1f}%**"
+                    better_txt = f"{pct_icon} **{pct:.2f}%**"
                 elif pct >= 80:
-                    better_txt = f"\U0001f7e2 **{pct:.1f}%**"
+                    better_txt = f"\U0001f7e2 **{pct:.2f}%**"
                 elif pct >= 50:
-                    better_txt = f"\U0001f7e1 {pct:.1f}%"
+                    better_txt = f"\U0001f7e1 {pct:.2f}%"
                 else:
-                    better_txt = f"\U0001f534 _{pct:.1f}%_"
+                    better_txt = f"\U0001f534 _{pct:.2f}%_"
                 place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
                 line1 = f"`{title}` \u2014 {clan_display}"
-                stats_parts = [f"**{format_points(pts)}**", rank_txt, f"{better_txt} better"]
+                stats_parts = [f"**{format_cw_points(pts)}**", rank_txt, f"{better_txt} better"]
                 if place_str:
                     stats_parts.append(f"clan #{int(place)}")
                 line2 = " \u00b7 ".join(stats_parts)
@@ -13192,7 +13223,7 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
             d.text((C_PTS, y + sc(5)), f"[{clan}]", font=F["stats"], fill=cc)
             d.text((C_RANK, y + sc(5)), "participated \u2713", font=F["stats"], fill=(110, 120, 140, 255))
         else:
-            pct = float(row.get("betterThan") or ((total_c - rank) / total_c * 100 if rank > 0 and total_c > 1 else 0))
+            pct = cw_better_pct(rank, total_c) or float(row.get("betterThan") or 0)
             if pct >= 80:
                 bc = (74, 222, 128)
             elif pct >= 50:
@@ -13210,7 +13241,7 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
             d.text((C_NAME, y + sc(22)), clan_str, font=F["stats"], fill=cc)
 
             # Points (aligned)
-            d.text((C_PTS, y + sc(2)), format_points(pts), font=F["pct"], fill=(200, 210, 230, 255))
+            d.text((C_PTS, y + sc(2)), format_cw_points(pts), font=F["pct"], fill=(200, 210, 230, 255))
 
             # Rank (aligned)
             if rank > 0 and total_c > 1:
@@ -13237,7 +13268,7 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
                 d = ImageDraw.Draw(img)
 
             # Percentile text
-            d.text((C_PCT, y + sc(11)), f"{pct:.1f}%", font=F["pct"], fill=(*bc, 255))
+            d.text((C_PCT, y + sc(11)), f"{pct:.2f}%", font=F["pct"], fill=(*bc, 255))
 
         y += rh
         await asyncio.sleep(0)
@@ -14759,6 +14790,54 @@ async def auto_cache_war_end(battle_id):
     )
 
 
+def _rank_one_battle_sql(conn, battle_id):
+    """CW-style global rank: unique players, MAX(points), total = unique count."""
+    if not battle_id:
+        return 0
+    key = str(battle_id)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH ids AS (
+                    SELECT DISTINCT battle_id
+                    FROM cross_clan_player_history
+                    WHERE battle_id = %s
+                       OR regexp_replace(lower(COALESCE(battle_id,'')), '[^a-z0-9]+', '', 'g')
+                        = regexp_replace(lower(%s), '[^a-z0-9]+', '', 'g')
+                ),
+                best AS (
+                    SELECT h.roblox_id::text AS roblox_id, MAX(h.points) AS pts
+                    FROM cross_clan_player_history h
+                    JOIN ids ON ids.battle_id = h.battle_id
+                    WHERE COALESCE(h.points, 0) > 0
+                    GROUP BY h.roblox_id::text
+                ),
+                ranked AS (
+                    SELECT roblox_id,
+                           ROW_NUMBER() OVER (ORDER BY pts DESC, roblox_id ASC) AS gr,
+                           COUNT(*) OVER () AS gt
+                    FROM best
+                )
+                UPDATE cross_clan_player_history h
+                SET rank = r.gr,
+                    total_contributors = r.gt
+                FROM ranked r, ids
+                WHERE h.roblox_id::text = r.roblox_id
+                  AND h.battle_id = ids.battle_id
+            """, (key, key))
+            updated = cur.rowcount
+        conn.commit()
+        print(f"[war-cache] ranked {updated} rows for {key}")
+        return int(updated or 0)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[war-cache] rank failed for {battle_id}: {exc}")
+        return 0
+
+
 async def _auto_cache_full_scan(battle_id, include_participants=False, only_clans=None):
     """Background task: scan all 50k clans (or a priority subset) for one battle.
 
@@ -14868,8 +14947,12 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
                 if isinstance(result, Exception) or not result:
                     continue
                 rows, participants_by_battle, places_by_battle = result
-                # Filter to only this battle's contributions
-                battle_rows = [r for r in rows if r[1] == battle_id]
+                # Filter to this battle (fuzzy — RoyalBattle2026 vs royal battle 2026)
+                norm = normalize_hourly_battle_key(battle_id)
+                battle_rows = []
+                for r in rows or []:
+                    if r[1] == battle_id or normalize_hourly_battle_key(r[1]) == norm:
+                        battle_rows.append((r[0], str(battle_id), r[2], r[3], r[4], r[5], r[6], r[7] if len(r) > 7 else None))
                 if battle_rows:
                     clans_with_data += 1
                     total_contribs += len(battle_rows)
@@ -14941,7 +15024,7 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
                 print(f"[auto-cache] rank failed: {exc}")
                 return 0
 
-        ranked = await asyncio.to_thread(_rank_battle)
+        ranked = await asyncio.to_thread(_rank_one_battle_sql, conn, battle_id)
         elapsed = time.time() - started
         print(f"[auto-cache] {battle_id}: {clans_with_data} clans, {total_contribs:,} contribs, {total_participants:,} participants, {ranked:,} ranked, {elapsed:.0f}s")
         mins = elapsed / 60
@@ -14986,29 +15069,49 @@ def get_cached_player_history(roblox_id):
     pass
     try:
         ensure_db_connection()
+        rid = str(roblox_id).strip()
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT battle_id, battle_name, clan_name, points, rank,
                        total_contributors, clan_place, earned_medal, start_time
                 FROM cross_clan_player_history
-                WHERE roblox_id = %s
+                WHERE TRIM(roblox_id::text) = %s
                 ORDER BY start_time DESC NULLS LAST, battle_id DESC
-            """, (str(roblox_id),))
+            """, (rid,))
             rows = cur.fetchall()
-        return [
-            {
+        parsed = []
+        for r in rows:
+            rank = int(r[4]) if r[4] not in (None, 0) else None
+            total = int(r[5]) if r[5] not in (None, 0) else None
+            parsed.append({
                 "battleId": r[0],
                 "title": r[1] or _friendly_battle_name(r[0]),
                 "clan": r[2],
                 "points": int(r[3] or 0),
-                "rank": int(r[4]) if r[4] else None,
-                "total": int(r[5]) if r[5] else None,
+                "rank": rank,
+                "total": total,
                 "clanPlace": r[6],
                 "earnedMedal": bool(r[7]),
                 "startTime": int(r[8]) if r[8] else 0,
-            }
-            for r in rows
-        ]
+                "betterThan": cw_better_pct(rank, total),
+            })
+        # One row per war: MCWV wins over a stale other-clan row.
+        merged = {}
+        for item in parsed:
+            key = normalize_hourly_battle_key(item.get("battleId"))
+            if not key:
+                continue
+            prev = merged.get(key)
+            if prev is None:
+                merged[key] = item
+                continue
+            this_mcwv = _normalize_clan_name(item.get("clan")) == _normalize_clan_name(CLAN_NAME)
+            prev_mcwv = _normalize_clan_name(prev.get("clan")) == _normalize_clan_name(CLAN_NAME)
+            if this_mcwv and not prev_mcwv:
+                merged[key] = item
+            elif this_mcwv == prev_mcwv and int(item.get("points") or 0) > int(prev.get("points") or 0):
+                merged[key] = item
+        return sorted(merged.values(), key=lambda x: (x.get("startTime") or 0, str(x.get("battleId") or "")), reverse=True)
     except Exception as e:
         print(f"[cross-clan cache] player history read failed: {e}")
         return []
@@ -15568,34 +15671,8 @@ def _compute_global_ranks_sql(conn):
         total_updated = 0
 
         for battle_id, actual_total in battles:
-            try:
-                with conn.cursor() as cur:
-                    # Window function per battle — small, fast, no timeout
-                    cur.execute("""
-                        WITH ranked AS (
-                            SELECT id,
-                                   ROW_NUMBER() OVER (
-                                       ORDER BY points DESC, roblox_id ASC
-                                   ) AS global_rank,
-                                   %s AS global_total
-                            FROM cross_clan_player_history
-                            WHERE battle_id = %s
-                        )
-                        UPDATE cross_clan_player_history h
-                        SET rank = r.global_rank,
-                            total_contributors = r.global_total
-                        FROM ranked r
-                        WHERE h.id = r.id
-                    """, (actual_total, battle_id))
-                    updated = cur.rowcount
-                conn.commit()
-                total_updated += updated if updated > 0 else 0
-            except Exception as exc:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                print(f"[global backfill] rank failed for {battle_id}: {exc}")
+            updated = _rank_one_battle_sql(conn, battle_id)
+            total_updated += updated if updated > 0 else 0
 
         print(f"[global backfill] rank computation complete: {total_updated:,} rows updated across {len(battles)} battles")
         return total_updated
@@ -15982,27 +16059,41 @@ async def backfill_history(interaction: discord.Interaction, battle_name: str = 
     pass  # keep connection alive (Supabase has no compute hour limit)
 
 
-@bot.tree.command(name="cachewar", description="Cache a specific war's data into the permanent cross-clan cache", guild=guild_obj)
-@app_commands.describe(battle_id="Battle ID to cache (e.g. NinjaBattle2026)")
+@bot.tree.command(name="cachewar", description="Full CW-style scan of one war (all clans) into the permanent cache", guild=guild_obj)
+@app_commands.describe(battle_id="Battle ID to cache (e.g. RoyalBattle2026)")
 @require_role()
 async def cachewar(interaction: discord.Interaction, battle_id: str):
+    global GLOBAL_BACKFILL_RUNNING
     await interaction.response.defer(ephemeral=True)
 
-    if not db_enabled():
+    if not db_enabled() or not DATABASE_URL:
         return await interaction.followup.send("Database is not available.", ephemeral=True)
 
     battle_id = battle_id.strip()
-    count = await cache_battle_contributors(battle_id)
-    pass  # keep connection alive (Supabase has no compute hour limit)
+    if not battle_id:
+        return await interaction.followup.send("Give a battle id, e.g. `RoyalBattle2026`.", ephemeral=True)
 
-    if count > 0:
-        stats = get_cached_battle_stats(battle_id)
-        stats_txt = ""
-        if stats:
-            stats_txt = f"\n{stats['clans']} clans | {stats['uniquePlayers']} unique players | {stats['rows']} total rows"
-        await interaction.followup.send(f"Cached **{battle_id}** — {count:,} contributor rows.{stats_txt}", ephemeral=True)
-    else:
-        await interaction.followup.send(f"No data found for `{battle_id}`. Check the battle ID.", ephemeral=True)
+    if GLOBAL_BACKFILL_RUNNING:
+        return await interaction.followup.send(
+            "A full scan is already running. Wait for Cache ops logs to say finished, then run this again.",
+            ephemeral=True,
+        )
+
+    frozen = 0
+    try:
+        frozen = await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id) or 0
+    except Exception as exc:
+        print(f"[cachewar] freeze failed: {exc}")
+
+    await interaction.followup.send(
+        f"Full **CW-style** scan queued for **{battle_id}**.\n"
+        f"MCWV snapshot frozen: **{frozen}** players.\n"
+        "This hits every clan on the sitemap (~20–40 min). Bot stays up.\n"
+        "Watch **Cache** ops logs. Then `/checkplayer` — ranks will be global "
+        "(e.g. `#6806/39897` · `82.94%` better).",
+        ephemeral=True,
+    )
+    asyncio.create_task(_auto_cache_full_scan(battle_id, include_participants=True))
 
 
 @bot.tree.command(name="cachedbstats", description="Show stats for the cross-clan history cache", guild=guild_obj)
