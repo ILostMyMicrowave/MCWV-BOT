@@ -599,6 +599,162 @@ async def _send_signup_verification_dm(discord_id, username, code):
     return {"success": True, "sent": True, "discord_id": str(user_id)}
 
 
+@app.route("/admin/lookup-discord-username", methods=["POST"])
+@require_admin_api_key
+def admin_lookup_discord_username():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username") or "").lstrip("@").strip()
+    if not username:
+        return jsonify({"discord_id": None}), 200
+    try:
+        future = _run_on_bot_loop(_lookup_discord_username(username))
+        return jsonify(future.result(timeout=15))
+    except Exception as exc:
+        return jsonify({"error": str(exc), "discord_id": None}), 200
+
+
+def _discord_name_matches(person, needle):
+    if person is None or not needle:
+        return False
+    names = [
+        getattr(person, "name", None),
+        getattr(person, "global_name", None),
+        getattr(person, "display_name", None),
+        getattr(person, "nick", None),
+    ]
+    user = getattr(person, "_user", None) or getattr(person, "user", None)
+    if user is not None and user is not person:
+        names.extend([getattr(user, "name", None), getattr(user, "global_name", None)])
+    return any(str(n).strip().lower() == needle for n in names if n)
+
+
+async def _lookup_discord_username(username):
+    raw = str(username or "").lstrip("@").strip()
+    needle = raw.lower()
+    if not needle:
+        return {"discord_id": None}
+    if needle.isdigit() and len(needle) >= 17:
+        return {"discord_id": needle}
+
+    guild = broadcast_primary_guild() or bot.get_guild(GUILD_ID)
+    if guild is None:
+        print("[password-reset] lookup: no guild")
+        return {"discord_id": None}
+
+    await _ensure_guild_member_cache(guild)
+
+    for member in list(guild.members or []):
+        if _discord_name_matches(member, needle):
+            return {"discord_id": str(member.id)}
+
+    if guild.owner_id:
+        owner = guild.get_member(guild.owner_id)
+        if owner is None:
+            try:
+                owner = await guild.fetch_member(guild.owner_id)
+            except Exception as exc:
+                print(f"[password-reset] fetch owner: {exc}")
+                owner = None
+        if _discord_name_matches(owner, needle):
+            return {"discord_id": str(guild.owner_id)}
+
+    try:
+        matches = await guild.query_members(query=raw[:100], limit=10)
+        hits = [m for m in (matches or []) if _discord_name_matches(m, needle)]
+        if len(hits) == 1:
+            return {"discord_id": str(hits[0].id)}
+        if hits:
+            return {"discord_id": str(hits[0].id)}
+        if matches and len(matches) == 1:
+            return {"discord_id": str(matches[0].id)}
+    except Exception as exc:
+        print(f"[password-reset] query_members: {exc}")
+
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        url = f"https://discord.com/api/v10/guilds/{guild.id}/members/search"
+        async with session.get(
+            url,
+            params={"query": raw[:100], "limit": 10},
+            headers={"Authorization": f"Bot {TOKEN}", "User-Agent": "MCWV-Bot/1.0"},
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as res:
+            data = await res.json(content_type=None)
+        rows = data if isinstance(data, list) else []
+        for row in rows:
+            user = row.get("user") if isinstance(row, dict) else None
+            if not isinstance(user, dict):
+                continue
+            names = [user.get("username"), user.get("global_name"), row.get("nick")]
+            if any(str(n).strip().lower() == needle for n in names if n):
+                return {"discord_id": str(user.get("id"))}
+        if len(rows) == 1:
+            uid = ((rows[0] or {}).get("user") or {}).get("id")
+            if uid:
+                return {"discord_id": str(uid)}
+    except Exception as exc:
+        print(f"[password-reset] rest search: {exc}")
+
+    print(f"[password-reset] lookup miss for {raw!r}")
+    return {"discord_id": None}
+
+
+@app.route("/admin/password-reset/dm", methods=["POST"])
+@require_admin_api_key
+def admin_password_reset_dm():
+    body = request.get_json(silent=True) or {}
+    discord_id = body.get("discord_id") or body.get("discordId")
+    reset_url = str(body.get("reset_url") or body.get("resetUrl") or "").strip()
+    if not discord_id or not reset_url.startswith("https://"):
+        return jsonify({"error": "discord_id and https reset_url are required"}), 400
+    try:
+        future = _run_on_bot_loop(_send_password_reset_dm(discord_id, reset_url))
+        return jsonify(future.result(timeout=15))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+async def _send_password_reset_dm(discord_id, reset_url):
+    try:
+        user_id = int(discord_id)
+    except Exception:
+        raise ValueError("discord_id must be numeric")
+    target = None
+    guild = broadcast_primary_guild() or bot.get_guild(GUILD_ID)
+    if guild:
+        target = guild.get_member(user_id)
+        if target is None:
+            try:
+                target = await guild.fetch_member(user_id)
+            except Exception:
+                target = None
+    if target is None:
+        try:
+            target = await bot.fetch_user(user_id)
+        except Exception:
+            target = None
+    if target is None:
+        raise ValueError("Discord user could not be found")
+    embed = discord.Embed(
+        title="MCWV Hub password reset",
+        description=(
+            "Someone asked to reset the Hub password for this Discord.\n\n"
+            "If that was you, open the link below and set a new password. "
+            "You do not need the old one.\n\n"
+            "If this was not you, ignore this message."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Reset link", value=reset_url[:1024], inline=False)
+    embed.set_footer(text="This link expires in 30 minutes.")
+    try:
+        await target.send(embed=embed)
+    except Exception:
+        raise ValueError("Could not DM that Discord user. They may have DMs disabled.")
+    return {"success": True, "sent": True, "discord_id": str(user_id)}
 
 
 def _ticket_row_to_payload(row):
@@ -24958,6 +25114,9 @@ def start_bot_loops():
     if not war_cache_window_loop.is_running():
         war_cache_window_loop.start()
 
+    if not password_reset_outbox_loop.is_running():
+        password_reset_outbox_loop.start()
+
 
 # ---------------- LOOP HEALTH MONITOR + DB HEALTH ----------------
 
@@ -25019,6 +25178,159 @@ async def before_db_keeper_loop():
     await bot.wait_until_ready()
 
 
+def _password_reset_outbox_fetch():
+    if not db_enabled():
+        return []
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS password_reset_outbox (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_username TEXT NOT NULL,
+                    discord_id TEXT,
+                    user_id INTEGER,
+                    token_hash TEXT NOT NULL,
+                    reset_url TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    sent_at TIMESTAMPTZ,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            try:
+                cur.execute("ALTER TABLE password_reset_tokens ALTER COLUMN user_id DROP NOT NULL")
+            except Exception:
+                conn.rollback()
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS password_reset_outbox (
+                        id BIGSERIAL PRIMARY KEY,
+                        discord_username TEXT NOT NULL,
+                        discord_id TEXT,
+                        user_id INTEGER,
+                        token_hash TEXT NOT NULL,
+                        reset_url TEXT NOT NULL,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        sent_at TIMESTAMPTZ,
+                        error TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+            cur.execute("""
+                SELECT id, discord_username, discord_id, user_id, token_hash, reset_url
+                FROM password_reset_outbox
+                WHERE sent_at IS NULL
+                  AND expires_at > NOW()
+                  AND (error IS NULL OR created_at > NOW() - INTERVAL '10 minutes')
+                ORDER BY id ASC
+                LIMIT 10
+            """)
+            rows = cur.fetchall()
+        conn.commit()
+        return rows
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[password-reset] outbox fetch: {exc}")
+        return []
+
+
+def _password_reset_outbox_mark(row_id, *, sent=False, error=None, discord_id=None, user_id=None):
+    if not db_enabled():
+        return
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE password_reset_outbox
+                SET sent_at = CASE WHEN %s THEN NOW() ELSE sent_at END,
+                    error = COALESCE(%s, error),
+                    discord_id = COALESCE(%s, discord_id),
+                    user_id = COALESCE(%s, user_id),
+                    reset_url = CASE WHEN %s THEN '' ELSE reset_url END
+                WHERE id = %s
+            """, (sent, error, discord_id, user_id, sent, int(row_id)))
+            if user_id:
+                cur.execute("""
+                    UPDATE password_reset_tokens
+                    SET user_id = %s
+                    WHERE token_hash = (
+                        SELECT token_hash FROM password_reset_outbox WHERE id = %s
+                    )
+                      AND user_id IS NULL
+                """, (int(user_id), int(row_id)))
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[password-reset] outbox mark: {exc}")
+
+
+def _password_reset_user_by_discord(discord_id):
+    if not db_enabled() or not discord_id:
+        return None
+    try:
+        ensure_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM users
+                WHERE TRIM(discord_id::text) = %s
+                  AND password_hash IS NOT NULL
+                  AND password_hash LIKE '$2%%'
+                LIMIT 1
+            """, (str(discord_id),))
+            row = cur.fetchone()
+        return int(row[0]) if row else None
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[password-reset] user by discord: {exc}")
+        return None
+
+
+@tasks.loop(seconds=10)
+async def password_reset_outbox_loop():
+    """Send Hub password-reset DMs queued in the shared DB (no HTTP to the bot)."""
+    await bot.wait_until_ready()
+    rows = await asyncio.to_thread(_password_reset_outbox_fetch)
+    for row in rows or []:
+        row_id, uname, did, uid, _token_hash, reset_url = row
+        try:
+            if not did:
+                looked = await _lookup_discord_username(uname)
+                did = (looked or {}).get("discord_id")
+            if not did:
+                await asyncio.to_thread(_password_reset_outbox_mark, row_id, sent=True, error="discord user not found")
+                continue
+            if not uid:
+                uid = await asyncio.to_thread(_password_reset_user_by_discord, did)
+            if not uid:
+                await asyncio.to_thread(_password_reset_outbox_mark, row_id, sent=True, error="no hub login", discord_id=str(did))
+                continue
+            await _send_password_reset_dm(did, reset_url)
+            await asyncio.to_thread(
+                _password_reset_outbox_mark,
+                row_id,
+                sent=True,
+                discord_id=str(did),
+                user_id=int(uid),
+            )
+        except Exception as exc:
+            print(f"[password-reset] outbox send {row_id}: {exc}")
+            await asyncio.to_thread(_password_reset_outbox_mark, row_id, error=str(exc)[:300], discord_id=str(did) if did else None)
+
+
+@password_reset_outbox_loop.before_loop
+async def before_password_reset_outbox_loop():
+    await bot.wait_until_ready()
+
+
 ALL_LOOPS = [
     ("Presence", "check_loop"),
     ("War Poll", "war_poll_loop"),
@@ -25039,6 +25351,7 @@ ALL_LOOPS = [
     ("Interaction Cache", "interaction_cache_refresh_loop"),
     ("Event Loop Watchdog", "event_loop_watchdog"),
     ("War Cache", "war_cache_window_loop"),
+    ("Password Reset DMs", "password_reset_outbox_loop"),
 ]
 
 
