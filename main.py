@@ -16165,6 +16165,356 @@ async def cachedbstats(interaction: discord.Interaction):
 
 
 
+MCWV_IDEAS_CHANNEL_ID = int(os.environ.get("MCWV_IDEAS_CHANNEL_ID", "1544004975452225607") or "1544004975452225607")
+_idea_cooldown = {}
+
+
+def db_ensure_ideas_table():
+    if not db_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mcwv_ideas (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_id BIGINT NOT NULL,
+                    username TEXT,
+                    category TEXT,
+                    title TEXT,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[ideas] table: {exc}")
+
+
+def db_idea_insert(discord_id, username, category, title, body):
+    db_ensure_ideas_table()
+    if not db_enabled():
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO mcwv_ideas (discord_id, username, category, title, body)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (int(discord_id), str(username or "")[:80], str(category or "")[:40], str(title or "")[:120], str(body or "")[:2000]),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return int(row[0]) if row else None
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[ideas] insert: {exc}")
+        return None
+
+
+def db_idea_set_status(idea_id, status):
+    if not db_enabled() or not idea_id:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE mcwv_ideas SET status = %s WHERE id = %s", (str(status)[:24], int(idea_id)))
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+async def _ideas_owner_user():
+    guild = bot.get_guild(GUILD_ID)
+    owner_id = guild.owner_id if guild else None
+    if not owner_id:
+        return None
+    user = bot.get_user(owner_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(owner_id)
+        except Exception:
+            user = None
+    return user
+
+
+def _idea_parse_footer(interaction):
+    rid = uid = None
+    embeds = list(getattr(interaction.message, "embeds", None) or [])
+    if embeds:
+        footer = str(getattr(embeds[0].footer, "text", None) or "")
+        m = re.search(r"idea:(\d+)", footer)
+        if m:
+            rid = int(m.group(1))
+        m = re.search(r"user:(\d+)", footer)
+        if m:
+            uid = int(m.group(1))
+    return rid, uid
+
+
+class IdeaSubmitModal(discord.ui.Modal, title="Submit an idea"):
+    category = discord.ui.TextInput(
+        label="Type",
+        placeholder="bot / games / website / server",
+        required=True,
+        max_length=40,
+    )
+    title_in = discord.ui.TextInput(
+        label="Short title",
+        placeholder="e.g. /checkplayer war filter",
+        required=True,
+        max_length=80,
+    )
+    body = discord.ui.TextInput(
+        label="The idea",
+        style=discord.TextStyle.paragraph,
+        placeholder="What should we add or change? Keep it about MCWV bot, games, the site, or the server.",
+        required=True,
+        max_length=1500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        cat = str(self.category.value or "").strip()[:40]
+        title = str(self.title_in.value or "").strip()[:80]
+        body = str(self.body.value or "").strip()[:1500]
+        if not body:
+            return await interaction.followup.send("Write the idea first.", ephemeral=True)
+
+        idea_id = db_idea_insert(interaction.user.id, interaction.user.name, cat, title, body)
+        owner = await _ideas_owner_user()
+        if owner is None:
+            return await interaction.followup.send("Couldn't find the owner to DM. Ping them.", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"💡 {title}",
+            description=body,
+            color=discord.Color.from_rgb(147, 110, 255),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="From", value=f"{interaction.user.mention}\n`{interaction.user}` · `{interaction.user.id}`", inline=True)
+        embed.add_field(name="Type", value=f"`{cat}`", inline=True)
+        embed.set_footer(text=f"idea:{idea_id or 0} | user:{interaction.user.id}")
+
+        try:
+            await owner.send(embed=embed, view=IdeaOwnerView())
+        except Exception:
+            return await interaction.followup.send(
+                "Couldn't DM the owner (their DMs might be closed). Ping them in the server.",
+                ephemeral=True,
+            )
+
+        ops_log_soon(
+            "tickets",
+            title="New idea",
+            description=f"**{title}** from {interaction.user.mention}",
+            level="info",
+            fields=[{"name": "Type", "value": cat, "inline": True}],
+        )
+        await interaction.followup.send("✅ Sent to the owner.", ephemeral=True)
+
+
+class IdeaReplyModal(discord.ui.Modal, title="Reply to the idea"):
+    def __init__(self, submitter_id, idea_title):
+        super().__init__()
+        self.submitter_id = int(submitter_id)
+        self.idea_title = idea_title
+        self.message = discord.ui.TextInput(
+            label="Message to them",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        text = str(self.message.value or "").strip()
+        try:
+            user = await bot.fetch_user(self.submitter_id)
+            await user.send(
+                f"**Reply on your idea** `{self.idea_title}`\n\n{text}"
+            )
+        except Exception:
+            return await interaction.followup.send("Couldn't DM them.", ephemeral=True)
+        await interaction.followup.send("Sent.", ephemeral=True)
+
+
+class IdeaNoModal(discord.ui.Modal, title="Turn down the idea"):
+    def __init__(self, submitter_id, idea_id, idea_title):
+        super().__init__()
+        self.submitter_id = int(submitter_id)
+        self.idea_id = idea_id
+        self.idea_title = idea_title
+        self.reason = discord.ui.TextInput(
+            label="Reason (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+            placeholder="Not doing this because…",
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        db_idea_set_status(self.idea_id, "no")
+        reason = str(self.reason.value or "").strip()
+        note = f"\n\n{reason}" if reason else ""
+        try:
+            user = await bot.fetch_user(self.submitter_id)
+            await user.send(f"Your idea `{self.idea_title}` isn't being taken forward.{note}")
+        except Exception:
+            pass
+        try:
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.dark_grey()
+            embed.title = f"❌ No — {self.idea_title}"
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+        await interaction.followup.send("Marked no.", ephemeral=True)
+
+
+class IdeaOwnerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _owner_only(self, interaction: discord.Interaction):
+        guild = bot.get_guild(GUILD_ID)
+        if not guild or interaction.user.id != guild.owner_id:
+            await interaction.response.send_message("Owner only.", ephemeral=True)
+            return False
+        return True
+
+    async def _notify_submitter(self, user_id, text):
+        try:
+            user = await bot.fetch_user(int(user_id))
+            await user.send(text)
+            return True
+        except Exception:
+            return False
+
+    @discord.ui.button(label="Doing it", style=discord.ButtonStyle.success, custom_id="mcwv_idea_doing")
+    async def doing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_only(interaction):
+            return
+        await interaction.response.defer()
+        idea_id, user_id = _idea_parse_footer(interaction)
+        db_idea_set_status(idea_id, "doing")
+        title = interaction.message.embeds[0].title if interaction.message.embeds else "your idea"
+        title = re.sub(r"^💡\s*", "", str(title))
+        await self._notify_submitter(user_id, f"Your idea `{title}` is being worked on.")
+        try:
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.green()
+            embed.title = f"✅ Doing — {title}"
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger, custom_id="mcwv_idea_no")
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_only(interaction):
+            return
+        idea_id, user_id = _idea_parse_footer(interaction)
+        title = interaction.message.embeds[0].title if interaction.message.embeds else "your idea"
+        title = re.sub(r"^💡\s*", "", str(title))
+        await interaction.response.send_modal(IdeaNoModal(user_id or 0, idea_id, title))
+
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.primary, custom_id="mcwv_idea_done")
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_only(interaction):
+            return
+        await interaction.response.defer()
+        idea_id, user_id = _idea_parse_footer(interaction)
+        db_idea_set_status(idea_id, "done")
+        title = interaction.message.embeds[0].title if interaction.message.embeds else "your idea"
+        title = re.sub(r"^💡\s*", "", str(title))
+        await self._notify_submitter(user_id, f"Your idea `{title}` is done.")
+        try:
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.gold()
+            embed.title = f"🏁 Done — {title}"
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Reply", style=discord.ButtonStyle.secondary, custom_id="mcwv_idea_reply")
+    async def reply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._owner_only(interaction):
+            return
+        _idea_id, user_id = _idea_parse_footer(interaction)
+        title = interaction.message.embeds[0].title if interaction.message.embeds else "your idea"
+        title = re.sub(r"^💡\s*", "", str(title))
+        if not user_id:
+            return await interaction.response.send_message("No submitter on this card.", ephemeral=True)
+        await interaction.response.send_modal(IdeaReplyModal(user_id, title))
+
+
+class IdeaPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Submit idea", style=discord.ButtonStyle.success, custom_id="mcwv_idea_submit")
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now = time.time()
+        last = _idea_cooldown.get(interaction.user.id, 0)
+        if now - last < 90:
+            return await interaction.response.send_message(
+                f"Wait **{int(90 - (now - last))}s** before another idea.",
+                ephemeral=True,
+            )
+        _idea_cooldown[interaction.user.id] = now
+        await interaction.response.send_modal(IdeaSubmitModal())
+
+
+async def send_ideas_panel(channel):
+    embed = discord.Embed(
+        title="💡 Ideas",
+        description=(
+            "For **MCWV Bot**, **MCWV Games**, the **website**, and other **server** stuff only.\n\n"
+            "Not war strats. Not “add me”. Not random clan drama.\n\n"
+            "Press **Submit idea** — it DMs the owner. You'll get a reply if it's being done, turned down, or finished."
+        ),
+        color=discord.Color.from_rgb(147, 110, 255),
+    )
+    embed.set_footer(text="MCWV")
+    await channel.send(embed=embed, view=IdeaPanelView())
+
+
+
+@bot.tree.command(name="ideas_panel", description="Post the ideas panel in the ideas channel", guild=guild_obj)
+@app_commands.describe(channel="Defaults to the ideas channel")
+async def ideas_panel(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    await interaction.response.defer(ephemeral=True)
+    if not has_mcwv_ticket_staff_permission(interaction.user):
+        return await interaction.followup.send("❌ Staff only.", ephemeral=True)
+    target = channel or interaction.guild.get_channel(MCWV_IDEAS_CHANNEL_ID)
+    if target is None and interaction.guild:
+        try:
+            target = await interaction.guild.fetch_channel(MCWV_IDEAS_CHANNEL_ID)
+        except Exception:
+            target = None
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.followup.send("❌ Ideas channel not found.", ephemeral=True)
+    try:
+        await send_ideas_panel(target)
+    except Exception as exc:
+        return await interaction.followup.send(f"❌ Could not send panel: `{type(exc).__name__}: {exc}`", ephemeral=True)
+    await interaction.followup.send(f"✅ Ideas panel posted in {target.mention}.", ephemeral=True)
+
+
 @bot.tree.command(name="ticket_panel_send", description="Send the MCWV application ticket panel", guild=guild_obj)
 @app_commands.describe(
     channel="Channel to send the panel in. Defaults to configured panel channel.",
@@ -25063,6 +25413,8 @@ async def on_ready():
         bot.add_view(TicketWelcomeView("persistent"))
         bot.add_view(ApplicationReviewView("persistent"))
         bot.add_view(ClanReviewView())
+        bot.add_view(IdeaPanelView())
+        bot.add_view(IdeaOwnerView())
         print("✅ MCWV ticket views registered")
     except Exception as e:
         print(f"❌ Failed to register ticket views: {e}")
