@@ -16379,7 +16379,7 @@ class IdeaNoModal(discord.ui.Modal, title="Turn down the idea"):
         try:
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.dark_grey()
-            embed.title = f"❌ No — {self.idea_title}"
+            embed.title = f"❌ No - {self.idea_title}"
             await interaction.message.edit(embed=embed, view=None)
         except Exception:
             pass
@@ -16418,7 +16418,7 @@ class IdeaOwnerView(discord.ui.View):
         try:
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.green()
-            embed.title = f"✅ Doing — {title}"
+            embed.title = f"✅ Doing - {title}"
             await interaction.message.edit(embed=embed, view=self)
         except Exception:
             pass
@@ -16445,7 +16445,7 @@ class IdeaOwnerView(discord.ui.View):
         try:
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.gold()
-            embed.title = f"🏁 Done — {title}"
+            embed.title = f"🏁 Done - {title}"
             await interaction.message.edit(embed=embed, view=None)
         except Exception:
             pass
@@ -16484,11 +16484,17 @@ async def send_ideas_panel(channel):
         title="💡 Ideas",
         description=(
             "For **MCWV Bot**, **MCWV Games**, the **website**, and other **server** stuff only.\n\n"
-            "Not war strats. Not “add me”. Not random clan drama.\n\n"
-            "Press **Submit idea** — it DMs the owner. You'll get a reply if it's being done, turned down, or finished."
+            "Not war strats. Not “add me”. Not random clan drama."
         ),
         color=discord.Color.from_rgb(147, 110, 255),
     )
+    guild = getattr(channel, "guild", None)
+    icon = None
+    if guild and getattr(guild, "icon", None):
+        icon = str(guild.icon.url)
+    if not icon:
+        icon = f"{HUB_BASE_URL}/mcwv-logo.png"
+    embed.set_thumbnail(url=icon)
     embed.set_footer(text="MCWV")
     await channel.send(embed=embed, view=IdeaPanelView())
 
