@@ -232,22 +232,35 @@ def freeze_mcwv_war_from_last_snapshot(battle_id):
                     ORDER BY roblox_id, captured_at DESC
                 """, (key, end_time, end_time, key, end_time))
                 rows = cur.fetchall()
+            cur.execute("""
+                ALTER TABLE cross_clan_player_history
+                    ADD COLUMN IF NOT EXISTS clan_member_rank INTEGER
+            """)
+            cur.execute("""
+                ALTER TABLE cross_clan_player_history
+                    ADD COLUMN IF NOT EXISTS clan_member_count INTEGER
+            """)
             n = 0
+            clan_size = len(rows or [])
             for rid, uname, pts, rank in rows or []:
                 rid = str(rid or "").strip()
                 if not rid:
                     continue
+                # NEVER write clan-local rank into `rank` — that column is global CW rank.
+                # Snapshot position lives in clan_member_rank / clan_member_count (67/75).
                 cur.execute("""
                     INSERT INTO cross_clan_player_history
                         (roblox_id, battle_id, battle_name, clan_name, points, rank,
-                         total_contributors, clan_place, earned_medal, start_time)
-                    VALUES (%s, %s, %s, %s, %s, %s, NULL, NULL, FALSE, NULL)
+                         total_contributors, clan_place, earned_medal, start_time,
+                         clan_member_rank, clan_member_count)
+                    VALUES (%s, %s, %s, %s, %s, NULL, NULL, NULL, FALSE, NULL, %s, %s)
                     ON CONFLICT (roblox_id, battle_id, clan_name)
                     DO UPDATE SET
                         points = GREATEST(cross_clan_player_history.points, EXCLUDED.points),
-                        rank = COALESCE(EXCLUDED.rank, cross_clan_player_history.rank),
+                        clan_member_rank = COALESCE(EXCLUDED.clan_member_rank, cross_clan_player_history.clan_member_rank),
+                        clan_member_count = COALESCE(EXCLUDED.clan_member_count, cross_clan_player_history.clan_member_count),
                         cached_at = NOW()
-                """, (rid, str(battle_id), str(battle_id), CLAN_NAME, int(pts or 0), rank))
+                """, (rid, str(battle_id), str(battle_id), CLAN_NAME, int(pts or 0), rank, clan_size))
                 cur.execute("""
                     INSERT INTO cross_clan_participants (battle_id, clan_name, roblox_id, place, captured_at)
                     VALUES (%s, %s, %s, NULL, NOW())
@@ -605,8 +618,17 @@ def get_cached_player_history(roblox_id):
             # Equality on roblox_id uses cross_clan_history_roblox_idx.
             # TRIM() forced a seq scan of 900k+ rows and hit statement_timeout.
             cur.execute("""
+                ALTER TABLE cross_clan_player_history
+                    ADD COLUMN IF NOT EXISTS clan_member_rank INTEGER
+            """)
+            cur.execute("""
+                ALTER TABLE cross_clan_player_history
+                    ADD COLUMN IF NOT EXISTS clan_member_count INTEGER
+            """)
+            cur.execute("""
                 SELECT battle_id, battle_name, clan_name, points, rank,
-                       total_contributors, clan_place, earned_medal, start_time
+                       total_contributors, clan_place, earned_medal, start_time,
+                       clan_member_rank, clan_member_count
                 FROM cross_clan_player_history
                 WHERE roblox_id = %s
                 ORDER BY start_time DESC NULLS LAST, battle_id DESC
@@ -626,6 +648,8 @@ def get_cached_player_history(roblox_id):
                 "clanPlace": r[6],
                 "earnedMedal": bool(r[7]),
                 "startTime": int(r[8]) if r[8] else 0,
+                "clanMemberRank": int(r[9]) if r[9] not in (None, 0) else None,
+                "clanMemberCount": int(r[10]) if r[10] not in (None, 0) else None,
                 "betterThan": cw_better_pct(rank, total),
             })
         # One row per war: MCWV wins over a stale other-clan row.
@@ -811,7 +835,7 @@ def _insert_raw_contributions(conn, rows):
                 ON CONFLICT (roblox_id, battle_id, clan_name)
                 DO UPDATE SET
                     points = GREATEST(cross_clan_player_history.points, EXCLUDED.points),
-                    clan_place = COALESCE(EXCLUDED.clan_place, cross_clan_player_history.clan_place),
+                    clan_place = COALESCE(cross_clan_player_history.clan_place, EXCLUDED.clan_place),
                     earned_medal = cross_clan_player_history.earned_medal OR EXCLUDED.earned_medal,
                     start_time = COALESCE(EXCLUDED.start_time, cross_clan_player_history.start_time),
                     cached_at = NOW()
@@ -983,10 +1007,10 @@ async def war_cache_window_loop():
             # keep trying a full scan until one completes.
             if not db_get_setting(f"mcwv_war_cache_post_{key}"):
                 db_set_setting(f"mcwv_war_cache_post_{key}", str(int(now)))
-                try:
-                    await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
-                except Exception as exc:
-                    print(f"[war-cache] post-end freeze failed: {exc}")
+            try:
+                await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
+            except Exception as exc:
+                print(f"[war-cache] post-end freeze failed: {exc}")
             if db_get_setting(f"mcwv_war_scan_complete_{key}") != "1" and not _get_scan_lock().locked():
                 admin_log("War Cache Post-End Scan", f"{battle_id}: schedule ended, API still live — full capture queued.")
                 queue_full_scan(battle_id, include_participants=True, label=f"post-end:{battle_id}")
