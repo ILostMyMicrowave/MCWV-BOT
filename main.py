@@ -23207,6 +23207,45 @@ def build_placement_embed(old_rank, new_rank, points):
     return embed
 
 
+async def upload_hub_media(png_bytes, filename="mcwv-placement.png"):
+    """Host a PNG on the hub so web push / inbox can use a public URL.
+
+    Discord attachments expire. Push `image` must be https, not a data URI.
+    """
+    if not HUB_BASE_URL or not png_bytes:
+        return None
+    api_key = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
+    if not api_key:
+        return None
+    try:
+        global session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+        form = aiohttp.FormData()
+        form.add_field(
+            "file",
+            png_bytes,
+            filename=str(filename or "mcwv-placement.png"),
+            content_type="image/png",
+        )
+        async with session.post(
+            f"{HUB_BASE_URL}/api/internal/media",
+            data=form,
+            headers={"X-Admin-API-Key": api_key},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as res:
+            if res.status != 200:
+                text = await res.text()
+                print(f"[hub media] HTTP {res.status}: {text[:200]}")
+                return None
+            data = await res.json(content_type=None)
+            url = str((data or {}).get("url") or "").strip()
+            return url if url.startswith("https://") else None
+    except Exception as exc:
+        print(f"[hub media] upload failed: {exc}")
+        return None
+
+
 async def trigger_hub_push(event, title=None, body=None, url=None, tag=None, image=None):
     """Fire a push notification to all Hub subscribers instantly via the
     bot-to-hub server endpoint. Best-effort: failures are logged but never
@@ -23245,18 +23284,22 @@ async def trigger_hub_push(event, title=None, body=None, url=None, tag=None, ima
 
 
 async def send_placement_alert(snapshot, old_rank):
+    """Post the Discord card. Returns (ok, hub_image_url)."""
     channel_id = get_placement_channel_id()
     if not channel_id:
-        return False
+        return False, None
     channel = await _maybe_get_channel(channel_id)
     if not isinstance(channel, discord.TextChannel):
         print(f"[placement] channel not found/not text: {channel_id}")
-        return False
+        return False, None
     image = await generate_placement_card(old_rank, snapshot["rank"], snapshot["points"], snapshot.get("icon"))
+    png_bytes = image.getvalue()
+    image.seek(0)
     file = discord.File(image, filename="mcwv-placement.png")
     embed = build_placement_embed(old_rank, snapshot["rank"], snapshot["points"])
     await channel.send(embed=embed, file=file)
-    return True
+    media_url = await upload_hub_media(png_bytes, "mcwv-placement.png")
+    return True, media_url
 
 
 @tasks.loop(seconds=30)
@@ -23287,17 +23330,18 @@ async def placement_alert_loop():
         save_placement_state(battle_id, rank, points, announced=False)
         return
     try:
-        if await send_placement_alert(snapshot, old_rank):
+        sent, card_url = await send_placement_alert(snapshot, old_rank)
+        if sent:
             save_placement_state(battle_id, rank, points, announced=True)
             print(f"[placement] alert sent {battle_id}: {old_rank}->{rank} points={points}")
-            # Fire instant push for placement changes.
             improved = rank < old_rank
             await trigger_hub_push(
                 "placement",
                 title=f"MCWV #{rank}",
-                body=f"{'Up' if improved else 'Down'} from #{old_rank} · {format_compact_points(points)} pts",
+                body=f"{'Up' if improved else 'Down'} from #{old_rank} - {format_compact_points(points)} pts",
                 url="/war-info",
                 tag=f"placement-{battle_id}".lower()[:48],
+                image=card_url,
             )
         else:
             save_placement_state(battle_id, rank, points, announced=False)
