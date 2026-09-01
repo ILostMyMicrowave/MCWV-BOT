@@ -5383,6 +5383,22 @@ def cw_better_pct(rank, total):
         return None
     return (total - rank) / total * 100
 
+
+def clan_roster_label(row):
+    """Frozen in-clan position at war end, e.g. 67/75. Not live roster, not clan Place."""
+    if not isinstance(row, dict):
+        return None
+    cr = row.get("clanMemberRank")
+    cc = row.get("clanMemberCount")
+    try:
+        cr = int(cr or 0)
+        cc = int(cc or 0)
+    except Exception:
+        return None
+    if cr > 0 and cc > 0:
+        return f"{cr}/{cc} in clan"
+    return None
+
 def format_duration(since: datetime) -> str:
     delta = datetime.now(timezone.utc) - since
     total = int(delta.total_seconds())
@@ -13076,10 +13092,13 @@ def build_checkplayer_embed(data, page=0, per_page=7):
             place = row.get("clanPlace")
             clan_display = f"**{clan}**" if clan.upper() == CLAN_NAME.upper() else clan
             participated = row.get("participated_only")
+            roster = clan_roster_label(row)
+            place_str = f" \u00b7 {roster}" if roster else (
+                f" \u00b7 placed #{int(place)}" if place and place not in (None, "", 0) else ""
+            )
 
             if participated:
                 # Participated but no score data (from AwardUserIDs)
-                place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
                 line1 = f"`{title}` \u2014 {clan_display}"
                 line2 = f"\u2713 participated (no score data){place_str}"
             elif rank > 0 and total > 1:
@@ -13096,16 +13115,14 @@ def build_checkplayer_embed(data, page=0, per_page=7):
                     better_txt = f"\U0001f7e1 {pct:.2f}%"
                 else:
                     better_txt = f"\U0001f534 _{pct:.2f}%_"
-                place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
                 line1 = f"`{title}` \u2014 {clan_display}"
                 stats_parts = [f"**{format_cw_points(pts)}**", rank_txt, f"{better_txt} better"]
-                if place_str:
-                    stats_parts.append(f"clan #{int(place)}")
+                if roster:
+                    stats_parts.append(roster)
                 line2 = " \u00b7 ".join(stats_parts)
             else:
-                place_str = f" \u00b7 clan #{int(place)}" if place and place not in (None, "", 0) else ""
                 line1 = f"`{title}` \u2014 {clan_display}"
-                line2 = f"{format_points(pts)} pts{place_str}"
+                line2 = f"{format_cw_points(pts)} pts{place_str}"
 
             projected = len("\n".join(table_lines + [line1, line2]))
             if projected > MAX_FIELD_LEN:
@@ -13467,7 +13484,9 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
             if rank > 0 and total_c > 1:
                 d.text((C_RANK, y + sc(2)), f"#{rank:,}/{total_c:,}", font=F["stats"], fill=(170, 180, 205, 255))
             if place and place not in (None, "", 0):
-                d.text((C_RANK, y + sc(22)), f"clan #{int(place)}", font=F["stats"], fill=(115, 125, 145, 255))
+                roster = clan_roster_label(row)
+                if roster:
+                    d.text((C_RANK, y + sc(22)), roster, font=F["stats"], fill=(115, 125, 145, 255))
 
             # Percentile bar
             bar_y = y + sc(14)
