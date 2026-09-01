@@ -13264,281 +13264,400 @@ class CheckPlayerView(discord.ui.View):
         await self._move(interaction, 1)
 
 
+_CHECKPLAYER_AVATAR_CACHE = {}
+
+
+async def _checkplayer_load_avatar(avatar_url, size):
+    """Headshot with a tiny in-process cache so page flips don't re-download."""
+    if not avatar_url:
+        return None
+    raw = _CHECKPLAYER_AVATAR_CACHE.get(avatar_url)
+    if raw is None:
+        try:
+            global session
+            if session is None or session.closed:
+                session = aiohttp.ClientSession()
+            async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=8)) as res:
+                if res.status != 200:
+                    return None
+                raw = await res.read()
+            _CHECKPLAYER_AVATAR_CACHE[avatar_url] = raw
+            while len(_CHECKPLAYER_AVATAR_CACHE) > 40:
+                _CHECKPLAYER_AVATAR_CACHE.pop(next(iter(_CHECKPLAYER_AVATAR_CACHE)))
+        except Exception:
+            return None
+    try:
+        av = Image.open(BytesIO(raw)).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        av.putalpha(mask)
+        return av
+    except Exception:
+        return None
+
+
+def _checkplayer_pct_color(pct):
+    if pct >= 95:
+        return (239, 198, 58)
+    if pct >= 80:
+        return (74, 222, 128)
+    if pct >= 50:
+        return (250, 200, 60)
+    return (255, 108, 108)
+
+
 async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
-    """Generate a polished dashboard image for /checkplayer.
-    Clean card UI: galaxy bg, avatar, header section, battle rows, summary."""
+    """War-history card for /checkplayer.
+
+    Table layout (not a pile of overlapping columns): battle, clan, points,
+    exact global rank, frozen in-clan rank, better-than bar. Renders at 2x.
+    """
     S = 2
-    rows = data["rows"]
-    page_rows = rows[page * per_page : page * per_page + per_page]
+    rows = data["rows"] or []
+    page_rows = rows[page * per_page: page * per_page + per_page]
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    has_summary = page >= total_pages - 1 and bool(data.get("rank_values"))
 
     def sc(v):
         return int(round(v * S))
 
-    # ---- Layout ----
-    W = 1200 * S
-    MARGIN = sc(60)
-    RIGHT = W - sc(60)
+    W = 1280 * S
+    MARGIN = sc(40)
+    RIGHT = W - sc(40)
     CONTENT_W = RIGHT - MARGIN
 
-    # Column positions (aligned grid)
-    C_NAME = MARGIN + sc(12)       # battle name
-    C_CLAN = MARGIN + sc(12)       # clan tag (below name)
-    C_PTS = MARGIN + sc(430)       # points column
-    C_RANK = MARGIN + sc(560)      # rank column
-    C_BAR = MARGIN + sc(770)       # percentile bar
-    BAR_W = sc(260)
-    C_PCT = C_BAR + BAR_W + sc(10) # percentile text
+    # Authored at 1x, then scaled. Right edges of numeric columns.
+    C_BATTLE = MARGIN + sc(16)
+    C_PTS_R = MARGIN + sc(430)
+    C_RANK_R = MARGIN + sc(690)
+    C_CLAN_R = MARGIN + sc(820)
+    C_BAR = MARGIN + sc(848)
+    BAR_W = sc(250)
+    C_PCT_R = RIGHT - sc(16)
 
-    # Row heights
-    RH_NORMAL = sc(50)
-    RH_COMPACT = sc(34)
-    HEADER_H = sc(280)
-    FOOTER_H = sc(35)
-    SUMMARY_H = sc(95)
+    RH_NORMAL = sc(58)
+    RH_COMPACT = sc(40)
+    HEADER_H = sc(232)
+    FOOTER_H = sc(38)
+    SUMMARY_H = sc(96)
 
-    # Calculate total height
-    list_h = 0
-    for row in page_rows:
-        list_h += RH_COMPACT if row.get("participated_only") else RH_NORMAL
-    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-    has_summary = page >= total_pages - 1 and data.get("rank_values")
-    H = HEADER_H + max(list_h, sc(40)) + (SUMMARY_H if has_summary else 0) + FOOTER_H + sc(20)
+    list_h = sum(RH_COMPACT if r.get("participated_only") else RH_NORMAL for r in page_rows)
+    H = HEADER_H + max(list_h, sc(48)) + (SUMMARY_H if has_summary else 0) + FOOTER_H
 
-    # ---- Fonts ----
     def font(size, bold=True):
-        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        path = (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        )
         try:
             return ImageFont.truetype(path, sc(size))
         except Exception:
             return ImageFont.load_default()
 
     F = {
-        "name": font(28, True),
-        "sub": font(15, False),
-        "badge": font(16, True),
-        "section": font(18, True),
-        "battle": font(16, True),
-        "stats": font(13, False),
+        "name": font(26, True),
+        "sub": font(13, False),
+        "badge": font(12, True),
+        "chip_lbl": font(9, True),
+        "chip_val": font(14, True),
+        "section": font(13, True),
+        "col": font(10, True),
+        "battle": font(15, True),
+        "clan": font(12, True),
+        "num": font(14, True),
+        "num_sm": font(12, True),
         "pct": font(14, True),
-        "sum_lbl": font(12, False),
+        "sum_lbl": font(10, True),
         "sum_val": font(22, True),
         "sum_sub": font(11, False),
-        "footer": font(12, False),
+        "footer": font(11, False),
     }
 
-    # ---- Accent ----
     if data["is_currently_mcwv"]:
         accent = (74, 222, 128)
     elif data["is_currently_rival"]:
-        accent = (255, 84, 96)
+        accent = (255, 96, 108)
     else:
-        accent = (130, 100, 255)
+        accent = (148, 118, 255)
 
-    # ---- Background ----
     img = cover_image(MCWV_HOURLY_STATS_BG_PATH, (W, H))
-    img.alpha_composite(Image.new("RGBA", (W, H), (3, 5, 16, 130)))
+    img.alpha_composite(Image.new("RGBA", (W, H), (4, 6, 18, 150)))
 
-    # Faint grid
     grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grid)
-    for x in range(0, W, sc(50)):
-        gd.line((x, 0, x, H), fill=(120, 140, 200, 10), width=sc(1))
-    for y in range(0, H, sc(50)):
-        gd.line((0, y, W, y), fill=(120, 140, 200, 7), width=sc(1))
+    for x in range(0, W, sc(48)):
+        gd.line((x, 0, x, H), fill=(120, 140, 200, 12), width=sc(1))
+    for y in range(0, H, sc(48)):
+        gd.line((0, y, W, y), fill=(120, 140, 200, 8), width=sc(1))
     img.alpha_composite(grid)
     await asyncio.sleep(0)
 
-    # ---- Helpers ----
     def panel(box, radius, fill, outline=None, width=1, blur=0):
         layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
-        ld.rounded_rectangle(box, radius=sc(radius), fill=fill,
-                              outline=outline, width=sc(width) if outline else 1)
+        ld.rounded_rectangle(
+            box,
+            radius=sc(radius) if radius >= 4 else radius,
+            fill=fill,
+            outline=outline,
+            width=sc(width) if outline else 1,
+        )
         if blur:
             layer = layer.filter(ImageFilter.GaussianBlur(sc(blur)))
         img.alpha_composite(layer)
 
-    def txt(xy, text, f, fill, shadow=True):
+    def text_w(draw, text, fnt):
+        bb = draw.textbbox((0, 0), str(text), font=fnt)
+        return bb[2] - bb[0]
+
+    def right_text(draw, x, y, text, fnt, fill):
+        text = str(text)
+        draw.text((x - text_w(draw, text, fnt), y), text, font=fnt, fill=fill)
+
+    def txt(xy, text, fnt, fill, shadow=True):
         d = ImageDraw.Draw(img)
         if shadow:
-            d.text((xy[0] + sc(1), xy[1] + sc(1)), text, font=f, fill=(0, 0, 0, 110))
-        d.text(xy, text, font=f, fill=fill)
+            d.text((xy[0] + sc(1), xy[1] + sc(1)), str(text), font=fnt, fill=(0, 0, 0, 120))
+        d.text(xy, str(text), font=fnt, fill=fill)
 
-    # ---- Card panel ----
-    card = (sc(20), sc(20), W - sc(20), H - sc(20))
-    panel((card[0]+sc(4), card[1]+sc(6), card[2]+sc(4), card[3]+sc(6)), 22, (0,0,0,130), blur=6)
-    panel(card, 22, (12, 15, 28, 218), outline=(*accent, 100), width=2)
-    panel((card[0]+sc(2), card[1]+sc(2), card[2]-sc(2), card[3]-sc(2)), 20, (255,255,255,0), outline=(255,255,255,18), width=1)
+    # Card shell
+    card = (sc(16), sc(16), W - sc(16), H - sc(16))
+    panel((card[0] + sc(4), card[1] + sc(6), card[2] + sc(4), card[3] + sc(6)), 22, (0, 0, 0, 120), blur=7)
+    panel(card, 22, (11, 14, 26, 228), outline=(*accent, 110), width=2)
+    panel(
+        (card[0] + sc(2), card[1] + sc(2), card[2] - sc(2), card[3] - sc(2)),
+        20,
+        (255, 255, 255, 0),
+        outline=(255, 255, 255, 20),
+        width=1,
+    )
+
+    # Avatar
+    AV_SIZE = sc(78)
+    AV_X, AV_Y = MARGIN, sc(36)
+    av = await _checkplayer_load_avatar(avatar_url, AV_SIZE)
+    if av is not None:
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).ellipse(
+            (AV_X - sc(5), AV_Y - sc(5), AV_X + AV_SIZE + sc(5), AV_Y + AV_SIZE + sc(5)),
+            fill=(*accent, 40),
+        )
+        img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(sc(5))))
+        img.paste(av, (AV_X, AV_Y), av)
+        ImageDraw.Draw(img).ellipse(
+            (AV_X - sc(2), AV_Y - sc(2), AV_X + AV_SIZE + sc(2), AV_Y + AV_SIZE + sc(2)),
+            outline=(*accent, 190),
+            width=sc(2),
+        )
     await asyncio.sleep(0)
 
-    # ---- Avatar ----
-    AV_SIZE = sc(90)
-    AV_X, AV_Y = MARGIN, sc(55)
-    if avatar_url:
-        try:
-            global session
-            if session is None or session.closed:
-                session = aiohttp.ClientSession()
-            async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=8)) as res:
-                if res.status == 200:
-                    ab = await res.read()
-                    av = Image.open(BytesIO(ab)).convert("RGBA").resize((AV_SIZE, AV_SIZE), Image.Resampling.LANCZOS)
-                    mask = Image.new("L", (AV_SIZE, AV_SIZE), 0)
-                    ImageDraw.Draw(mask).ellipse((0, 0, AV_SIZE-1, AV_SIZE-1), fill=255)
-                    glow = Image.new("RGBA", (W, H), (0,0,0,0))
-                    rg = ImageDraw.Draw(glow)
-                    rg.ellipse((AV_X-sc(6), AV_Y-sc(6), AV_X+AV_SIZE+sc(6), AV_Y+AV_SIZE+sc(6)), fill=(*accent, 35))
-                    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(sc(6))))
-                    img.paste(av, (AV_X, AV_Y), mask)
-                    d = ImageDraw.Draw(img)
-                    d.ellipse((AV_X-sc(2), AV_Y-sc(2), AV_X+AV_SIZE+sc(2), AV_Y+AV_SIZE+sc(2)), outline=(*accent, 170), width=sc(2))
-        except Exception:
-            pass
-    await asyncio.sleep(0)
-
-    # ---- Name + ID ----
-    NAME_X = AV_X + AV_SIZE + sc(20)
-    txt((NAME_X, sc(55)), data["roblox_name"], F["name"], (255, 255, 255, 255))
-    txt((NAME_X, sc(90)), f"ID: {data['roblox_id']}", F["sub"], (150, 160, 180, 255), shadow=False)
-
-    # ---- Status badges ----
-    bx = NAME_X
-    by = sc(115)
-    badges = []
+    NAME_X = AV_X + AV_SIZE + sc(18)
+    txt((NAME_X, sc(34)), data["roblox_name"], F["name"], (252, 253, 255, 255))
+    clan_now = data.get("current_clan_name") or "Unknown"
     if data["is_currently_mcwv"]:
-        badges.append("MCWV")
+        status = "MCWV member"
     elif data["is_currently_rival"]:
-        badges.append(data["current_clan_name"])
-    if data.get("total_battles_agg"):
-        badges.append(f"{data['total_battles_agg']} battles")
+        status = clan_now
+    else:
+        status = "clan unknown"
+    txt((NAME_X, sc(68)), f"ID {data['roblox_id']}  ·  {status}", F["sub"], (158, 168, 188, 255), shadow=False)
 
-    for btext in badges[:4]:
+    # Metric chips
+    rv = data.get("rank_values") or []
+    avg_pct = (sum(r["pct"] for r in rv) / len(rv)) if rv else None
+    last_pts = _safe_int((rows[0] or {}).get("points")) if rows else 0
+    chips = [
+        ("WARS", str(len(rows))),
+        ("MEDALS", str(int(data.get("earned_medals_agg") or 0))),
+    ]
+    if avg_pct is not None:
+        chips.append(("AVG BETTER", f"{avg_pct:.2f}%"))
+    if last_pts:
+        chips.append(("LAST", format_cw_points(last_pts)))
+
+    d = ImageDraw.Draw(img)
+    bx, by = NAME_X, sc(96)
+    for lbl, val in chips[:4]:
+        vw = max(text_w(d, val, F["chip_val"]), text_w(d, lbl, F["chip_lbl"]))
+        bw = vw + sc(20)
+        panel((bx, by, bx + bw, by + sc(38)), 9, (18, 22, 36, 220), outline=(*accent, 55), width=1)
         d = ImageDraw.Draw(img)
-        tw = d.textbbox((0, 0), btext, font=F["badge"])
-        bw = tw[2] - tw[0]
-        panel((bx, by, bx + bw + sc(18), by + sc(26)), 13, (20, 24, 38, 220), outline=(*accent, 80), width=1)
-        d.text((bx + sc(9), by + sc(4)), btext, font=F["badge"], fill=(*accent, 255))
-        bx += bw + sc(18) + sc(7)
+        d.text((bx + sc(10), by + sc(4)), lbl, font=F["chip_lbl"], fill=(140, 150, 170, 255))
+        d.text((bx + sc(10), by + sc(16)), val, font=F["chip_val"], fill=(236, 240, 252, 255))
+        bx += bw + sc(8)
+
+    # Sparkline of better-than across wars (oldest -> newest)
+    spark_pcts = [float(r["pct"]) for r in reversed(rv[-14:])] if len(rv) >= 2 else []
+    if spark_pcts:
+        sx1, sy1 = RIGHT - sc(220), sc(36)
+        sx2, sy2 = RIGHT - sc(8), sc(118)
+        panel((sx1, sy1, sx2, sy2), 10, (16, 20, 34, 210), outline=(90, 100, 140, 70), width=1)
+        d = ImageDraw.Draw(img)
+        d.text((sx1 + sc(10), sy1 + sc(6)), "BETTER THAN", font=F["chip_lbl"], fill=(140, 150, 170, 255))
+        pad = sc(12)
+        inner_w = (sx2 - sx1) - pad * 2
+        inner_h = (sy2 - sy1) - sc(28)
+        n = len(spark_pcts)
+        pts = []
+        for i, pval in enumerate(spark_pcts):
+            px = sx1 + pad + int(inner_w * (i / max(n - 1, 1)))
+            py = sy2 - sc(10) - int(inner_h * max(0.0, min(1.0, pval / 100.0)))
+            pts.append((px, py))
+        glow_l = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(glow_l).line(pts, fill=(*accent, 70), width=sc(6), joint="curve")
+        img.alpha_composite(glow_l.filter(ImageFilter.GaussianBlur(sc(3))))
+        ImageDraw.Draw(img).line(pts, fill=(*accent, 230), width=sc(2), joint="curve")
+        lx, ly = pts[-1]
+        ImageDraw.Draw(img).ellipse((lx - sc(3), ly - sc(3), lx + sc(3), ly + sc(3)), fill=(*accent, 255))
+
+    clans = data.get("clans_seen") or []
+    d = ImageDraw.Draw(img)
+    if clans:
+        hist = "  →  ".join(clans[:10])
+        if len(clans) > 10:
+            hist += f"  +{len(clans) - 10}"
+        hist = fit_text(d, hist, F["sub"], CONTENT_W)
+        txt((MARGIN, sc(148)), hist, F["sub"], (186, 196, 216, 255), shadow=False)
+    elif data.get("been_in_mcwv") and data["is_currently_rival"]:
+        txt((MARGIN, sc(148)), f"Left MCWV  ·  now {clan_now}", F["sub"], (255, 150, 150, 255), shadow=False)
+
+    d = ImageDraw.Draw(img)
+    d.line((MARGIN, sc(172), RIGHT, sc(172)), fill=(80, 90, 120, 70), width=sc(1))
+    txt(
+        (MARGIN, sc(180)),
+        f"WAR HISTORY  ·  {len(rows)} battles  ·  page {page + 1}/{total_pages}",
+        F["section"],
+        (200, 210, 232, 240),
+        shadow=False,
+    )
+
+    # Column headers sit on their own row so they don't crash into the title
+    hy = sc(208)
+    d = ImageDraw.Draw(img)
+    d.text((C_BATTLE, hy), "BATTLE", font=F["col"], fill=(128, 138, 160, 255))
+    right_text(d, C_PTS_R, hy, "POINTS", F["col"], (128, 138, 160, 255))
+    right_text(d, C_RANK_R, hy, "GLOBAL", F["col"], (128, 138, 160, 255))
+    right_text(d, C_CLAN_R, hy, "IN CLAN", F["col"], (128, 138, 160, 255))
+    d.text((C_BAR, hy), "BETTER THAN", font=F["col"], fill=(128, 138, 160, 255))
+
+    # Row plates in one pass so we don't allocate a full-size layer per battle
+    y = HEADER_H
+    row_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rd = ImageDraw.Draw(row_layer)
+    stripe_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(stripe_layer)
+    y_tmp = y
+    for i, row in enumerate(page_rows):
+        participated = bool(row.get("participated_only"))
+        rh = RH_COMPACT if participated else RH_NORMAL
+        clan = str(row.get("clan") or "?")
+        is_mcwv = clan.upper() == str(CLAN_NAME).upper()
+        fill = (22, 26, 42, 175) if i % 2 == 0 else (16, 20, 34, 150)
+        if is_mcwv:
+            fill = (18, 32, 28, 190)
+        rd.rounded_rectangle((MARGIN, y_tmp, RIGHT, y_tmp + rh - sc(6)), radius=sc(10), fill=fill)
+        stripe = accent if is_mcwv else ((90, 98, 120) if participated else (70, 78, 110))
+        sd.rounded_rectangle(
+            (MARGIN, y_tmp + sc(8), MARGIN + sc(5), y_tmp + rh - sc(14)),
+            radius=sc(3),
+            fill=(*stripe, 230),
+        )
+        y_tmp += rh
+    img.alpha_composite(row_layer)
+    img.alpha_composite(stripe_layer)
     await asyncio.sleep(0)
 
-    # ---- Clan history ----
-    clans = data.get("clans_seen", [])[:8]
-    if clans:
-        d = ImageDraw.Draw(img)
-        clan_text = "  \u2192  ".join(clans)
-        clan_text = fit_text(d, clan_text, F["sub"], CONTENT_W)
-        txt((MARGIN, sc(165)), "Clan History", F["section"], (160, 170, 195, 190), shadow=False)
-        txt((MARGIN, sc(190)), clan_text, F["sub"], (210, 220, 245, 255))
-
-    # ---- Separator ----
     d = ImageDraw.Draw(img)
-    d.line((MARGIN, sc(230), RIGHT, sc(230)), fill=(70, 80, 110, 60), width=sc(1))
+    name_max = (C_PTS_R - C_BATTLE) - sc(90)
 
-    # ---- War History header ----
-    txt((MARGIN, sc(248)), f"War History  \u00b7  Page {page+1}/{total_pages}", F["section"], (195, 205, 235, 230))
-
-    # ---- Battle rows ----
-    y = sc(278)
-    for row in page_rows:
+    for i, row in enumerate(page_rows):
         title = _friendly_battle_name(row.get("battleId") or row.get("title") or "?")
         clan = str(row.get("clan") or "?")
         pts = _safe_int(row.get("points"))
         rank = _safe_int(row.get("rank"))
         total_c = _safe_int(row.get("total")) or 0
-        place = row.get("clanPlace")
-        participated = row.get("participated_only")
+        participated = bool(row.get("participated_only"))
         rh = RH_COMPACT if participated else RH_NORMAL
-
-        # Row card
-        panel((MARGIN, y, RIGHT, y + rh - sc(4)), 8, (18, 22, 36, 165))
-        d = ImageDraw.Draw(img)
+        roster = clan_roster_label(row)
+        is_mcwv = clan.upper() == str(CLAN_NAME).upper()
+        medal = bool(row.get("earnedMedal"))
 
         if participated:
-            t_short = fit_text(d, title, F["battle"], sc(390))
-            d.text((C_NAME, y + sc(3)), t_short, font=F["battle"], fill=(170, 180, 205, 255))
-            cc = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (130, 140, 165, 255)
-            d.text((C_PTS, y + sc(5)), f"[{clan}]", font=F["stats"], fill=cc)
-            d.text((C_RANK, y + sc(5)), "participated \u2713", font=F["stats"], fill=(110, 120, 140, 255))
+            t_short = fit_text(d, title, F["battle"], name_max)
+            clan_fill = (*accent, 255) if is_mcwv else (128, 138, 160, 255)
+            d.text((C_BATTLE, y + sc(10)), t_short, font=F["battle"], fill=(168, 176, 196, 255))
+            clan_x = C_BATTLE + text_w(d, t_short, F["battle"]) + sc(10)
+            d.text((clan_x, y + sc(12)), f"[{clan}]", font=F["clan"], fill=clan_fill)
+            right_text(d, C_PTS_R, y + sc(12), "—", F["num"], (120, 128, 148, 255))
+            right_text(d, C_RANK_R, y + sc(12), "participated", F["num_sm"], (120, 128, 148, 255))
+            right_text(d, C_CLAN_R, y + sc(12), roster.split()[0] if roster else "—", F["num_sm"], (120, 128, 148, 255))
         else:
-            pct = cw_better_pct(rank, total_c) or float(row.get("betterThan") or 0)
-            if pct >= 80:
-                bc = (74, 222, 128)
-            elif pct >= 50:
-                bc = (250, 200, 60)
-            else:
-                bc = (255, 100, 100)
+            pct = cw_better_pct(rank, total_c)
+            if pct is None:
+                pct = float(row.get("betterThan") or 0)
+            bc = _checkplayer_pct_color(pct)
+            t_short = fit_text(d, title, F["battle"], name_max - (sc(16) if medal else 0))
+            d.text((C_BATTLE, y + sc(8)), t_short, font=F["battle"], fill=(240, 244, 255, 255))
+            if medal:
+                mx = C_BATTLE + text_w(d, t_short, F["battle"]) + sc(8)
+                my = y + sc(12)
+                d.rounded_rectangle((mx, my, mx + sc(10), my + sc(10)), radius=sc(2), fill=(239, 198, 58, 255))
+            clan_fill = (*accent, 255) if is_mcwv else (150, 160, 182, 255)
+            d.text((C_BATTLE, y + sc(30)), f"[{clan}]", font=F["clan"], fill=clan_fill)
 
-            # Battle name
-            t_short = fit_text(d, title, F["battle"], sc(400))
-            d.text((C_NAME, y + sc(2)), t_short, font=F["battle"], fill=(235, 240, 255, 255))
+            right_text(d, C_PTS_R, y + sc(18), format_cw_points(pts), F["num"], (220, 228, 245, 255))
 
-            # Clan tag
-            cc = (*accent, 255) if clan.upper() == CLAN_NAME.upper() else (130, 140, 165, 255)
-            clan_str = f"[{clan}]"
-            d.text((C_NAME, y + sc(22)), clan_str, font=F["stats"], fill=cc)
-
-            # Points (aligned)
-            d.text((C_PTS, y + sc(2)), format_cw_points(pts), font=F["pct"], fill=(200, 210, 230, 255))
-
-            # Rank (aligned)
             if rank > 0 and total_c > 1:
-                d.text((C_RANK, y + sc(2)), f"#{rank:,}/{total_c:,}", font=F["stats"], fill=(170, 180, 205, 255))
-            if place and place not in (None, "", 0):
-                roster = clan_roster_label(row)
-                if roster:
-                    d.text((C_RANK, y + sc(22)), roster, font=F["stats"], fill=(115, 125, 145, 255))
+                rank_txt = f"#{rank:,}/{total_c:,}"
+                rfont = F["num_sm"] if text_w(d, rank_txt, F["num"]) > sc(175) else F["num"]
+                right_text(d, C_RANK_R, y + sc(18), rank_txt, rfont, (200, 210, 230, 255))
+            else:
+                right_text(d, C_RANK_R, y + sc(18), "—", F["num"], (120, 128, 148, 255))
 
-            # Percentile bar
-            bar_y = y + sc(14)
-            bar_h = sc(8)
-            d.rounded_rectangle((C_BAR, bar_y, C_BAR + BAR_W, bar_y + bar_h), radius=sc(3), fill=(38, 42, 56, 255))
-            fw = int(BAR_W * (pct / 100))
-            if fw > 0:
-                fi = Image.new("RGBA", (fw, bar_h), (0,0,0,0))
-                fd2 = ImageDraw.Draw(fi)
-                for bx2 in range(fw):
-                    t2 = bx2 / max(fw - 1, 1)
-                    s2 = 0.80 + 0.20 * t2
-                    g2 = tuple(min(255, int(bc[i] * s2 + 12 * (1 - t2))) for i in range(3))
-                    fd2.line((bx2, 0, bx2, bar_h), fill=(*g2, 255))
-                fm = Image.new("L", fi.size, 0)
-                ImageDraw.Draw(fm).rounded_rectangle((0, 0, fi.size[0]-1, fi.size[1]-1), radius=sc(3), fill=255)
-                img.paste(fi, (C_BAR, bar_y), fm)
-                d = ImageDraw.Draw(img)
+            clan_txt = roster.split(" ")[0] if roster else "—"
+            right_text(d, C_CLAN_R, y + sc(18), clan_txt, F["num"], (190, 200, 220, 255))
 
-            # Percentile text
-            d.text((C_PCT, y + sc(11)), f"{pct:.2f}%", font=F["pct"], fill=(*bc, 255))
+            bar_y = y + sc(22)
+            bar_h = sc(12)
+            d.rounded_rectangle((C_BAR, bar_y, C_BAR + BAR_W, bar_y + bar_h), radius=sc(4), fill=(32, 36, 52, 255))
+            fw = int(BAR_W * max(0.0, min(1.0, pct / 100.0)))
+            if fw >= sc(4):
+                d.rounded_rectangle((C_BAR, bar_y, C_BAR + fw, bar_y + bar_h), radius=sc(4), fill=(*bc, 255))
+                d.rounded_rectangle(
+                    (C_BAR + sc(2), bar_y + sc(1), C_BAR + max(sc(3), fw - sc(2)), bar_y + sc(4)),
+                    radius=sc(2),
+                    fill=(255, 255, 255, 40),
+                )
+            right_text(d, C_PCT_R, y + sc(16), f"{pct:.2f}%", F["pct"], (*bc, 255))
 
         y += rh
-        await asyncio.sleep(0)
+        if i % 3 == 2:
+            await asyncio.sleep(0)
+            d = ImageDraw.Draw(img)
 
-    # ---- Summary (last page only) ----
     if has_summary:
-        rv = data["rank_values"]
         sp = sorted(rv, key=lambda r: r["pct"], reverse=True)
         best, worst = sp[0], sp[-1]
         avg = sum(r["pct"] for r in rv) / len(rv)
-
         d = ImageDraw.Draw(img)
-        d.line((MARGIN, y, RIGHT, y), fill=(70, 80, 110, 60), width=sc(1))
+        d.line((MARGIN, y, RIGHT, y), fill=(80, 90, 120, 70), width=sc(1))
         y += sc(10)
-
         col_w = CONTENT_W // 3
         items = [
-            ("BEST", f"{best['pct']:.1f}%", f"#{best['rank']:,}/{best['total']:,}", (74, 222, 128)),
-            ("AVERAGE", f"{avg:.1f}%", "better than global", (100, 180, 255)),
-            ("WORST", f"{worst['pct']:.1f}%", f"#{worst['rank']:,}/{worst['total']:,}", (255, 100, 100)),
+            ("BEST", f"{best['pct']:.2f}%", f"#{best['rank']:,}/{best['total']:,}", (74, 222, 128)),
+            ("AVERAGE", f"{avg:.2f}%", f"{len(rv)} ranked wars", (110, 180, 255)),
+            ("WORST", f"{worst['pct']:.2f}%", f"#{worst['rank']:,}/{worst['total']:,}", (255, 108, 108)),
         ]
         for i, (lbl, val, sub, col) in enumerate(items):
             x = MARGIN + i * col_w
             bw = col_w - sc(8)
-            panel((x, y, x + bw, y + sc(72)), 10, (20, 24, 38, 195), outline=(*col, 60), width=1)
+            panel((x, y, x + bw, y + sc(72)), 10, (18, 22, 36, 210), outline=(*col, 70), width=1)
             d = ImageDraw.Draw(img)
-            d.text((x + sc(12), y + sc(6)), lbl, font=F["sum_lbl"], fill=(125, 135, 155, 255))
+            d.text((x + sc(12), y + sc(8)), lbl, font=F["sum_lbl"], fill=(140, 150, 170, 255))
             txt((x + sc(12), y + sc(22)), val, F["sum_val"], (*col, 255))
-            d.text((x + sc(12), y + sc(52)), sub, font=F["sum_sub"], fill=(145, 155, 175, 255))
+            d.text((x + sc(12), y + sc(52)), sub, font=F["sum_sub"], fill=(160, 170, 190, 255))
 
-    # ---- Footer ----
     d = ImageDraw.Draw(img)
     sources = []
     if data.get("cached_rows"):
@@ -13546,23 +13665,21 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
     if data.get("scraped_clans"):
         sources.append("scrape")
     src = " + ".join(sources) if sources else "PS99"
-    ft = f"{src}  \u00b7  {len(rows)} battles"
+    ft = f"{src}  ·  {len(rows)} battles"
     if page == 0:
-        ft += f"  \u00b7  \u26a0\ufe0f {MCWV_HISTORY_INCOMPLETE_NOTE}"
-    d.text((MARGIN, H - sc(25)), ft, font=F["footer"], fill=(135, 145, 170, 210))
+        note = str(MCWV_HISTORY_INCOMPLETE_NOTE)
+        if text_w(d, ft + "  ·  " + note, F["footer"]) < CONTENT_W:
+            ft += f"  ·  {note}"
+        else:
+            ft += "  ·  older wars may be incomplete"
+    d.text((MARGIN, H - sc(26)), ft, font=F["footer"], fill=(140, 150, 172, 210))
 
     await asyncio.sleep(0)
-
-    # ---- Output ----
-    out_w = W // S
-    out_h = H // S
-    img = img.resize((out_w, out_h), Image.Resampling.LANCZOS)
+    img = img.resize((W // S, H // S), Image.Resampling.LANCZOS)
     out = BytesIO()
-    img.save(out, format="PNG")
+    img.save(out, format="PNG", optimize=True)
     out.seek(0)
     return out
-
-
 
 # ---------------- CHECKPLAYER COMMAND ----------------
 
