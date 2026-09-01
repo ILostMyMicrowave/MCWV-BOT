@@ -12764,6 +12764,47 @@ async def gather_player_data(roblox_id, roblox_name):
             except Exception:
                 pass
 
+    # 4b. Live MCWV battles if cache missed (index/timeout) — don't show "no data"
+    # for someone sitting in the clan API.
+    if not cached_rows and mcwv_clan_data:
+        battles = mcwv_clan_data.get("Battles") or mcwv_clan_data.get("battles") or {}
+        live = []
+        rid = str(roblox_id)
+        if isinstance(battles, dict):
+            for bid, battle in battles.items():
+                if not isinstance(battle, dict):
+                    continue
+                contribs = battle.get("PointContributions") or battle.get("pointContributions") or []
+                pts = 0
+                found = False
+                for c in contribs if isinstance(contribs, list) else []:
+                    if not isinstance(c, dict):
+                        continue
+                    if str(c.get("UserID") or c.get("userId") or "") == rid:
+                        pts = _safe_int(c.get("Points") or c.get("points"))
+                        found = True
+                        break
+                awards = battle.get("AwardUserIDs") or battle.get("awardUserIDs") or []
+                if not found and isinstance(awards, list) and rid in {str(x) for x in awards}:
+                    found = True
+                if not found:
+                    continue
+                live.append({
+                    "battleId": str(bid),
+                    "title": _friendly_battle_name(str(bid)),
+                    "clan": CLAN_NAME,
+                    "points": pts,
+                    "rank": None,
+                    "total": None,
+                    "clanPlace": battle.get("Place") or battle.get("place"),
+                    "earnedMedal": bool(battle.get("EarnedMedal") or battle.get("earnedMedal")),
+                    "startTime": _safe_int(battle.get("StartTime") or battle.get("startTime")),
+                    "participated_only": pts <= 0,
+                })
+        if live:
+            print(f"[checkplayer] {roblox_name} — {len(live)} live MCWV battles (cache miss)")
+            cached_rows = live
+
     # 5. Update active battle points from summary
     rows = []
     for row in cached_rows:
