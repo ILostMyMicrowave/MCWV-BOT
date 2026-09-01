@@ -593,20 +593,22 @@ def get_cached_player_history(roblox_id):
     _sync_from_main()
     """Read a player's full cross-clan history from the permanent cache.
     Returns a list of dicts sorted by start time (most recent first).
-    Uses a local connection to avoid race conditions with other loops
-    that close the global conn."""
+    Uses a dedicated connection so we never fight the bot's 1.8s timeout
+    or a live scan writing on `conn`."""
     if not DATABASE_URL:
         return []
-    pass
+    rid = str(roblox_id).strip()
+    c = None
     try:
-        ensure_db_connection()
-        rid = str(roblox_id).strip()
-        with conn.cursor() as cur:
+        c = _open_scan_connection_sync()
+        with c.cursor() as cur:
+            # Equality on roblox_id uses cross_clan_history_roblox_idx.
+            # TRIM() forced a seq scan of 900k+ rows and hit statement_timeout.
             cur.execute("""
                 SELECT battle_id, battle_name, clan_name, points, rank,
                        total_contributors, clan_place, earned_medal, start_time
                 FROM cross_clan_player_history
-                WHERE TRIM(roblox_id::text) = %s
+                WHERE roblox_id = %s
                 ORDER BY start_time DESC NULLS LAST, battle_id DESC
             """, (rid,))
             rows = cur.fetchall()
@@ -645,9 +647,14 @@ def get_cached_player_history(roblox_id):
         return sorted(merged.values(), key=lambda x: (x.get("startTime") or 0, str(x.get("battleId") or "")), reverse=True)
     except Exception as e:
         print(f"[cross-clan cache] player history read failed: {e}")
+        if c is not None:
+            try:
+                c.rollback()
+            except Exception:
+                pass
         return []
     finally:
-        pass
+        _close_scan_connection_sync(c)
 
 
 def get_cached_battle_stats(battle_id):
