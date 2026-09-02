@@ -19844,6 +19844,7 @@ from discord.ext import tasks
 api_semaphore = asyncio.Semaphore(3)
 pending_clan_removals = {}
 CLAN_LEAVE_DISMISSED_KEY = "mcwv_clan_leave_dismissed"
+CLAN_ROSTER_SEEN_KEY = "mcwv_clan_roster_seen"
 
 
 def db_clan_leave_dismissed_ids():
@@ -20307,10 +20308,19 @@ async def clan_leave_loop():
             return
 
         dismissed = db_clan_leave_dismissed_ids()
+        seen_in_game = db_clan_roster_seen_ids()
+        just_seen = []
         for roblox_id, discord_id, roblox_name in users:
             try:
                 rid = str(roblox_id).strip()
                 if int(rid) in clan_member_ids:
+                    just_seen.append(rid)
+                    continue
+
+                # Never-joined: Discord accept happens before they take the
+                # in-game invite. Only alert if we already saw them on the
+                # live roster at least once.
+                if rid not in seen_in_game:
                     continue
 
                 # Skip anyone on an active LOA — they're deliberately not in
@@ -20359,6 +20369,9 @@ async def clan_leave_loop():
 
             except Exception as e:
                 print("Clan leave row error:", e)
+
+        if just_seen:
+            db_clan_roster_mark_seen(just_seen)
 
     except Exception as e:
         print("Clan leave loop error:", e)
@@ -20729,35 +20742,6 @@ class ClanReviewView(discord.ui.View):
                 await interaction.followup.send("Something went wrong while applying LOA.", ephemeral=True)
             except Exception:
                 pass
-
-    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.secondary, custom_id="mcwv_clan_leave_ignore")
-    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._staff_gate(interaction):
-            return
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.defer()
-            rid, did, name = self._parse_target(interaction)
-            if rid:
-                pending_clan_removals.pop(str(rid), None)
-                db_clan_leave_dismiss(rid)
-            done = discord.Embed(
-                title="Ignored",
-                description=f"**{name or rid or 'Unknown'}** — left on the books. Won't re-alert.",
-                color=discord.Color.dark_grey(),
-                timestamp=datetime.now(timezone.utc),
-            )
-            if did:
-                done.add_field(name="Discord", value=f"<@{did}>", inline=True)
-            done.set_footer(text=f"Ignored by {interaction.user}")
-            await self._close_card(interaction, done)
-        except Exception as e:
-            print("Ignore button error:", e)
-            try:
-                await interaction.followup.send("❌ Could not ignore this card.", ephemeral=True)
-            except Exception:
-                pass
-
 
 # ---------------- TICKET SCREENSHOT REMINDER LOOP ----------------
 def db_tickets_needing_screenshot_reminder():
