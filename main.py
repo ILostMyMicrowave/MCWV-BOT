@@ -9402,6 +9402,86 @@ def has_mcwv_ticket_staff_permission(member):
     return bool(role_ids.intersection(MCWV_TICKET_STAFF_ROLE_IDS)) or has_officer_guide_permission(member)
 
 
+APPLY_ALREADY_IN_CLAN_MSG = (
+    "You're already in the clan. Recruits open their own application - don't make the ticket for them."
+)
+
+
+def member_is_already_in_clan(member):
+    """Clan members and staff cannot open application tickets for other people."""
+    if not isinstance(member, discord.Member):
+        return False
+    role_ids = {getattr(role, "id", 0) for role in getattr(member, "roles", [])}
+    if CLAN_MEMBER_ROLE_ID in role_ids:
+        return True
+    try:
+        if int(MCWV_TICKET_MEMBER_ROLE_ID) in role_ids:
+            return True
+    except Exception:
+        pass
+    return has_mcwv_ticket_staff_permission(member)
+
+
+def db_connected_roblox_ids_for_discord(discord_id):
+    """Roblox ids tied to this Discord via BIG Games connect or hub link."""
+    ids = set()
+    if not db_enabled() or not discord_id:
+        return ids
+    did = str(discord_id)
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT roblox_id FROM big_games_discord_tokens WHERE TRIM(discord_id::text) = %s",
+                    (did,),
+                )
+                for (rid,) in cur.fetchall() or []:
+                    rid = str(rid or "").strip()
+                    if rid:
+                        ids.add(rid)
+            except Exception:
+                conn.rollback()
+            try:
+                cur.execute(
+                    """
+                    SELECT roblox_id FROM users
+                    WHERE TRIM(discord_id::text) = %s
+                      AND roblox_id IS NOT NULL
+                      AND TRIM(roblox_id::text) <> ''
+                    """,
+                    (did,),
+                )
+                for (rid,) in cur.fetchall() or []:
+                    rid = str(rid or "").strip()
+                    if rid:
+                        ids.add(rid)
+            except Exception:
+                conn.rollback()
+            try:
+                cur.execute(
+                    """
+                    SELECT t.roblox_id
+                    FROM big_games_tokens t
+                    JOIN users u ON u.id = t.user_id OR TRIM(u.roblox_id::text) = TRIM(t.roblox_id::text)
+                    WHERE TRIM(u.discord_id::text) = %s
+                    """,
+                    (did,),
+                )
+                for (rid,) in cur.fetchall() or []:
+                    rid = str(rid or "").strip()
+                    if rid:
+                        ids.add(rid)
+            except Exception:
+                conn.rollback()
+    except Exception as exc:
+        print(f"[ticket] connected roblox lookup failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    return ids
+
+
 async def resolve_roblox_username_basic(username):
     global session
     if session is None or session.closed:
@@ -10804,6 +10884,15 @@ class ApplicationModal(discord.ui.Modal):
         if not guild:
             return await interaction.followup.send("❌ This must be used in the server.", ephemeral=True)
 
+        if member_is_already_in_clan(interaction.user):
+            ops_log_soon(
+                "tickets",
+                title="Blocked - already in clan",
+                description=f"{interaction.user.mention} tried to open an application (staff/member).",
+                level="warning",
+            )
+            return await interaction.followup.send(APPLY_ALREADY_IN_CLAN_MSG, ephemeral=True)
+
         blacklist_entry = await asyncio.to_thread(db_ticket_blacklist_get, interaction.user.id)
         if blacklist_entry:
             reason = str(blacklist_entry[1] or "No reason provided")[:500]
@@ -10856,6 +10945,24 @@ class ApplicationModal(discord.ui.Modal):
                 level="warning",
             )
             return await interaction.followup.send("❌ Roblox username not found. Please check spelling and try again.", ephemeral=True)
+
+        connected_ids = await asyncio.to_thread(db_connected_roblox_ids_for_discord, interaction.user.id)
+        resolved_id = str(resolved.get("id") or "").strip()
+        if connected_ids and resolved_id and resolved_id not in connected_ids:
+            ops_log_soon(
+                "tickets",
+                title="Blocked - Roblox mismatch",
+                description=f"{interaction.user.mention} tried to apply as `{resolved.get('name')}` (`{resolved_id}`).",
+                level="warning",
+                fields=[
+                    {"name": "Connected", "value": ", ".join(sorted(connected_ids))[:1024], "inline": False},
+                ],
+            )
+            return await interaction.followup.send(
+                "That Roblox account doesn't match the PS99 account you connected. "
+                "Use your own username - don't apply for someone else.",
+                ephemeral=True,
+            )
 
         category = guild.get_channel(MCWV_TICKET_CATEGORY_ID)
         if not isinstance(category, discord.CategoryChannel):
@@ -11807,6 +11914,14 @@ class MCWVTicketPanelView(discord.ui.View):
             blacklist_role = guild.get_role(MCWV_TICKET_BLACKLIST_ROLE_ID)
             if blacklist_role and isinstance(interaction.user, discord.Member) and blacklist_role in interaction.user.roles:
                 return await interaction.response.send_message("❌ You are currently blocked from opening MCWV application tickets.", ephemeral=True)
+            if member_is_already_in_clan(interaction.user):
+                ops_log_soon(
+                    "tickets",
+                    title="Blocked - already in clan",
+                    description=f"{interaction.user.mention} hit Open Application (staff/member).",
+                    level="warning",
+                )
+                return await interaction.response.send_message(APPLY_ALREADY_IN_CLAN_MSG, ephemeral=True)
             # Keep this interaction fast: Discord requires modal responses within a
             # few seconds. The database-backed blacklist is checked after modal submit
             # (where we can defer), while the role blacklist is checked immediately.
