@@ -972,11 +972,8 @@ async def get_priority_clan_names():
 
 @tasks.loop(minutes=10)
 async def war_cache_window_loop():
+    """CW-Bot-parity scheduler: full capture in the last hours of a war."""
     _sync_from_main()
-    """CW-Bot-parity scheduler: run the full capture scan in the final hours of
-    a war (while the API still lists all 75 members per clan) and priority
-    re-scans of MCWV + tracked users' clans right before the end. The user's
-    War Schedule finish time wins over the API config."""
     if not DATABASE_URL or not db_enabled():
         return
     try:
@@ -1043,7 +1040,20 @@ async def war_cache_window_loop():
 
 @war_cache_window_loop.before_loop
 async def before_war_cache_window_loop():
-    await bot.wait_until_ready()
+    # This file is imported into main.py. `bot` is not in this module until
+    # we copy it - without that, before_loop NameErrors, the loop never
+    # stays up, and health-monitor spam-restarts War Cache every 5 min.
+    _sync_from_main()
+    b = globals().get("bot")
+    if b is None:
+        b = getattr(sys.modules.get("__main__"), "bot", None)
+    if b is not None:
+        await b.wait_until_ready()
+
+
+@war_cache_window_loop.error
+async def war_cache_window_loop_error(error):
+    print(f"[war-cache] loop error: {type(error).__name__}: {error}")
 
 
 def _compute_global_ranks_sql(conn):
