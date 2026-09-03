@@ -25197,6 +25197,31 @@ async def on_disconnect():
         await session.close()
 
 
-# ---------------- RUN ----------------
+# ---------------- AUTO-RECOVERY: RETRY ON RATE LIMIT / BLOCK ----------------
+# If the Render IP (or bot IP) gets temporarily banned by Cloudflare (1015)
+# or rate-limited by Discord, bot.run() throws / exits. This loop pauses
+# with exponential backoff and retries automatically until the block lifts.
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    retry_delay = 60          # start at 60 seconds
+    max_retry = 300           # cap at 5 minutes
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            print(f"🤖 Bot start attempt #{attempt} ...")
+            bot.run(TOKEN)
+            # bot.run() is blocking; it only returns on clean exit.
+            print("✅ Bot.run returned cleanly — exiting retry loop.")
+            break
+        except Exception as e:
+            error_text = str(e).lower()
+            is_rate_or_block = any(k in error_text for k in [
+                "rate limit", "1015", "cloudflare", "banned", "blocked",
+                "ratelimit", "too many requests", "temporary", "429",
+                "connection", "timeout", "network", "refused", "reset",
+            ])
+            retry_delay = min(retry_delay * 2, max_retry)
+            print(f"⚠️ Attempt #{attempt} failed (rate/block={is_rate_or_block}): {e}")
+            print(f"⏳ Waiting {retry_delay}s before retry ...")
+            time.sleep(retry_delay)
+            continue
