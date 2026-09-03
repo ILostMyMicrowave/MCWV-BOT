@@ -13796,11 +13796,7 @@ async def generate_checkplayer_card(data, avatar_url=None, page=0, per_page=7):
     out.seek(0)
     return out
 
-# ---------------- CHECKPLAYER COMMAND ----------------
 
-# Recent username searches for autocomplete
-RECENT_PLAYER_SEARCHES = []
-MAX_RECENT_SEARCHES = 25
 
 
 async def checkplayer_autocomplete(interaction: discord.Interaction, current: str):
