@@ -74,7 +74,7 @@ def health():
 ADMIN_API_KEY = os.environ.get("BOT_ADMIN_API_KEY") or os.environ.get("ADMIN_API_KEY")
 ADMIN_RESTART_ENABLED = os.environ.get("ALLOW_ADMIN_RESTART", "0") == "1"
 HUB_BASE_URL = (os.environ.get("MCWV_HUB_URL") or os.environ.get("HUB_URL") or "https://mcwv-hub.vercel.app").rstrip("/")
-WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "")
+WAR_COLLECT_SECRET = os.environ.get("WAR_COLLECT_SECRET", "").strip()
 WAR_COLLECT_INTERVAL_MINUTES = max(1, int(os.environ.get("WAR_COLLECT_INTERVAL_MINUTES", "1") or "1"))
 BADGE_ROLE_SYNC_INTERVAL_MINUTES = max(5, int(os.environ.get("BADGE_ROLE_SYNC_INTERVAL_MINUTES", "20") or "20"))
 OFFICER_GUIDE_ROLE_ID = int(os.environ.get("OFFICER_GUIDE_ROLE_ID", "1501986357516701827"))
@@ -23468,13 +23468,21 @@ async def hub_war_collect_loop():
         if session is None or session.closed:
             session = aiohttp.ClientSession()
 
+        if not WAR_COLLECT_SECRET:
+            if _hub_collector_last_state != "no-secret":
+                print("[hub war collector] skipped: WAR_COLLECT_SECRET is not set")
+            _hub_collector_last_state = "no-secret"
+            return
+
         url = f"{HUB_BASE_URL}/api/war-collector"
-        if WAR_COLLECT_SECRET:
-            url = f"{url}?secret={WAR_COLLECT_SECRET}"
+        headers = {"x-war-collect-secret": WAR_COLLECT_SECRET}
 
         timeout = aiohttp.ClientTimeout(total=25)
-        async with session.get(url, timeout=timeout) as response:
+        async with session.get(url, headers=headers, timeout=timeout) as response:
             text = await response.text()
+            if response.status == 401:
+                print("[hub war collector] HTTP 401: WAR_COLLECT_SECRET does not match the hub")
+                return
             if response.status != 200:
                 print(f"[hub war collector] HTTP {response.status}: {text[:300]}")
                 return
