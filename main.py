@@ -19515,13 +19515,10 @@ async def status(interaction: discord.Interaction, member: discord.Member):
                 battle_count = len(cached)
                 ranked = [r for r in cached if r.get("rank") and r.get("total")]
                 best_pct = 0
+                ranked = [r for r in cached if r.get("rank") and r.get("total")]
                 if ranked:
                     best_pct = max(float(r.get("betterThan") or ((int(r.get("total")) - int(r.get("rank"))) / int(r.get("total")) * 100)) for r in ranked)
                 clans = list(dict.fromkeys(str(r.get("clan") or "") for r in cached if r.get("clan")))
-                    name="⚔️ War History",
-                    value=f"{battle_count} battles · best {best_pct:.0f}% better\n{' → '.join(clans[:4])}" if clans else f"{battle_count} battles",
-                    inline=False,
-                )
         except Exception:
             pass
 
@@ -19557,7 +19554,6 @@ async def whois(interaction: discord.Interaction, member: discord.Member):
             embed.add_field(
                 name="\U0001f3dd\ufe0f Leave of Absence",
                 value=f"**Active** since {started}\nExcused from wars & tracking",
-                inline=False,
             )
 
         if main_link:
@@ -19583,7 +19579,6 @@ async def whois(interaction: discord.Interaction, member: discord.Member):
                     clans = list(dict.fromkeys(str(r.get("clan") or "") for r in cached if r.get("clan")))
                     best_pct = 0
                     ranked = [r for r in cached if r.get("rank") and r.get("total")]
-                    if ranked:
                     embed.add_field(name="\u2694\ufe0f War History", value=f"{bc} battles \u00b7 {medals} medals \u00b7 best {best_pct:.0f}%", inline=True)
                     if clans:
                         embed.add_field(name="\U0001f4cb Clans", value=" \u2192 ".join(clans[:6]), inline=False)
