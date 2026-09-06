@@ -19756,11 +19756,14 @@ async def rosterhealth(interaction: discord.Interaction):
             key=lambda x: -len(x[1]),
         )
 
-        # E. LOAs
-        loa_lines = [
-            (str(rec[2] or rec[1]), rec[1])
-            for rec in active_loas
-        ]
+        # E. LOAs (dedupe by roblox id)
+        seen_loa = set()
+        loa_lines = []
+        for rec in active_loas:
+            rid = str(rec[2] or rec[1] or "").strip()
+            if rid and rid not in seen_loa:
+                seen_loa.add(rid)
+                loa_lines.append((rid, rec[1]))
 
         # Build embed
         embed = discord.Embed(
@@ -19804,6 +19807,55 @@ async def rosterhealth(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.followup.send(f"❌ Roster health failed: `{type(exc).__name__}`", ephemeral=True)
 
+
+
+
+@bot.tree.command(name="cleanupall", description="Bulk cleanup: unlink all linked users not currently in clan", guild=guild_obj)
+@require_role()
+async def cleanupall(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # Reuse roster logic to find linked-not-in-clan
+        clan_data = await _fetch_clan_data(CLAN_NAME) or {}
+        in_game = {}
+        for member in clan_data.get("Members", []) if isinstance(clan_data, dict) else []:
+            if isinstance(member, dict):
+                try:
+                    rid = str(int(member.get("UserID")))
+                    in_game[rid] = True
+                except Exception:
+                    pass
+        linked = db_get_all_linked() or []
+        targets = []
+        for row in linked:
+            rid = str(row[0] or "").strip()
+            if rid and rid not in in_game:
+                targets.append(row)
+        if not targets:
+            return await interaction.followup.send("✅ No linked users missing from in-game roster.", ephemeral=True)
+        count = 0
+        for row in targets:
+            rid = str(row[0] or "").strip()
+            did = row[1] if len(row) > 1 else None
+            try:
+                if did:
+                    did = int(did) if str(did).isdigit() else None
+                if did:
+                    ok, msg = db_remove_all_links_for_discord(did)
+                    if ok:
+                        cleanup_memory_for_removed_user(rid)
+                        count += 1
+                else:
+                    # Try by roblox id
+                    extra = db_remove_roblox_link(rid)
+                    cleanup_memory_for_removed_user(rid)
+                    if extra is not None:
+                        count += 1
+            except Exception as e:
+                pass
+        await interaction.followup.send(f"✅ Bulk cleanup done: {count}/{len(targets)} linked-but-not-in-clan users unlinked.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Cleanup all failed: {e}", ephemeral=True)
 
 # ---------------- AUTO-RECONNECT ----------------
 
