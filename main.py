@@ -20243,6 +20243,14 @@ async def war_poll_loop():
     pass  # keep connection alive (Supabase has no compute hour limit)
         
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
+def db_clan_roster_seen_ids():
+    # Fallback: prevent NameError in clan leave loop; returns empty seen set
+    try:
+        return set()
+    except Exception:
+        return set()
+
+
 @tasks.loop(minutes=10)
 async def clan_leave_loop():
     try:
