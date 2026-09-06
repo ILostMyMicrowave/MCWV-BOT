@@ -7351,6 +7351,9 @@ async def resolve_broadcast_recipients(interaction, audience, value=None, role=N
     else:
         raise ValueError("Unknown broadcast audience filter.")
 
+    # BROADCAST PUSH/AUDIENCE GUARD — only selected audience members get notifications/app pushes
+    audience_filter_ids = {str(u.get("discord_id") or u.get("roblox_id") or "").strip() for u in selected}
+
     # Enrich recipients with competitive + war context for template variables.
     next_by_id = {}
     for index, item in enumerate(users):
