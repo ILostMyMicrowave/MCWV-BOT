@@ -2207,6 +2207,21 @@ DB_STARTUP_CONNECTION_OPTIONS = (
     "-c statement_timeout=30000 -c lock_timeout=5000 "
     "-c idle_in_transaction_session_timeout=30000"
 )
+# TCP liveness of the shared connection. A half-dead socket (network blip,
+# pooler drop, NAT timeout) blocks cur.execute until TCP declares the path
+# dead — with the old 30s/10s/3 keepalives that is ~60s, LONGER than
+# Discord's ~30s heartbeat tolerance. That is exactly the 2026-09-11
+# "heartbeat blocked for more than 30/40 seconds" -> gateway drop: the loop
+# thread was stuck inside db_get_all_tracked's cur.execute. 10s/5s/3 fails a
+# dead path in ~25s (under the tolerance); async_db_guard() additionally
+# hard-caps loop-critical queries and drops the connection for a heal.
+DB_KEEPALIVES_IDLE = max(5, int(os.environ.get("DB_KEEPALIVES_IDLE", "10")))
+DB_KEEPALIVES_INTERVAL = max(1, int(os.environ.get("DB_KEEPALIVES_INTERVAL", "5")))
+DB_KEEPALIVES_COUNT = max(1, int(os.environ.get("DB_KEEPALIVES_COUNT", "3")))
+# Hard wall-clock cap for shared-connection queries run through
+# async_db_guard (loop-critical call sites). Must stay well under Discord's
+# heartbeat tolerance (~30s); 10s leaves headroom for a few sequential calls.
+DB_QUERY_HARD_TIMEOUT_S = max(2.0, float(os.environ.get("DB_QUERY_HARD_TIMEOUT_S", "10")))
 _database_initializing = True
 
 import threading as _threading
@@ -2231,9 +2246,9 @@ def _event_conn():
                 connect_timeout=5,
                 options=DB_CONNECTION_OPTIONS,
                 keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
+                keepalives_idle=DB_KEEPALIVES_IDLE,
+                keepalives_interval=DB_KEEPALIVES_INTERVAL,
+                keepalives_count=DB_KEEPALIVES_COUNT,
             )
             c.autocommit = True
             _event_local.conn = c
@@ -2587,9 +2602,9 @@ def ensure_db_connection():
             connect_timeout=5,
             options=DB_STARTUP_CONNECTION_OPTIONS if _database_initializing else DB_CONNECTION_OPTIONS,
             keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=3,
+            keepalives_idle=DB_KEEPALIVES_IDLE,
+            keepalives_interval=DB_KEEPALIVES_INTERVAL,
+            keepalives_count=DB_KEEPALIVES_COUNT,
         )
         conn.autocommit = True
         print("✅ Database connected")
@@ -4013,6 +4028,100 @@ def db_enabled():
     if DATABASE_URL:
         _schedule_db_heal()
     return False
+
+
+# ---------------- HARD TIMEOUT FOR SHARED-CONNECTION QUERIES ----------------
+# Server-side statement/lock timeouts only protect against slow SERVER work.
+# When the network path to the database stalls (half-dead socket), the
+# server's cancel never arrives and psycopg2's blocking read has no
+# client-side timeout of its own (its C layer even ignores OS socket
+# recv-timeouts), so cur.execute blocks until TCP keepalives give up. On the
+# event-loop thread that freezes Discord's heartbeat (see DB_KEEPALIVES_*).
+#
+# async_db_guard() runs a helper in a worker thread under the shared
+# connection lock, with a hard wall-clock cap; on timeout it POISONS the
+# shared connection so every other DB call fails fast (db_enabled() ->
+# False) while the background heal reconnects.
+
+_shared_conn_lock = _threading.RLock()
+
+
+def _poison_shared_conn(reason):
+    """Drop the shared-connection reference so db_enabled() fails fast and
+    the background heal reconnects.
+
+    Deliberately does NOT close() the old connection here: another thread
+    may still be inside its protocol exchange on the same socket, and
+    close-during-execute is unsafe with psycopg2. The orphaned connection
+    dies when TCP keepalives (~25s) kill its socket; its frame is then
+    garbage-collected.
+    """
+    global conn
+    print(f"⚠️ [db] shared connection dropped: {reason}")
+    conn = None
+    _schedule_db_heal()
+
+
+def _locked_db_call(fn, *args, **kwargs):
+    with _shared_conn_lock:
+        return fn(*args, **kwargs)
+
+
+async def async_db_guard(fn, *args, **kwargs):
+    """Run a blocking shared-connection DB helper off the event loop with a
+    HARD wall-clock timeout. For loop-critical call sites (periodic loops
+    that would otherwise freeze Discord if the DB path stalls).
+
+    Usage:  rows = await async_db_guard(db_get_all_tracked)
+
+    Pass the helper BY REFERENCE — the call-expression form
+    async_db_guard(db_get_all_tracked()) would run the helper on the event
+    loop, the exact bug this guard exists to prevent (logged; the
+    already-computed value is passed through).
+
+    On timeout (or on being unable to acquire the connection lock because a
+    previous query is stalled) the shared connection is poisoned so all
+    other DB calls fail fast while the heal reconnects; the timed-out call
+    keeps burning its daemon thread until TCP keepalives kill the stalled
+    socket (~25s).
+    """
+    if not callable(fn):
+        import traceback as _tb
+        print(f"[db] async_db_guard given non-callable {type(fn).__name__} — a helper "
+              f"ran on the event loop (call-expression form). Caller:")
+        print("".join(_tb.format_stack(limit=3)[:-1]))
+        return fn
+
+    fn_name = getattr(fn, "__name__", repr(fn))
+    done = _threading.Event()
+    box = {}
+
+    def _target():
+        if not _shared_conn_lock.acquire(timeout=DB_QUERY_HARD_TIMEOUT_S / 2):
+            box["lock_timeout"] = True
+            done.set()
+            return
+        try:
+            try:
+                box["result"] = fn(*args, **kwargs)
+            except BaseException as exc:  # re-raised onto the loop below
+                box["error"] = exc
+        finally:
+            _shared_conn_lock.release()
+            done.set()
+
+    worker = _threading.Thread(target=_target, name="db-guard", daemon=True)
+    worker.start()
+    if not done.wait(timeout=DB_QUERY_HARD_TIMEOUT_S):
+        _poison_shared_conn(f"query {fn_name} exceeded {DB_QUERY_HARD_TIMEOUT_S:.0f}s (stalled network path?)")
+        raise TimeoutError(f"db query {fn_name} hard-timed out at {DB_QUERY_HARD_TIMEOUT_S:.0f}s; shared connection dropped for heal")
+    if box.get("lock_timeout"):
+        _poison_shared_conn(f"query {fn_name} could not acquire the shared-connection lock within {DB_QUERY_HARD_TIMEOUT_S / 2:.0f}s (previous query stalled?)")
+        raise TimeoutError(f"db query {fn_name} lock-timed out; shared connection dropped for heal")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
 
 # DB connection is opened on demand by db_enabled()/ensure_db_connection().
 # We do NOT connect at import time — connect on demand instead.
@@ -8448,7 +8557,7 @@ async def broadcast_scheduler_loop():
                 run_dt = run_at if getattr(run_at, "tzinfo", None) else run_at.replace(tzinfo=timezone.utc)
                 if run_dt > now_dt:
                     continue
-                db_mark_schedule_fired(row["id"], context.get("battle_key") or None, disable=True)
+                await async_db_guard(db_mark_schedule_fired, row["id"], context.get("battle_key") or None, disable=True)
                 await fire_broadcast_schedule(row, context)
                 continue
 
@@ -20069,7 +20178,7 @@ async def check_loop():
                     offline_since[rid] = now
 
                 try:
-                    if str(db_get_setting("offline_tracking", "false")).lower() == "true":
+                    if str(await async_db_guard(db_get_setting, "offline_tracking", "false")).lower() == "true":
                         channel = await _get_channel(CHANNEL_ID)
                         if channel:
                             await channel.send(
@@ -20293,12 +20402,62 @@ async def war_poll_loop():
     pass  # keep connection alive (Supabase has no compute hour limit)
         
 # ---------------- CLAN LEAVE DETECTION (STAFF PANEL) ----------------
+def _ensure_clan_roster_seen_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mcwv_clan_roster_seen (
+            roblox_id TEXT PRIMARY KEY,
+            seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
 def db_clan_roster_seen_ids():
-    # Fallback: prevent NameError in clan leave loop; returns empty seen set
+    """Roblox ids previously seen on the live clan roster — the memory the
+    clan-leave detector needs ("only alert if we saw them at least once").
+
+    Real table-backed implementation (replaces the degraded empty-set
+    fallback, which silently disabled leave detection)."""
+    if not db_enabled():
+        return set()
     try:
+        with conn.cursor() as cur:
+            _ensure_clan_roster_seen_table(cur)
+            cur.execute("SELECT roblox_id FROM mcwv_clan_roster_seen")
+            return {str(r[0]).strip() for r in cur.fetchall() if r and r[0]}
+    except Exception as e:
+        conn.rollback()
+        print("db_clan_roster_seen_ids error:", e)
         return set()
-    except Exception:
-        return set()
+
+
+def db_clan_roster_mark_seen(roblox_ids):
+    """Upsert roblox ids currently seen on the live roster.
+    (Was undefined — the NameError in the 2026-09-10 prod logs.)"""
+    ids = []
+    for value in roblox_ids or []:
+        if value is None:
+            continue
+        try:
+            rid = str(value).strip()
+            if rid and rid not in ids:
+                ids.append(rid)
+        except Exception:
+            continue
+    if not ids or not db_enabled():
+        return 0
+    try:
+        with conn.cursor() as cur:
+            _ensure_clan_roster_seen_table(cur)
+            execute_values(cur, """
+                INSERT INTO mcwv_clan_roster_seen (roblox_id) VALUES %s
+                ON CONFLICT (roblox_id) DO UPDATE SET seen_at = NOW()
+            """, [(rid,) for rid in ids])
+        conn.commit()
+        return len(ids)
+    except Exception as e:
+        conn.rollback()
+        print("db_clan_roster_mark_seen error:", e)
+        return 0
 
 
 @tasks.loop(minutes=10)
@@ -20318,7 +20477,7 @@ async def clan_leave_loop():
         # next 10-min tick would re-detect them and re-alert forever.
         loa_roblox_ids = set()
         try:
-            for row in db_list_active_loas():
+            for row in (await async_db_guard(db_list_active_loas)):
                 # row: (id, roblox_id, roblox_username, discord_id, ...)
                 if row and row[1]:
                     loa_roblox_ids.add(str(row[1]).strip())
@@ -20359,8 +20518,8 @@ async def clan_leave_loop():
         if not staff_channel:
             return
 
-        dismissed = db_clan_leave_dismissed_ids()
-        seen_in_game = db_clan_roster_seen_ids()
+        dismissed = await async_db_guard(db_clan_leave_dismissed_ids)
+        seen_in_game = await async_db_guard(db_clan_roster_seen_ids)
         just_seen = []
         for roblox_id, discord_id, roblox_name in users:
             try:
@@ -20423,7 +20582,7 @@ async def clan_leave_loop():
                 print("Clan leave row error:", e)
 
         if just_seen:
-            db_clan_roster_mark_seen(just_seen)
+            await async_db_guard(db_clan_roster_mark_seen, just_seen)
 
     except Exception as e:
         print("Clan leave loop error:", e)
@@ -20830,7 +20989,7 @@ def db_tickets_needing_screenshot_reminder():
 @tasks.loop(minutes=10)
 async def ticket_screenshot_reminder_loop():
     await bot.wait_until_ready()
-    rows = db_tickets_needing_screenshot_reminder()
+    rows = await async_db_guard(db_tickets_needing_screenshot_reminder)
     if not rows:
         return
 
@@ -20841,7 +21000,7 @@ async def ticket_screenshot_reminder_loop():
                 channel = await bot.fetch_channel(int(channel_id))
             if not isinstance(channel, discord.TextChannel):
                 # Channel deleted — mark as reminded so we stop retrying
-                db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Channel no longer exists — reminder skipped")
+                await async_db_guard(db_ticket_log, ticket_id, None, "screenshots/reminder_sent", "Channel no longer exists — reminder skipped")
                 continue
 
             embed = discord.Embed(
@@ -20864,11 +21023,11 @@ async def ticket_screenshot_reminder_loop():
                 view=ScreenshotUploadedView(),
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
             )
-            db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Screenshot reminder sent after 6 hours")
+            await async_db_guard(db_ticket_log, ticket_id, None, "screenshots/reminder_sent", "Screenshot reminder sent after 6 hours")
             await asyncio.sleep(0.5)
         except discord.NotFound:
             # Channel deleted — mark as reminded so we stop retrying every 30 min
-            db_ticket_log(ticket_id, None, "screenshots/reminder_sent", "Channel deleted — reminder skipped")
+            await async_db_guard(db_ticket_log, ticket_id, None, "screenshots/reminder_sent", "Channel deleted — reminder skipped")
         except Exception as exc:
             print(f"ticket_screenshot_reminder_loop error for {ticket_id}: {exc}")
 
@@ -21345,8 +21504,11 @@ async def fetch_roblox_users_for_logs(user_ids):
     user_map = {}
 
     # Prefer local DB names when available so logs still work during Roblox hiccups.
+    # Guarded: this is the path caught freezing the event loop on 2026-09-11
+    # (clan_log_loop -> process_clan_logs -> fetch_roblox_users_for_logs ->
+    # db_get_all_tracked -> cur.execute, 30-43s, gateway dropped).
     try:
-        for row in db_get_all_tracked() or []:
+        for row in (await async_db_guard(db_get_all_tracked)) or []:
             try:
                 rid = int(row[0])
                 username = str(row[2]) if len(row) > 2 and row[2] else str(rid)
@@ -22193,7 +22355,7 @@ async def collect_hourly_player_snapshot():
 
     names = {}
     try:
-        for row in db_get_all_tracked() or []:
+        for row in (await async_db_guard(db_get_all_tracked)) or []:
             try:
                 rid = str(row[0]).strip()
                 if rid:
@@ -22668,7 +22830,7 @@ async def send_hourly_stats_card(channel, ping_enabled=None, ping_threshold=None
     # Send as a plain image attachment, not an embed.
     await channel.send(file=file)
     save_hourly_player_snapshot(payload)
-    db_set_setting("mcwv_hourly_stats_last_sent_at", _now_iso())
+    await async_db_guard(db_set_setting, "mcwv_hourly_stats_last_sent_at", _now_iso())
 
     should_ping = hourly_stats_ping_enabled() if ping_enabled is None else bool(ping_enabled)
     threshold = get_hourly_stats_ping_threshold() if ping_threshold is None else max(0, int(ping_threshold))
@@ -24152,6 +24314,43 @@ async def _fetch_gems_from_token(token):
 
 
 @tasks.loop(minutes=60)
+def _biggames_gem_ensure_table():
+    """CREATE TABLE/INDEX for player_gem_snapshots (idempotent)."""
+    with _shared_conn_lock:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS player_gem_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    roblox_id TEXT NOT NULL,
+                    gems BIGINT,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS player_gem_snapshots_roblox_time_idx
+                ON player_gem_snapshots (roblox_id, captured_at)
+            """)
+
+
+def _biggames_gem_record(roblox_id, gems):
+    """Throttled INSERT for one member. Returns True when a row was recorded.
+    Throttle: only insert if no row in the last ~50 min."""
+    with _shared_conn_lock:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM player_gem_snapshots WHERE roblox_id = %s "
+                "AND captured_at > NOW() - INTERVAL '50 minutes' LIMIT 1",
+                (roblox_id,),
+            )
+            if cur.fetchone():
+                return False
+            cur.execute(
+                "INSERT INTO player_gem_snapshots (roblox_id, gems) VALUES (%s, %s)",
+                (roblox_id, int(round(gems))),
+            )
+        return True
+
+
 async def biggames_gem_snapshot_loop():
     """Hourly: capture each connected member's current PS99 gem count into
     player_gem_snapshots so the hub's Profiles "Most Improved" / WarSpending
@@ -24171,26 +24370,9 @@ async def biggames_gem_snapshot_loop():
 
         # Ensure the snapshot table exists (mirrors the hub's shape/index).
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS player_gem_snapshots (
-                        id BIGSERIAL PRIMARY KEY,
-                        roblox_id TEXT NOT NULL,
-                        gems BIGINT,
-                        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS player_gem_snapshots_roblox_time_idx
-                    ON player_gem_snapshots (roblox_id, captured_at)
-                """)
-            conn.commit()
+            await async_db_guard(_biggames_gem_ensure_table)
         except Exception as exc:
             print(f"[biggames-snap] ensure table failed: {exc}")
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             return
 
         seen_roblox = set()
@@ -24209,27 +24391,10 @@ async def biggames_gem_snapshot_loop():
 
             rid = str(roblox_id)
             try:
-                with conn.cursor() as cur:
-                    # Throttle: only insert if no row in the last ~50 min.
-                    cur.execute(
-                        "SELECT 1 FROM player_gem_snapshots WHERE roblox_id = %s "
-                        "AND captured_at > NOW() - INTERVAL '50 minutes' LIMIT 1",
-                        (rid,),
-                    )
-                    if cur.fetchone():
-                        continue
-                    cur.execute(
-                        "INSERT INTO player_gem_snapshots (roblox_id, gems) VALUES (%s, %s)",
-                        (rid, int(round(gems))),
-                    )
-                conn.commit()
-                print(f"[biggames-snap] recorded gems for roblox {rid}")
+                if await async_db_guard(_biggames_gem_record, rid, gems):
+                    print(f"[biggames-snap] recorded gems for roblox {rid}")
             except Exception as exc:
                 print(f"[biggames-snap] insert failed for {rid}: {exc}")
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
     except Exception as exc:
         print(f"[biggames-snap] loop error: {exc}")
 
@@ -24578,9 +24743,10 @@ def ping_shared_db_connection_sync():
     if current is None or getattr(current, "closed", 1) != 0:
         return False
     try:
-        with current.cursor() as cur:
-            cur.execute("SELECT 1")
-            return bool(cur.fetchone())
+        with _shared_conn_lock:
+            with current.cursor() as cur:
+                cur.execute("SELECT 1")
+                return bool(cur.fetchone())
     except Exception:
         try:
             current.close()
@@ -24589,7 +24755,7 @@ def ping_shared_db_connection_sync():
         return False
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=20)
 async def db_keeper_loop():
     """Ping PostgreSQL on a worker so a network stall cannot freeze Discord."""
     if not DATABASE_URL:
@@ -25181,7 +25347,7 @@ async def on_ready():
 
     # ---------------- DB CHECK ----------------
     try:
-        tracked = db_get_all_tracked()
+        tracked = await async_db_guard(db_get_all_tracked)
         print(f"👥 Tracking {len(tracked)} users")
     except Exception as e:
         print(f"❌ DB tracking error: {e}")
