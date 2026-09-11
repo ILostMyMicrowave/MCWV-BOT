@@ -53,10 +53,39 @@ def _sync_from_main():
 #   4. PARTICIPANTS: AwardUserIDs (participated, incl. 0-pointers) are stored in
 #      cross_clan_participants for top clans + MCWV + tracked users' clans.
 WAR_CACHE_PRE_SCAN_HOURS = max(1.0, float(os.environ.get("MCWV_WAR_PRE_SCAN_HOURS", "4") or "4"))
-WAR_CACHE_SCAN_CONCURRENCY = max(4, int(os.environ.get("MCWV_WAR_SCAN_CONCURRENCY", "40") or "40"))
+# Concurrency was 40: a 50k-clan scan at 40 in-flight requests saturates the
+# PS99 rate limit and the resulting multi-minute 429 storms starve every other
+# consumer of API budget (placement polling, war collector, hourly stats).
+WAR_CACHE_SCAN_CONCURRENCY = max(2, int(os.environ.get("MCWV_WAR_SCAN_CONCURRENCY", "8") or "8"))
 WAR_CACHE_PARTICIPANT_MAX_PLACE = max(0, int(os.environ.get("MCWV_WAR_PARTICIPANT_MAX_PLACE", "2500") or "2500"))
 WAR_CACHE_ROLLING_INTERVAL_SECONDS = max(15 * 60, int(os.environ.get("MCWV_WAR_SCAN_ROLLING_SECONDS", "2700") or "2700"))
 WAR_CACHE_SCAN_MAX_MINUTES = max(15, int(os.environ.get("MCWV_WAR_SCAN_MAX_MINUTES", "45") or "45"))
+
+# ---------------- SCAN-WIDE 429 HANDLING ----------------
+# A batch in which most clans came back 429 means PS99's rate-limit budget is
+# exhausted. Retrying per-clan (the old behaviour: 0.35s x3 each, 40 workers)
+# turns one rate-limit event into a multi-minute 429 storm. Instead: honour
+# Retry-After per worker, and when a batch is mostly rate-limited, pause the
+# WHOLE scan with an exponential ramp until the budget recovers.
+RATE_LIMIT_PAUSE_BASE_S = max(5.0, float(os.environ.get("MCWV_WAR_RATE_LIMIT_PAUSE_S", "15") or "15"))
+RATE_LIMIT_PAUSE_MAX_S = max(RATE_LIMIT_PAUSE_BASE_S, float(os.environ.get("MCWV_WAR_RATE_LIMIT_PAUSE_MAX_S", "120") or "120"))
+RETRY_AFTER_CAP_S = 20.0
+
+
+def _retry_after_seconds(value):
+    """Parse a Retry-After header (seconds) with a cap. None when absent/invalid."""
+    try:
+        secs = float(value)
+        if secs < 0:
+            return None
+        return min(secs, RETRY_AFTER_CAP_S)
+    except (TypeError, ValueError):
+        return None
+
+
+# Sentinel: this clan's fetch was lost to rate limiting (reported to the batch
+# loop so it can pause the whole scan instead of retrying per worker).
+RATE_LIMITED = object()
 _scan_lock = None
 _scan_started_at = None
 _scan_label = None
@@ -84,9 +113,9 @@ def _open_scan_connection_sync():
         sslmode="require",
         connect_timeout=10,
         keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=3,
+        keepalives_idle=DB_KEEPALIVES_IDLE,
+        keepalives_interval=DB_KEEPALIVES_INTERVAL,
+        keepalives_count=DB_KEEPALIVES_COUNT,
         options="-c statement_timeout=60000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=30000",
     )
     c.autocommit = False
@@ -163,7 +192,7 @@ def queue_full_scan(battle_id, *, include_participants=True, label=None):
         )
         if ok:
             key = normalize_hourly_battle_key(battle_id)
-            db_set_setting(f"mcwv_war_cache_last_full_{key}", str(int(time.time())))
+            await async_db_guard(db_set_setting, f"mcwv_war_cache_last_full_{key}", str(int(time.time())))
 
     asyncio.create_task(_run())
 
@@ -174,7 +203,13 @@ def freeze_mcwv_war_from_last_snapshot(battle_id):
 
     Kicks after war-end must not shrink the report — this copies whoever was
     on the last hourly/history snapshot, even if the live clan is now 60.
+    Serialized on the shared-connection lock (runs in a worker thread).
     """
+    with _shared_conn_lock:
+        return _freeze_mcwv_war_from_last_snapshot_locked(battle_id)
+
+
+def _freeze_mcwv_war_from_last_snapshot_locked(battle_id):
     if not battle_id or not db_enabled():
         return 0
     key = normalize_hourly_battle_key(str(battle_id))
@@ -451,6 +486,7 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
         total_participants = 0
         pending_rows = []
         pending_participants = []
+        rate_pause = RATE_LIMIT_PAUSE_BASE_S
 
         print(f"[auto-cache] scanning {len(clan_names)} clans for {battle_id} (concurrency={CONCURRENCY}, participants={include_participants})")
         ops_log_soon(
@@ -472,8 +508,18 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
                 return_exceptions=True,
             )
 
+            # Scan-wide rate-limit pause: if most of this batch was 429, the
+            # API budget is exhausted — stop hammering and let it recover.
+            rate_limited_count = sum(1 for r in results if r is RATE_LIMITED)
+            if rate_limited_count * 2 >= len(batch):
+                print(f"[auto-cache] {rate_limited_count}/{len(batch)} clans rate-limited — pausing scan {rate_pause:.0f}s")
+                await asyncio.sleep(rate_pause)
+                rate_pause = min(rate_pause * 2, RATE_LIMIT_PAUSE_MAX_S)
+            elif rate_limited_count == 0:
+                rate_pause = RATE_LIMIT_PAUSE_BASE_S
+
             for name, result in zip(batch, results):
-                if isinstance(result, Exception) or result is None:
+                if isinstance(result, Exception) or result is None or result is RATE_LIMITED:
                     fetch_failed += 1
                     continue
                 if not result:
@@ -564,7 +610,7 @@ async def _auto_cache_full_scan(battle_id, include_participants=False, only_clan
         total_names = max(1, len(clan_names))
         complete = fetch_failed < max(100, int(total_names * 0.05))
         key = normalize_hourly_battle_key(battle_id)
-        db_set_setting(f"mcwv_war_scan_complete_{key}", "1" if complete else "0")
+        await async_db_guard(db_set_setting, f"mcwv_war_scan_complete_{key}", "1" if complete else "0")
         ops_log_soon(
             "cache",
             title="Scan finished" if complete else "Scan finished (degraded)",
@@ -730,6 +776,7 @@ async def _fetch_clan_contributions(scan_session, clan_name):
         return []
     url = f"{PS99_API}/api/clan/{str(clan_name)}"
     payload = None
+    last_status = None
     for attempt in range(3):
         try:
             async with scan_session.get(
@@ -740,8 +787,16 @@ async def _fetch_clan_contributions(scan_session, clan_name):
                 if res.status == 200:
                     payload = await res.json(content_type=None)
                     break
+                last_status = res.status
                 if res.status in (429, 500, 502, 503, 504):
-                    await asyncio.sleep(0.35 * (2 ** attempt) + random.random() * 0.25)
+                    if res.status == 429 and attempt >= 2:
+                        # Rate-limited on the final attempt — hand off to the
+                        # batch loop, which pauses the WHOLE scan (with ramp)
+                        # instead of every worker retrying into the limit.
+                        return RATE_LIMITED
+                    retry_after = _retry_after_seconds(res.headers.get("Retry-After")) if res.status == 429 else None
+                    delay = retry_after if retry_after is not None else (0.35 * (2 ** attempt) + random.random() * 0.25)
+                    await asyncio.sleep(delay)
                     continue
                 return None
         except Exception:
@@ -892,9 +947,9 @@ async def _auto_cache_priority_scan(battle_id, clan_names):
                 sslmode="require",
                 connect_timeout=10,
                 keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
+                keepalives_idle=DB_KEEPALIVES_IDLE,
+                keepalives_interval=DB_KEEPALIVES_INTERVAL,
+                keepalives_count=DB_KEEPALIVES_COUNT,
             )
             c.autocommit = False
             return c
@@ -905,7 +960,7 @@ async def _auto_cache_priority_scan(battle_id, clan_names):
         pending_participants = []
         for name in clan_names:
             result = await _fetch_clan_contributions(scan_session, name)
-            if not result:
+            if not result or result is RATE_LIMITED:
                 continue
             rows, participants_by_battle, places_by_battle = result
             battle_rows = [r for r in rows if r[1] == battle_id]
@@ -1002,20 +1057,20 @@ async def war_cache_window_loop():
         if hours_left <= 0:
             # Schedule says over; API may still have full 75s. Freeze once,
             # keep trying a full scan until one completes.
-            if not db_get_setting(f"mcwv_war_cache_post_{key}"):
-                db_set_setting(f"mcwv_war_cache_post_{key}", str(int(now)))
+            if not await async_db_guard(db_get_setting, f"mcwv_war_cache_post_{key}"):
+                await async_db_guard(db_set_setting, f"mcwv_war_cache_post_{key}", str(int(now)))
             try:
                 await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
             except Exception as exc:
                 print(f"[war-cache] post-end freeze failed: {exc}")
-            if db_get_setting(f"mcwv_war_scan_complete_{key}") != "1" and not _get_scan_lock().locked():
+            if (await async_db_guard(db_get_setting, f"mcwv_war_scan_complete_{key}")) != "1" and not _get_scan_lock().locked():
                 admin_log("War Cache Post-End Scan", f"{battle_id}: schedule ended, API still live — full capture queued.")
                 queue_full_scan(battle_id, include_participants=True, label=f"post-end:{battle_id}")
             return
 
         # Rolling full scans in the last N hours so a restart doesn't mean zero data.
         if hours_left <= WAR_CACHE_PRE_SCAN_HOURS:
-            last = db_get_setting(f"mcwv_war_cache_last_full_{key}")
+            last = await async_db_guard(db_get_setting, f"mcwv_war_cache_last_full_{key}")
             due = True
             if last:
                 try:
@@ -1028,8 +1083,8 @@ async def war_cache_window_loop():
 
         # 2) Priority re-scans of MCWV + tracked users' clans near the end.
         for phase, cutoff in (("prio_1h", 1.0), ("prio_10m", 1.0 / 6)):
-            if hours_left <= cutoff and not db_get_setting(f"mcwv_war_cache_{phase}_{key}"):
-                db_set_setting(f"mcwv_war_cache_{phase}_{key}", str(int(now)))
+            if hours_left <= cutoff and not await async_db_guard(db_get_setting, f"mcwv_war_cache_{phase}_{key}"):
+                await async_db_guard(db_set_setting, f"mcwv_war_cache_{phase}_{key}", str(int(now)))
                 clans = await get_priority_clan_names()
                 admin_log("War Cache Priority Scan", f"{battle_id}: re-scanning {len(clans)} priority clans at T-{hours_left:.1f}h.")
                 asyncio.create_task(_auto_cache_priority_scan(battle_id, clans))
@@ -1158,6 +1213,7 @@ async def _run_global_backfill(channel_id=None):
         clans_with_data = 0
         total_contribs = 0
         pending_rows = []
+        rate_pause = RATE_LIMIT_PAUSE_BASE_S
         print(f"[global backfill] scanning {len(clan_names)} clans (concurrency={CONCURRENCY})")
 
         for batch_start in range(0, len(clan_names), CONCURRENCY):
@@ -1166,6 +1222,13 @@ async def _run_global_backfill(channel_id=None):
                 *(_fetch_clan_contributions(scan_session, name) for name in batch),
                 return_exceptions=True,
             )
+            rate_limited_count = sum(1 for r in results if r is RATE_LIMITED)
+            if rate_limited_count * 2 >= len(batch):
+                print(f"[global backfill] {rate_limited_count}/{len(batch)} clans rate-limited — pausing scan {rate_pause:.0f}s")
+                await asyncio.sleep(rate_pause)
+                rate_pause = min(rate_pause * 2, RATE_LIMIT_PAUSE_MAX_S)
+            elif rate_limited_count == 0:
+                rate_pause = RATE_LIMIT_PAUSE_BASE_S
             for name, result in zip(batch, results):
                 if isinstance(result, Exception) or not result or not isinstance(result, tuple):
                     continue
