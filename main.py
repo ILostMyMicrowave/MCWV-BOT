@@ -24313,7 +24313,6 @@ async def _fetch_gems_from_token(token):
         return None
 
 
-@tasks.loop(minutes=60)
 def _biggames_gem_ensure_table():
     """CREATE TABLE/INDEX for player_gem_snapshots (idempotent)."""
     with _shared_conn_lock:
@@ -24351,6 +24350,7 @@ def _biggames_gem_record(roblox_id, gems):
         return True
 
 
+@tasks.loop(minutes=60)
 async def biggames_gem_snapshot_loop():
     """Hourly: capture each connected member's current PS99 gem count into
     player_gem_snapshots so the hub's Profiles "Most Improved" / WarSpending
