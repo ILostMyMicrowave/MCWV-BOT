@@ -23730,6 +23730,43 @@ async def before_hub_war_collect_loop():
     await bot.wait_until_ready()
 
 
+# ---------------- HUB KEEP-ALIVE LOOP ----------------
+# Vercel reaps idle function isolates after ~60s, and every cold isolate has
+# to open a fresh Supabase connection through an egress path that drops
+# roughly half of first connects (hub 503s / "database is busy",
+# 2026-09-12). A 30s ping to the cheap, public app-status endpoint keeps
+# one isolate — and its pooled DB connection (idleTimeout 300s) —
+# permanently warm, so members' requests land on a warm isolate instead of
+# a cold-start lottery ticket. app-status serves this from a 90s cache and
+# without a session, so the ping costs the hub almost nothing.
+HUB_KEEPALIVE_INTERVAL_SECONDS = max(15, int(os.environ.get("HUB_KEEPALIVE_INTERVAL_SECONDS", "30") or "30"))
+
+
+@tasks.loop(seconds=HUB_KEEPALIVE_INTERVAL_SECONDS)
+async def hub_keepalive_loop():
+    global session
+
+    if not HUB_BASE_URL:
+        return
+
+    try:
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with session.get(f"{HUB_BASE_URL}/api/app-status", timeout=timeout) as response:
+            # 429 just means the rate limiter answered — the isolate is warm.
+            if response.status not in (200, 429):
+                print(f"[hub keepalive] HTTP {response.status}")
+    except Exception:
+        pass  # best-effort: the next tick retries
+
+
+@hub_keepalive_loop.before_loop
+async def before_hub_keepalive_loop():
+    await bot.wait_until_ready()
+
+
 def _biggames_connect_url(discord_id):
     """Public no-login connect link for an applicant (no hub account needed)."""
     return f"{HUB_BASE_URL}/api/biggames/connect?discord={discord_id}"
@@ -24662,6 +24699,10 @@ def start_bot_loops():
         print(f"✅ Hub war collector loop started ({WAR_COLLECT_INTERVAL_MINUTES}m) -> {HUB_BASE_URL}")
     elif not HUB_BASE_URL:
         print("⚠️ Hub war collector loop not started: HUB_BASE_URL is empty")
+
+    if HUB_BASE_URL and not hub_keepalive_loop.is_running():
+        hub_keepalive_loop.start()
+        print(f"✅ Hub keepalive loop started ({HUB_KEEPALIVE_INTERVAL_SECONDS}s) -> {HUB_BASE_URL}")
 
     if HUB_BASE_URL and not hub_badge_role_sync_loop.is_running():
         hub_badge_role_sync_loop.change_interval(minutes=BADGE_ROLE_SYNC_INTERVAL_MINUTES)
