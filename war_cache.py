@@ -1063,7 +1063,19 @@ async def war_cache_window_loop():
                 await asyncio.to_thread(freeze_mcwv_war_from_last_snapshot, battle_id)
             except Exception as exc:
                 print(f"[war-cache] post-end freeze failed: {exc}")
-            if (await async_db_guard(db_get_setting, f"mcwv_war_scan_complete_{key}")) != "1" and not _get_scan_lock().locked():
+            # (2026-09-14) The PS99 API keeps serving a finished battle as
+            # "activeClanBattle" for DAYS after it ends, and post-end scans of
+            # a finished battle never reach "complete" — so this re-queued a
+            # full scan every 10 minutes, and each pass re-read the whole
+            # cross_clan_player_history table (~500MB/day of Supabase egress,
+            # the 13–14 Sep bleed). Bound it: only re-queue within 6 hours of
+            # the scheduled finish; after that, stop retrying.
+            within_post_end_window = (now - float(finish)) <= 6 * 3600
+            if (
+                (await async_db_guard(db_get_setting, f"mcwv_war_scan_complete_{key}")) != "1"
+                and not _get_scan_lock().locked()
+                and within_post_end_window
+            ):
                 admin_log("War Cache Post-End Scan", f"{battle_id}: schedule ended, API still live — full capture queued.")
                 queue_full_scan(battle_id, include_participants=True, label=f"post-end:{battle_id}")
             return
